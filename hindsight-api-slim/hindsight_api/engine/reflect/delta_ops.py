@@ -174,6 +174,12 @@ class DeltaOperationList(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     operations: list[Operation] = Field(default_factory=list)
+    #: The model's escape hatch: "the evidence I was given is not enough to edit
+    #: this document correctly". Only the delta fast path asks for it and only the
+    #: fast path reads it — there it means "hand this refresh to the agentic reflect
+    #: loop", which can go and retrieve more. Default False, so a model that never
+    #: mentions it (every caller before the fast path existed) behaves as it did.
+    needs_full_context: bool = False
 
 
 class DeltaAllOpsInvalidError(ValueError):
@@ -186,11 +192,33 @@ class DeltaAllOpsInvalidError(ValueError):
     """
 
 
-def _finalize_operations(valid: list[Operation], skipped: list[dict[str, Any]]) -> DeltaOperationList:
+def _coerce_needs_full_context(raw: Any) -> bool:
+    """Read the escape-hatch flag out of a raw delta payload.
+
+    The delta call is text-mode, not schema-enforced (the discriminated-union JSON
+    schema is rejected by some providers — see the caller), so a model can answer
+    with the string ``"true"`` where a boolean was asked for. Anything else —
+    absent, null, false, a number, prose — reads as False: the flag only ever adds
+    a hand-off to the slower agentic loop, so the safe reading is to require an
+    explicit yes rather than to guess from a truthy value.
+    """
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() == "true"
+    return False
+
+
+def _finalize_operations(
+    valid: list[Operation],
+    skipped: list[dict[str, Any]],
+    *,
+    needs_full_context: bool = False,
+) -> DeltaOperationList:
     """Build the result, but refuse a wholesale validation failure as a silent no-op."""
     if skipped and not valid:
         raise DeltaAllOpsInvalidError(f"all {len(skipped)} delta operation(s) failed validation")
-    return DeltaOperationList(operations=valid)
+    return DeltaOperationList(operations=valid, needs_full_context=needs_full_context)
 
 
 def _extract_balanced_json_object(text: str) -> str | None:
@@ -223,7 +251,13 @@ def _extract_balanced_json_object(text: str) -> str | None:
 
 
 def parse_delta_operation_list(raw: Any) -> DeltaOperationList:
-    """Parse structured-delta LLM output into a validated operation list."""
+    """Parse structured-delta LLM output into a validated operation list.
+
+    ``needs_full_context`` is carried through every branch. It has to be threaded
+    explicitly: each branch rebuilds the list from the operations it validated, so
+    a flag left on the raw payload would be silently dropped and the fast path
+    would run edits the model had just said it could not make safely.
+    """
     if isinstance(raw, DeltaOperationList):
         return raw
     if isinstance(raw, dict):
@@ -235,7 +269,11 @@ def parse_delta_operation_list(raw: Any) -> DeltaOperationList:
                 len(valid),
                 len(skipped),
             )
-        return _finalize_operations(valid, skipped)
+        return _finalize_operations(
+            valid,
+            skipped,
+            needs_full_context=_coerce_needs_full_context(raw.get("needs_full_context")),
+        )
 
     text = (raw or "").strip()
     if not text:
@@ -267,7 +305,11 @@ def parse_delta_operation_list(raw: Any) -> DeltaOperationList:
                 len(valid),
                 len(skipped),
             )
-        return _finalize_operations(valid, skipped)
+        return _finalize_operations(
+            valid,
+            skipped,
+            needs_full_context=_coerce_needs_full_context(payload.get("needs_full_context")),
+        )
 
     if last_error is not None:
         raise last_error

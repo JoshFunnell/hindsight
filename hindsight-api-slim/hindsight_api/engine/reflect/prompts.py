@@ -674,6 +674,37 @@ JSON STRING RULES (critical)
 
 - Do not append extra ``]`` or ``}`` after the closing ``}`` of the root object."""
 
+#: The same task, asked without a prior reflect synthesis: the delta fast path
+#: calls the model straight off the retrieved window, so SUPPORTING FACTS is the
+#: only new evidence and NEW INFORMATION SYNTHESIS comes through empty. That is
+#: the whole point of the fast path (one call instead of an agentic loop), but it
+#: means the model can genuinely lack what it needs — hence the escape hatch.
+#:
+#: Deliberately an addendum rather than an edit to the constant above: the agentic
+#: path shares that prompt and does NOT read the flag, so a model that answered
+#: "I can't do this properly" there would be ignored and its (possibly empty) op
+#: list written anyway. Keeping the base prompt byte-identical keeps that path's
+#: behaviour byte-identical too.
+STRUCTURED_DELTA_FAST_PATH_SYSTEM_PROMPT = (
+    STRUCTURED_DELTA_SYSTEM_PROMPT
+    + """
+
+ESCAPE HATCH (supersedes the single-top-level-key rule above)
+You are being called without a prior synthesis pass: NEW INFORMATION SYNTHESIS
+is empty, and SUPPORTING FACTS is the only new evidence you get. If those facts
+are not enough to edit the document correctly — they are ambiguous on their own,
+they refer to material you cannot see, or answering the TOPIC properly would
+need a broader search of the memory bank — do NOT guess and do NOT make a
+best-effort edit. Return exactly:
+
+``{"operations": [], "needs_full_context": true}``
+
+and a slower pass that can retrieve more will take over.
+
+Otherwise omit ``needs_full_context`` entirely (or set it to false) and return
+the ``{"operations": [...]}`` object exactly as described above."""
+)
+
 _STRUCTURED_DELTA_DEFAULT_MAX_INPUT_TOKENS = 24_000
 
 

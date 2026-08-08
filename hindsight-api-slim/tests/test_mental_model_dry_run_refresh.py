@@ -254,7 +254,9 @@ class TestDryRunExplainsTheModeDecision:
             name="Team Info",
             source_query="Tell me about the team",
             content="# Team\n\nYears of accumulated detail.",
-            trigger={"mode": "delta"},
+            # Pins the agentic delta path: the failing call under test is the one
+            # the reflect loop makes, which the fast path would otherwise pre-empt.
+            trigger={"mode": "delta", "delta_fast_path": False},
             request_context=request_context,
         )
         await memory.update_mental_model(
@@ -586,6 +588,8 @@ class TestKeepTrace:
             "effective_mode",
             "mode_fallback_reason",
             "outcome",
+            "fast_path",
+            "fast_path_fallback_reason",
             "tool_calls",
             "llm_calls",
             "delta_operations",

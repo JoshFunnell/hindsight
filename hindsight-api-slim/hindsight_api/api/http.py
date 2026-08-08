@@ -2183,6 +2183,18 @@ class MentalModelTrigger(BaseModel):
             "None means use the bank/global config default (recall_chunks_max_tokens)."
         ),
     )
+    delta_fast_path: bool | None = Field(
+        default=None,
+        description=(
+            "Override whether a delta refresh may take the deterministic fast path: fetch the "
+            "memories created since the last refresh and, if there are any, turn them into edit "
+            "operations with a single LLM call instead of running the agentic reflect loop. An "
+            "empty window costs no LLM call at all. The fast path hands back to the loop whenever "
+            "a surgical edit is not obviously safe, so every outcome is preserved either way. "
+            "None means use the bank/global config default (mental_model_delta_fast_path). "
+            "Ignored in full mode, which never takes the fast path."
+        ),
+    )
     response_schema: dict | None = Field(
         default=None,
         description=(
