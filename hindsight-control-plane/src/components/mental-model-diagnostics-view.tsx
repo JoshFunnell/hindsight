@@ -214,6 +214,21 @@ export function TraceSummary({ trace }: { trace: MentalModelRefreshTrace }) {
           &middot; {fallbackLabels[trace.mode_fallback_reason]}
         </span>
       )}
+      {/*
+        Which route produced the refresh, and — when the deterministic fast path
+        declined — why the agentic loop ran anyway. Rendered as the raw API
+        values in mono, like `effective_mode` directly above, rather than as
+        translated prose: these are the enum names the dry-run payload, the
+        stored trace and the docs all use, so a reader comparing this line
+        against a `reflect_response` sees the same token.
+      */}
+      {trace.fast_path && <span className="font-mono"> &middot; fast_path={trace.fast_path}</span>}
+      {trace.fast_path_fallback_reason && (
+        <span className="font-mono text-amber-700 dark:text-amber-400">
+          {" "}
+          &middot; fast_path_fallback_reason={trace.fast_path_fallback_reason}
+        </span>
+      )}
     </span>
   );
 }
