@@ -14343,6 +14343,14 @@ class MemoryEngine(MemoryEngineInterface):
                     filters.append(f"((tags IS NULL OR tags = '{{}}') OR ({scoped_clause}))")
                     params.extend(tags_params)
             if tag_groups:
+                # Directives carry no entity postings, so an entity leaf is
+                # unanswerable here and reads permissively; only the surviving
+                # tag constraints scope the directive set. memory_units queries
+                # keep their entity leaves.
+                from .search.tags import strip_entity_leaves
+
+                tag_groups = strip_entity_leaves(tag_groups)
+            if tag_groups:
                 groups_clause, groups_params, param_idx = build_tag_groups_where_clause(
                     tag_groups, param_offset=param_idx
                 )
