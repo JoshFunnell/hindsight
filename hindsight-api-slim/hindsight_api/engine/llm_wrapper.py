@@ -270,6 +270,7 @@ _PROVIDERS_WITHOUT_API_KEY = frozenset(
         "litellmrouter",
         "bedrock",
         "nous",
+        "xai-grok-cli",
     }
 )
 
@@ -531,6 +532,22 @@ def create_llm_provider(
             timeout=timeout,
         )
 
+    elif provider_lower == "xai-grok-cli":
+        # SuperGrok subscription lane: OpenAI-shaped on the wire, but with five
+        # required client headers, header-based model routing, a client-version
+        # floor, and a session token refreshed by spawning the vendor's own CLI —
+        # none of which fits the OpenAI SDK client, hence its own provider.
+        from hindsight_api.engine.providers.xai_grok_cli_llm import XaiGrokCliLLM
+
+        return XaiGrokCliLLM(
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+        )
+
     elif provider_lower == "openai-responses":
         # OpenAI Responses API (/v1/responses). Unlike chat/completions, it
         # supports reasoning + function tools together, so reflect's tool loop
@@ -723,6 +740,7 @@ class LLMProvider:
             "atlas",
             "fireworks",
             "nous",
+            "xai-grok-cli",
         ]
         if self.provider not in valid_providers:
             raise ValueError(f"Invalid LLM provider: {self.provider}. Must be one of: {', '.join(valid_providers)}")
