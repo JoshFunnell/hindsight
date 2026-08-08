@@ -1116,6 +1116,92 @@ class _MentalModelRefreshRun:
         )
 
 
+@dataclass(frozen=True)
+class _MentalModelRefreshContext:
+    """What a refresh resolved before it branched on mode or outcome.
+
+    Every branch of ``_execute_mental_model_refresh`` reports the same identity,
+    scope and window; only the document it produced differs. Grouping them here
+    is what lets ``_build_refresh_run`` be a free function callable from *before*
+    the reflect loop runs — the property the deterministic delta fast path needs
+    in order to report through the same path as the agentic one.
+    """
+
+    mental_model_id: str
+    name: str
+    requested_mode: RefreshMode
+    scope: MentalModelRefreshScope
+    window: MentalModelRefreshWindow
+    current_content: str
+    source_query: str
+    processed_watermark: datetime | None
+    started: float
+
+
+@dataclass(frozen=True)
+class _MentalModelRefreshEvidence:
+    """What produced a refresh's candidate document, whichever path produced it.
+
+    The agentic loop fills this from its ``ReflectResult``; the delta fast path
+    fills it from its own typed retrieval plus (on tier 1) its single delta call.
+    The two fields later stages still mutate — ``reflect_response`` and
+    ``warnings`` — are deliberately NOT carried here, so nothing holds a snapshot
+    that keeps changing under it; they are passed per branch instead.
+    """
+
+    candidate_content: str
+    facts: MentalModelFactCounts
+    tool_calls: list[MentalModelTraceToolCall] = field(default_factory=list)
+    llm_calls: list[LLMCallTrace] = field(default_factory=list)
+    usage: TokenUsage = field(default_factory=TokenUsage)
+
+
+def _build_refresh_run(
+    ctx: _MentalModelRefreshContext,
+    evidence: _MentalModelRefreshEvidence,
+    *,
+    effective_mode: RefreshMode,
+    mode_fallback_reason: ModeFallbackReason | None,
+    final_content: str,
+    final_structured: StructuredDocument | None,
+    delta_operations: MentalModelDeltaOperations | None,
+    reflect_response: dict[str, Any],
+    outcome: RefreshOutcome,
+    warnings: list[str],
+) -> _MentalModelRefreshRun:
+    """Assemble the run that one refresh branch produced.
+
+    This was a closure inside ``_execute_mental_model_refresh`` that captured the
+    post-reflect locals. It is a free function now because the delta fast path
+    finishes *before* those locals exist, and a fast-path refresh that reported
+    through a different assembler than the agentic one would drift from it.
+    """
+    return _MentalModelRefreshRun(
+        mental_model_id=ctx.mental_model_id,
+        name=ctx.name,
+        requested_mode=ctx.requested_mode,
+        effective_mode=effective_mode,
+        mode_fallback_reason=mode_fallback_reason,
+        scope=ctx.scope,
+        window=ctx.window,
+        facts=evidence.facts,
+        current_content=ctx.current_content,
+        candidate_content=evidence.candidate_content,
+        final_content=final_content,
+        final_structured=final_structured,
+        delta_operations=delta_operations,
+        reflect_response=reflect_response,
+        source_query=ctx.source_query,
+        processed_watermark=ctx.processed_watermark,
+        outcome=outcome,
+        tool_calls=evidence.tool_calls,
+        llm_calls=evidence.llm_calls,
+        usage=evidence.usage,
+        duration_ms=int((time.time() - ctx.started) * 1000),
+        warnings=warnings,
+    )
+
+
 @dataclass
 class ResolvedDispositionMission:
     """Disposition + mission after overlaying resolved bank config on the legacy columns."""
@@ -12109,6 +12195,17 @@ class MemoryEngine(MemoryEngineInterface):
             created_before=refresh_cutoff,
             watermark=processed_watermark,
         )
+        ctx = _MentalModelRefreshContext(
+            mental_model_id=mental_model_id,
+            name=mm_name,
+            requested_mode=requested_mode,
+            scope=scope,
+            window=window,
+            current_content=current_content,
+            source_query=source_query,
+            processed_watermark=processed_watermark,
+            started=started,
+        )
 
         reflect_result = await self.reflect_async(**reflect_kwargs)
 
@@ -12193,40 +12290,13 @@ class MemoryEngine(MemoryEngineInterface):
                 "what the retrieved memories are about."
             )
 
-        def _finish(
-            *,
-            effective_mode: RefreshMode,
-            mode_fallback_reason: ModeFallbackReason | None,
-            final_content: str,
-            final_structured: StructuredDocument | None,
-            delta_operations: MentalModelDeltaOperations | None,
-            outcome: RefreshOutcome,
-        ) -> _MentalModelRefreshRun:
-            """Close over everything the pipeline resolved before it branched."""
-            return _MentalModelRefreshRun(
-                mental_model_id=mental_model_id,
-                name=mm_name,
-                requested_mode=requested_mode,
-                effective_mode=effective_mode,
-                mode_fallback_reason=mode_fallback_reason,
-                scope=scope,
-                window=window,
-                facts=facts,
-                current_content=current_content,
-                candidate_content=reflect_result.text,
-                final_content=final_content,
-                final_structured=final_structured,
-                delta_operations=delta_operations,
-                reflect_response=reflect_response_payload,
-                source_query=source_query,
-                processed_watermark=processed_watermark,
-                outcome=outcome,
-                tool_calls=_summarize_refresh_tool_calls(reflect_result.tool_trace, created_after),
-                llm_calls=list(reflect_result.llm_trace),
-                usage=reflect_result.usage or TokenUsage(),
-                duration_ms=int((time.time() - started) * 1000),
-                warnings=warnings,
-            )
+        evidence = _MentalModelRefreshEvidence(
+            candidate_content=reflect_result.text,
+            facts=facts,
+            tool_calls=_summarize_refresh_tool_calls(reflect_result.tool_trace, created_after),
+            llm_calls=list(reflect_result.llm_trace),
+            usage=reflect_result.usage or TokenUsage(),
+        )
 
         # Delta-mode path: emit structured operations against the existing
         # structured doc, apply them, then re-render to markdown. Sections
@@ -12289,13 +12359,17 @@ class MemoryEngine(MemoryEngineInterface):
                 if not supporting_facts:
                     reflect_response_payload["delta_applied"] = False
                     reflect_response_payload["delta_skipped_reason"] = "no_new_facts"
-                    return _finish(
+                    return _build_refresh_run(
+                        ctx,
+                        evidence,
                         effective_mode="delta",
                         mode_fallback_reason=None,
                         final_content=current_content,
                         final_structured=None,
                         delta_operations=None,
+                        reflect_response=reflect_response_payload,
                         outcome="content_preserved_no_new_facts",
+                        warnings=warnings,
                     )
 
                 # Op JSON is denser than the rendered markdown — each op
@@ -12402,13 +12476,17 @@ class MemoryEngine(MemoryEngineInterface):
                 "The refresh produced empty content, which usually means an upstream LLM failure. "
                 "A real refresh would preserve the existing content and fail."
             )
-            return _finish(
+            return _build_refresh_run(
+                ctx,
+                evidence,
                 effective_mode=effective_mode,
                 mode_fallback_reason=mode_fallback_reason,
                 final_content=final_content,
                 final_structured=None,
                 delta_operations=delta_operations,
+                reflect_response=reflect_response_payload,
                 outcome="refresh_failed_empty_candidate",
+                warnings=warnings,
             )
 
         # Refuse to write a delta-window candidate as the whole document (#3112).
@@ -12423,13 +12501,17 @@ class MemoryEngine(MemoryEngineInterface):
         # this correct anyway, because a candidate read over full history IS a document
         # and writing it is a legitimate full regeneration.
         if use_delta and not delta_applied and created_after is not None:
-            return _finish(
+            return _build_refresh_run(
+                ctx,
+                evidence,
                 effective_mode=effective_mode,
                 mode_fallback_reason=mode_fallback_reason,
                 final_content=final_content,
                 final_structured=None,
                 delta_operations=delta_operations,
+                reflect_response=reflect_response_payload,
                 outcome="refresh_failed_delta_not_applied",
+                warnings=warnings,
             )
 
         # When delta is not applied (full mode, or delta fallback), parse the
@@ -12444,13 +12526,17 @@ class MemoryEngine(MemoryEngineInterface):
                     f"for {mental_model_id} ({exc}); leaving structured_content unchanged"
                 )
 
-        return _finish(
+        return _build_refresh_run(
+            ctx,
+            evidence,
             effective_mode=effective_mode,
             mode_fallback_reason=mode_fallback_reason,
             final_content=final_content,
             final_structured=final_structured,
             delta_operations=delta_operations,
+            reflect_response=reflect_response_payload,
             outcome="content_written",
+            warnings=warnings,
         )
 
     async def refresh_mental_model(
