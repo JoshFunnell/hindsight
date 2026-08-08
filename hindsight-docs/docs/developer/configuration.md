@@ -170,7 +170,7 @@ For non-English banks (especially CJK) and the language/extraction-language trad
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_LLM_PROVIDER` | Provider: `openai`, `openai-responses`, `openai-codex`, `claude-code`, `anthropic`, `gemini`, `groq`, `minimax`, `deepseek`, `zai`, `opencode-go`, `nous`, `fireworks`, `ollama`, `ollama-cloud`, `lmstudio`, `llamacpp`, `vertexai`, `bedrock`, `litellm`, `litellmrouter`, `volcano`, `openrouter`, `requesty`, `none` | `openai` |
+| `HINDSIGHT_API_LLM_PROVIDER` | Provider: `openai`, `openai-responses`, `openai-codex`, `claude-code`, `anthropic`, `gemini`, `groq`, `minimax`, `deepseek`, `zai`, `opencode-go`, `nous`, `xai-grok-cli`, `fireworks`, `ollama`, `ollama-cloud`, `lmstudio`, `llamacpp`, `vertexai`, `bedrock`, `litellm`, `litellmrouter`, `volcano`, `openrouter`, `requesty`, `none` | `openai` |
 | `HINDSIGHT_API_LLM_API_KEY` | API key for LLM provider | - |
 | `HINDSIGHT_API_LLM_MODEL` | Model name | `gpt-5-mini` |
 | `HINDSIGHT_API_LLM_BASE_URL` | Custom LLM endpoint | Provider default |
@@ -347,6 +347,14 @@ export HINDSIGHT_API_LLM_MODEL=deepseek/deepseek-v4-flash
 # No API key needed — reads a rotating JWT from ~/.hermes/auth.json (run `hermes portal` first).
 # Default base_url: https://inference-api.nousresearch.com/v1 (override with HINDSIGHT_API_LLM_BASE_URL if needed)
 # See the "Nous Portal Setup" section in the Models guide for the login flow.
+
+# SuperGrok via the Grok CLI (no API key — uses your `grok login` session; local/personal use)
+export HINDSIGHT_API_LLM_PROVIDER=xai-grok-cli
+export HINDSIGHT_API_LLM_MODEL=grok-4.5
+# No API key needed — reads a session token from ~/.grok/auth.json (run `grok login` first).
+# Requires Grok CLI >= 0.1.202; older clients are refused with HTTP 426.
+# See the "SuperGrok Setup" section in the Models guide, including the deployment matrix
+# for containerized engines (read-only auth mount + a host-side refresher).
 
 # AWS Bedrock (native support - no API key needed, uses AWS credentials)
 export HINDSIGHT_API_LLM_PROVIDER=bedrock

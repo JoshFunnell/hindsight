@@ -238,6 +238,11 @@ export HINDSIGHT_API_LLM_PROVIDER=nous
 export HINDSIGHT_API_LLM_MODEL=deepseek/deepseek-v4-flash  # any Nous-hosted slug
 # No API key needed — reads a rotating JWT from ~/.hermes/auth.json (see "Nous Portal Setup" below)
 
+# SuperGrok via the Grok CLI (no API key — uses your `grok login` session; local/personal use)
+export HINDSIGHT_API_LLM_PROVIDER=xai-grok-cli
+# export HINDSIGHT_API_LLM_MODEL=grok-4.5  # defaults to grok-4.5
+# No API key needed — reads a session token from ~/.grok/auth.json (see "SuperGrok Setup" below)
+
 # Vertex AI (Google Cloud)
 export HINDSIGHT_API_LLM_PROVIDER=vertexai
 export HINDSIGHT_API_LLM_MODEL=gemini-3.1-flash-lite
@@ -467,6 +472,105 @@ You can use any model supported by Claude Code CLI.
 - Usage billed to your Claude subscription (not separate API costs)
 - For personal development use only (see Claude Terms of Service)
 
+
+---
+
+### SuperGrok Setup (Grok CLI subscription)
+
+Use your SuperGrok subscription for Hindsight via the Grok CLI's session
+credential — no xAI API key.
+
+
+:::warning Terms of Service Notice
+
+This provider talks to `https://cli-chat-proxy.grok.com/v1`, the backend the
+vendor's own Grok CLI uses, with the session token that CLI stores in
+`~/.grok/auth.json`.
+
+**Please be aware:**
+
+- The auth recipe is documented *inside* the Grok CLI itself ("Using auth.json
+  for API Access"), but this endpoint is **not** a separately published,
+  stability-guaranteed API product. It can change without notice.
+- Rate-limit and permitted-use terms are not published for this path. Usage
+  counts against your SuperGrok subscription limits.
+- Hindsight performs no login on your behalf — it reads a credential you
+  already created with `grok login`, and it only ever **reads** that file.
+- This provider is intended for **local, personal use only**. Do not use it in
+  production deployments or shared environments.
+- For production or team use, use an API-key provider instead.
+
+:::
+
+
+**Prerequisites:**
+- Active SuperGrok subscription
+- Grok CLI installed and logged in (version **0.1.202 or newer** — older clients
+  are refused with HTTP 426)
+
+**Setup Steps:**
+
+1. **Log in with the Grok CLI:**
+   ```bash
+   grok login
+   ```
+   This authenticates with your xAI account and saves a session token to
+   `~/.grok/auth.json`.
+
+2. **Verify:**
+   ```bash
+   grok --version   # must be >= 0.1.202
+   ls ~/.grok/auth.json
+   ```
+
+3. **Configure Hindsight:**
+   ```bash
+   export HINDSIGHT_API_LLM_PROVIDER=xai-grok-cli
+   # export HINDSIGHT_API_LLM_MODEL=grok-4.5   # defaults to grok-4.5
+   # No API key needed — reads ~/.grok/auth.json automatically
+   ```
+
+4. **Start Hindsight:**
+   ```bash
+   hindsight-api
+   ```
+
+**Important Notes:**
+- The session token lives in `~/.grok/auth.json` and expires roughly every six
+  hours. Hindsight refreshes it by invoking the Grok CLI once with a throwaway
+  prompt and re-reading the file — it never writes the credential itself, so it
+  cannot log you out of your own tooling.
+- A request is only admitted when the token outlives both the refresh margin and
+  the configured request timeout, so a long call cannot start against a
+  credential that will expire mid-flight.
+- The endpoint requires an `x-grok-client-version` header and refuses anything
+  below its floor with HTTP 426. Hindsight reads that version from the CLI once
+  per process; if the server later raises the floor, calls fail with a message
+  telling you to run `grok update`.
+- Unlike the OpenAI-compatible route to this endpoint, this provider sends the
+  member's configured `reasoning_effort`, so that setting takes effect here.
+- Only non-streaming calls are implemented. Streaming responses omit
+  `prompt_tokens_details`, so cached-token accounting would read low.
+
+**Optional environment overrides:**
+
+| Variable | Purpose |
+|---|---|
+| `HINDSIGHT_API_XAI_GROK_CLI_BASE_URL` | Point at a different upstream. Takes precedence over `HINDSIGHT_API_LLM_BASE_URL`. |
+| `HINDSIGHT_API_XAI_GROK_CLI_BIN` | Path to the Grok CLI binary, when it is not `grok`/`agent` on `PATH`. |
+| `HINDSIGHT_API_XAI_GROK_CLI_CLIENT_VERSION` | Pin `x-grok-client-version` instead of probing the CLI. **Required when no CLI is present.** |
+| `HINDSIGHT_API_XAI_GROK_CLI_AUTH_FILE` | **Read-side only** override of the credential path. It does not relocate where a refresh *writes*, so it is not the read-and-write relocation `CODEX_HOME` provides for Codex. |
+
+#### Deployment matrix
+
+The credential is a host-local file and the refresh is a host-local process, so
+where Hindsight runs decides whether this provider is a complete story:
+
+| Deployment | Credential | Refresh | Verdict |
+|---|---|---|---|
+| **Host-local engine** (laptop, bare metal) | default `~/.grok/auth.json` | CLI spawn works | Full native story — nothing else to arrange. |
+| **Containerized engine, host has the CLI** | mount the auth directory **read-only** into the container and point `HINDSIGHT_API_XAI_GROK_CLI_AUTH_FILE` at the mount; also set `HINDSIGHT_API_XAI_GROK_CLI_CLIENT_VERSION`, since there is no CLI inside the container to probe | In-container refresh is impossible. A **host-side refresher** must keep the file fresh (a scheduled no-op CLI invocation); Hindsight treats a missing CLI as a soft state and keeps serving while the token is valid | Works continuously **only if** that host-side refresher exists. Without it, calls fail with a `grok login` remediation once the token expires. |
+| **Containerized engine, no host CLI arrangement** | — | — | Not a supported shape for this provider; use an API-key provider. |
 
 ---
 
