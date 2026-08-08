@@ -18,6 +18,7 @@ from ..causal_links import (
 from ..db.base import DatabaseConnection
 from ..db.ops import DataAccessOps
 from ..memory_engine import fq_table
+from .entity_labels import build_labels_lookup, is_label_entity, parse_entity_labels
 from .types import CausalRelation, EntityResolutionResult
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,30 @@ def _normalize_entity_name(name: str) -> str:
     matches on LOWER(canonical_name) separately.
     """
     return _WHITESPACE_RUN_RE.sub(" ", name).strip()
+
+
+# Conservative tag-shape: lowercase-word ":" lowercase-word, e.g. "domain:lens".
+# Deliberately does NOT match URLs (contain "//"), Windows paths (contain "\"
+# or a single-letter drive prefix like "C:"), times ("12:30" -- digits before
+# the colon), names with spaces or dots ("re: subject"), or names with no
+# colon at all ("backup", "x-grok-conv-id").
+_TAG_SHAPE_RE = re.compile(r"^[a-z][a-z0-9_-]{1,15}:[a-z][a-z0-9_-]{1,24}$")
+
+
+def _is_tag_shaped_name(name: str) -> bool:
+    """Return True if `name` (already whitespace-normalized) looks like a
+    category/tag label rather than an entity, e.g. "domain:lens".
+
+    Motivation: extraction was measured (2026-08-08) minting entities named
+    domain:lens, domain:host, domain:memory -- category labels, not entities.
+    They behave like broad tags and measurably poisoned entity-based scoping
+    (61.5% vs 94.0% precision on one subject). Matching is done against a
+    lowercased copy of the name; the stored/compared name's case is untouched
+    by this check. Callers must exempt names that are configured entity
+    labels (e.g. "use:use-001") before treating a match here as skippable --
+    label values are deliberately "key:value" shaped (GH-1558).
+    """
+    return bool(_TAG_SHAPE_RE.match(name.lower()))
 
 
 # Maximum number of temporal links to keep per unit (from_unit_id).
@@ -165,9 +190,20 @@ def _prepare_entities_for_resolution(
     fact_dates: list,
     llm_entities: list[list[dict]],
     log_buffer: list[str] = None,
+    entity_labels: list | None = None,
 ) -> tuple[list[dict], list[list[dict]], list[tuple]]:
     """
     Convert LLM entities into the flat format expected by entity resolver.
+
+    Also drops candidate names that are tag-shaped (e.g. "domain:lens") rather
+    than real entities -- see `_is_tag_shaped_name`. A tag-shaped name that is
+    also a configured entity label (e.g. "use:use-001" from a tag-type label
+    group) is exempt: label values are deliberately "key:value" shaped and
+    must still reach entity resolution (GH-1558 exact-match path).
+
+    Args:
+        entity_labels: Optional configured label taxonomy, used only to
+            exempt configured label values from the tag-shape skip.
 
     Returns:
         Tuple of (all_entities_flat, all_entities, entity_to_unit) where:
@@ -175,8 +211,12 @@ def _prepare_entities_for_resolution(
         - all_entities: per-unit formatted entity lists
         - entity_to_unit: maps flat index to (unit_id, local_index, fact_date)
     """
+    labels_cfg = parse_entity_labels(entity_labels)
+    labels_lookup = build_labels_lookup(labels_cfg) if labels_cfg else set()
+
     substep_start = time.time()
     all_entities = []
+    skipped_tag_shaped = 0
     for entity_list in llm_entities:
         formatted_entities = []
         for ent in entity_list:
@@ -186,8 +226,23 @@ def _prepare_entities_for_resolution(
                 raw_text, entity_type = ent.get("text", ""), ent.get("type", "CONCEPT")
             else:
                 continue
-            formatted_entities.append({"text": _normalize_entity_name(raw_text), "type": entity_type})
+
+            normalized_text = _normalize_entity_name(raw_text)
+            is_configured_label = bool(labels_cfg) and is_label_entity(normalized_text, labels_cfg, labels_lookup)
+            if not is_configured_label and _is_tag_shaped_name(normalized_text):
+                skipped_tag_shaped += 1
+                logger.debug("Skipping tag-shaped candidate entity name: %r", normalized_text)
+                continue
+
+            formatted_entities.append({"text": normalized_text, "type": entity_type})
         all_entities.append(formatted_entities)
+
+    if skipped_tag_shaped:
+        _log(
+            log_buffer,
+            f"  [6.1] Skipped {skipped_tag_shaped} tag-shaped candidate entity name(s)",
+            level="debug",
+        )
 
     total_entities = sum(len(ents) for ents in all_entities)
     _log(
@@ -263,7 +318,7 @@ async def resolve_entities_only(
         Phase 2.
     """
     all_entities_flat, _all_entities, entity_to_unit = _prepare_entities_for_resolution(
-        unit_ids, sentences, fact_dates, llm_entities, log_buffer
+        unit_ids, sentences, fact_dates, llm_entities, log_buffer, entity_labels
     )
 
     if not all_entities_flat:
