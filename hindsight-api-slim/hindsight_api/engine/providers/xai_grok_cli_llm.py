@@ -230,7 +230,7 @@ def _conversation_affinity_id(messages: list[dict[str, Any]]) -> str | None:
     context = current_trace_context()
     if context is not None and context.trace_id:
         return hashlib.sha256(context.trace_id.encode("utf-8")).hexdigest()[:32]
-    if not messages or not isinstance(messages[0], dict):
+    if not isinstance(messages, list) or not messages or not isinstance(messages[0], dict):
         return None
     try:
         first = json.dumps(messages[0], sort_keys=True, ensure_ascii=False, default=str)

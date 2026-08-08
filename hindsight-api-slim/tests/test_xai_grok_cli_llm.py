@@ -53,6 +53,7 @@ from hindsight_api.engine.providers.xai_grok_cli_llm import (
     TOKEN_AUTH_MODE,
     XaiGrokCliLLM,
     _ChatUsage,
+    _conversation_affinity_id,
     _token_counts,
 )
 
@@ -205,6 +206,30 @@ async def test_conv_id_is_stable_for_the_same_leading_message(tmp_path, monkeypa
     await llm.call(messages=[{"role": "system", "content": "S"}, {"role": "user", "content": "b"}], max_retries=0)
     first, second = (call["headers"]["x-grok-conv-id"] for call in llm._client.calls)
     assert first == second
+
+
+def test_conversation_affinity_id_hashes_a_list_of_dict_messages():
+    result = _conversation_affinity_id([{"role": "system", "content": "S"}])
+    assert result is not None
+    assert len(result) == 32
+    assert all(c in "0123456789abcdef" for c in result)
+
+
+def test_conversation_affinity_id_fails_open_on_a_string():
+    assert _conversation_affinity_id("not a list") is None  # type: ignore[arg-type]
+
+
+def test_conversation_affinity_id_fails_open_on_a_dict():
+    """A bare dict indexes to ``messages[0]`` (KeyError), not a first message."""
+    assert _conversation_affinity_id({"role": "system", "content": "S"}) is None  # type: ignore[arg-type]
+
+
+def test_conversation_affinity_id_fails_open_on_an_empty_list():
+    assert _conversation_affinity_id([]) is None
+
+
+def test_conversation_affinity_id_fails_open_on_none():
+    assert _conversation_affinity_id(None) is None  # type: ignore[arg-type]
 
 
 async def test_reasoning_effort_and_token_cap_land_in_the_body(tmp_path, monkeypatch):
