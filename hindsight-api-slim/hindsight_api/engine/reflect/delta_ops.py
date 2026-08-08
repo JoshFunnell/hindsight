@@ -4,7 +4,20 @@ The LLM's job during a delta refresh is to emit a list of these operations,
 each targeting an existing section (by id) or referencing a position relative
 to one.  ``apply_operations`` validates and applies each op in turn against a
 copy of the document; invalid ops (unknown ``section_id``, out-of-range
-``block_index``, malformed payloads) are dropped with a debug-friendly reason.
+``block_index``, a mismatched block ``anchor``, malformed payloads) are
+dropped with a debug-friendly reason.
+
+Block-targeting ops (``replace_block``, ``remove_block``, and ``insert_block``
+when its index names an existing block) also carry a content ``anchor``: a
+verbatim excerpt of the block the LLM believes is at the given index.
+``apply_operations`` checks the anchor against the block actually there
+before mutating anything. This guards against a wrong-but-in-range index,
+which is otherwise indistinguishable from a correct one — the LLM's only way
+to know a block's index in the compact JSON it is shown is to count array
+elements, and a miscount silently lands the op on the wrong block instead of
+failing loudly. See ``serialize_document_for_delta_prompt`` for the
+prompt-facing view that annotates each block with its index so the model can
+read it instead of counting.
 
 Sections and blocks not mentioned by any op are physically copied through
 unchanged — there is no LLM-mediated re-emission of unchanged text, so prose
@@ -28,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
@@ -36,6 +50,10 @@ from hindsight_api.engine.llm_wrapper import parse_llm_json
 
 from .structured_doc import (
     Block,
+    BulletListBlock,
+    CodeBlock,
+    OrderedListBlock,
+    ParagraphBlock,
     Section,
     StructuredDocument,
     make_unique_id,
@@ -64,29 +82,55 @@ class InsertBlockOp(_OpBase):
     """Insert a new block at ``index`` in an existing section.
 
     ``index`` may equal ``len(section.blocks)`` (append) but not be greater.
+
+    ``anchor`` names the block this insert will land before: a verbatim
+    excerpt of the block currently at ``index``. Required only when ``index``
+    names an existing block (``index < len(section.blocks)``); at the append
+    position there is no block to anchor against, so ``anchor`` may be left
+    empty there. See ``ReplaceBlockOp`` for the matching rules and why this
+    exists.
     """
 
     op: Literal["insert_block"] = "insert_block"
     section_id: str
     index: int = Field(ge=0)
+    anchor: str = ""
     block: Block
 
 
 class ReplaceBlockOp(_OpBase):
-    """Replace the block at ``index`` of an existing section."""
+    """Replace the block at ``index`` of an existing section.
+
+    ``anchor`` must be a verbatim excerpt (~50 chars) of the block's own
+    content at ``index`` — its ``text`` field, or ``items`` joined with a
+    space for list blocks — copied from what the model was shown at that
+    index. ``apply_operations`` compares it (whitespace-normalized) against
+    the block actually there before replacing it, and skips the op on a
+    mismatch or a missing anchor instead of applying it. This is the guard
+    against a miscounted, wrong-but-in-range ``index``: without it, a wrong
+    index is indistinguishable from a correct one and silently destroys the
+    wrong block's content.
+    """
 
     op: Literal["replace_block"] = "replace_block"
     section_id: str
     index: int = Field(ge=0)
+    anchor: str = ""
     block: Block
 
 
 class RemoveBlockOp(_OpBase):
-    """Remove the block at ``index`` of an existing section."""
+    """Remove the block at ``index`` of an existing section.
+
+    See ``ReplaceBlockOp`` for the ``anchor`` field's role and matching
+    rules — identical here, since removal is equally destructive of the
+    wrong block on a miscounted index.
+    """
 
     op: Literal["remove_block"] = "remove_block"
     section_id: str
     index: int = Field(ge=0)
+    anchor: str = ""
 
 
 class AddSectionOp(_OpBase):
@@ -316,6 +360,110 @@ def parse_delta_operation_list(raw: Any) -> DeltaOperationList:
     return DeltaOperationList()
 
 
+# Anchor matching -------------------------------------------------------------
+#
+# Block-targeting ops are validated against the document by *index*, but an
+# index alone cannot distinguish a correct one from a miscounted one that
+# still happens to be in range. The anchor closes that gap: the LLM quotes a
+# short excerpt of the block it believes is at the claimed index, and we
+# check that excerpt against the block actually there before mutating it.
+
+#: ~40-60 chars is enough to disambiguate two blocks that happen to share a
+#: short common opening (e.g. two bullet items both starting "The system"),
+#: while staying cheap for the model to quote and cheap for the prompt to
+#: carry every refresh.
+_ANCHOR_EXCERPT_CHARS = 50
+
+_WHITESPACE_RX = re.compile(r"\s+")
+
+
+def _normalize_anchor_text(text: str) -> str:
+    """Collapse whitespace runs to a single space and strip.
+
+    Anchors are compared after this normalization so incidental whitespace
+    differences (a stray double space, a line-wrapped newline inside the
+    model's quoted excerpt) never cause a spurious mismatch. Normalization
+    only touches whitespace characters, so any real content difference —
+    the case this exists to catch — still causes a mismatch.
+    """
+    return _WHITESPACE_RX.sub(" ", text).strip()
+
+
+def _block_content_text(block: Block) -> str:
+    """The block's own text content, independent of markdown rendering.
+
+    This mirrors what ``serialize_document_for_delta_prompt`` shows the model
+    for each block — the raw ``text`` field, or ``items`` joined with a space
+    — rather than ``render_block``'s markdown form (bullet ``- `` prefixes,
+    code fences). A model quoting verbatim from what it was shown then
+    produces a matching anchor without needing to reconstruct markdown syntax
+    it was never shown as such.
+    """
+    if isinstance(block, (ParagraphBlock, CodeBlock)):
+        return block.text
+    if isinstance(block, (BulletListBlock, OrderedListBlock)):
+        return " ".join(block.items)
+    raise TypeError(f"Unknown block type: {type(block)!r}")  # pragma: no cover
+
+
+def _anchor_matches(block: Block, anchor: str) -> bool:
+    """True if ``anchor`` verbatim-matches (whitespace-normalized) a prefix
+    of ``block``'s own content. An empty/whitespace-only anchor never
+    matches — see ``_check_block_anchor`` for the "missing anchor" case.
+    """
+    normalized_anchor = _normalize_anchor_text(anchor)
+    if not normalized_anchor:
+        return False
+    normalized_content = _normalize_anchor_text(_block_content_text(block))
+    return normalized_content.startswith(normalized_anchor)
+
+
+def _check_block_anchor(section: Section, index: int, anchor: str) -> str | None:
+    """Validate a block-targeting op's anchor against the block actually at
+    ``index`` (the caller must range-check ``index`` first).
+
+    Returns ``None`` when the op may proceed, or a skip reason string when it
+    must not. A missing/empty anchor is treated as a mismatch — fail closed —
+    so an op from a model (or an older caller) that never adopted the anchor
+    contract loses that op rather than risk it landing on the wrong block.
+    """
+    if not anchor:
+        return "missing anchor"
+    if not _anchor_matches(section.blocks[index], anchor):
+        return f"anchor mismatch at index {index}"
+    return None
+
+
+def serialize_document_for_delta_prompt(doc: StructuredDocument) -> str:
+    """Render a document to the JSON the delta-ops prompt shows the model,
+    with each block additionally annotated with its own 0-based ``index``
+    within its section.
+
+    Without this, the model has to silently count array elements in a
+    compact, unannotated JSON dump to know which index a block sits at —
+    exactly the failure mode that produces the wrong-but-in-range indices the
+    ``anchor`` fields above guard against. Annotating the index removes the
+    need to count at all.
+
+    ``index`` is prompt-only. It is not, and must never become, a real field
+    on ``Block``: every block subtype declares ``model_config =
+    ConfigDict(extra="forbid")``, so nothing that parses this JSON back
+    through ``StructuredDocument.model_validate`` can accept it — callers
+    parse the model's *operations* against the real document, never this
+    view, back into a ``StructuredDocument``.
+    """
+    sections_out = [
+        {
+            "id": section.id,
+            "heading": section.heading,
+            "level": section.level,
+            "blocks": [{"index": i, **block.model_dump(mode="json")} for i, block in enumerate(section.blocks)],
+        }
+        for section in doc.sections
+    ]
+    return json.dumps({"version": doc.version, "sections": sections_out})
+
+
 # Application ---------------------------------------------------------------
 
 
@@ -348,8 +496,9 @@ def apply_operations(
     """Apply a list of operations to a document, returning a new document.
 
     The original document is never mutated. Invalid operations (unknown
-    section, out-of-range index, name collision when adding a section) are
-    skipped and recorded in ``skipped`` with a ``reason`` string.
+    section, out-of-range index, a mismatched or missing block anchor, name
+    collision when adding a section) are skipped and recorded in ``skipped``
+    with a ``reason`` string.
     """
     new_doc = doc.model_copy(deep=True)
     applied: list[dict[str, Any]] = []
@@ -382,6 +531,14 @@ def apply_operations(
                     f"index out of range: {op.index} > {len(section.blocks)}",
                 )
                 continue
+            if op.index < len(section.blocks):
+                # `index` names an existing block (the one this insert lands
+                # before); at the append position (index == len(blocks))
+                # there is no block there to anchor against.
+                anchor_reason = _check_block_anchor(section, op.index, op.anchor)
+                if anchor_reason is not None:
+                    skip(op, anchor_reason)
+                    continue
             section.blocks.insert(op.index, op.block)
             applied.append(_op_summary(op))
             continue
@@ -397,6 +554,10 @@ def apply_operations(
                     f"index out of range: {op.index} >= {len(section.blocks)}",
                 )
                 continue
+            anchor_reason = _check_block_anchor(section, op.index, op.anchor)
+            if anchor_reason is not None:
+                skip(op, anchor_reason)
+                continue
             section.blocks[op.index] = op.block
             applied.append(_op_summary(op))
             continue
@@ -411,6 +572,10 @@ def apply_operations(
                     op,
                     f"index out of range: {op.index} >= {len(section.blocks)}",
                 )
+                continue
+            anchor_reason = _check_block_anchor(section, op.index, op.anchor)
+            if anchor_reason is not None:
+                skip(op, anchor_reason)
                 continue
             section.blocks.pop(op.index)
             applied.append(_op_summary(op))

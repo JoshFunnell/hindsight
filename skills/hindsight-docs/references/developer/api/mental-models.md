@@ -248,7 +248,9 @@ Hindsight keeps an authoritative **structured** representation of the document �
 
 Anything no operation mentions is copied through untouched, so unchanged prose is preserved rather than regenerated and checked. This matters because "preserve the unchanged content" is only a soft constraint on an LLM — generating the next token from a gestalt of the input is what it intrinsically does, so instructed-to-preserve prose drifts over many refreshes.
 
-Failure modes are conservative by design: an operation referencing a section or block that doesn't exist is **dropped** rather than guessed at, and the rest of the operations still apply. The refresh records which ones were dropped and why, so you can see that part of that round's new information didn't make it into the document.
+`replace_block`, `remove_block`, and `insert_block` (when its `index` names an existing block) also require an `anchor`: a short verbatim excerpt of the block the model believes is at that index. Each block in the document shown to the model is annotated with its own index, so the model reads the position instead of counting array elements — but a miscount is still possible, and a wrong-but-in-range index is otherwise indistinguishable from a correct one. Before applying the op, Hindsight checks the anchor against the block actually at that index and drops the op on a mismatch (or a missing anchor) instead of risking it landing on the wrong block.
+
+Failure modes are conservative by design: an operation referencing a section or block that doesn't exist, or whose anchor doesn't match the block at its index, is **dropped** rather than guessed at, and the rest of the operations still apply. The refresh records which ones were dropped and why, so you can see that part of that round's new information didn't make it into the document.
 
 Delta mode falls back to a full regeneration automatically in two cases:
 1. The mental model has no existing content yet (nothing to anchor edits on).

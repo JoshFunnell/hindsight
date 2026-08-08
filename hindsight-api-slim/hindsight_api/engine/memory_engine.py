@@ -12230,6 +12230,7 @@ class MemoryEngine(MemoryEngineInterface):
             DeltaAllOpsInvalidError,
             apply_operations,
             parse_delta_operation_list,
+            serialize_document_for_delta_prompt,
         )
         from .reflect.prompts import (
             STRUCTURED_DELTA_FAST_PATH_SYSTEM_PROMPT,
@@ -12353,7 +12354,12 @@ class MemoryEngine(MemoryEngineInterface):
         doc_max_tokens = stored_max_tokens or 2048
         delta_max_tokens = max(2048, int(doc_max_tokens * 1.5))
         user_prompt = build_structured_delta_prompt(
-            current_document_json=current_doc.model_dump_json(),
+            # Annotated with each block's own index, not a bare model dump —
+            # see serialize_document_for_delta_prompt's docstring for why a
+            # compact, unannotated dump makes the model silently count array
+            # elements to know a block's index, which is the root cause the
+            # anchor/index fix in delta_ops.py exists to remove.
+            current_document_json=serialize_document_for_delta_prompt(current_doc),
             # There is no synthesis on this path — that is the call being skipped.
             # The fast-path system prompt says so and tells the model to ask for
             # the agentic pass rather than guess when the facts alone fall short.
@@ -12793,6 +12799,7 @@ class MemoryEngine(MemoryEngineInterface):
         from .reflect.delta_ops import (
             apply_operations,
             parse_delta_operation_list,
+            serialize_document_for_delta_prompt,
         )
         from .reflect.prompts import (
             STRUCTURED_DELTA_SYSTEM_PROMPT,
@@ -12844,7 +12851,9 @@ class MemoryEngine(MemoryEngineInterface):
                 doc_max_tokens = stored_max_tokens or 2048
                 delta_max_tokens = max(2048, int(doc_max_tokens * 1.5))
                 user_prompt = build_structured_delta_prompt(
-                    current_document_json=current_doc.model_dump_json(),
+                    # Annotated with each block's own index — see
+                    # serialize_document_for_delta_prompt's docstring.
+                    current_document_json=serialize_document_for_delta_prompt(current_doc),
                     candidate_markdown=reflect_result.text,
                     supporting_facts=supporting_facts,
                     source_query=source_query,
