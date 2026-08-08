@@ -3135,6 +3135,13 @@ class MemoryEngine(MemoryEngineInterface):
             based_on_counts={fact_type: len(facts or []) for fact_type, facts in based_on.items()},
             delta_ops_applied=len(reflect_response.get("delta_operations_applied") or []),
             delta_ops_skipped=len(reflect_response.get("delta_operations_skipped") or []),
+            # reflect_response carries the tier as `fast_path`: "tier0"/"tier1" from the
+            # fast path, and None from the agentic loop. Normalised to "tier2" here so
+            # the persisted value names the tier that ran rather than the absence of a
+            # flag -- a null in result_metadata would be ambiguous between "agentic" and
+            # "written by a build that predates this field".
+            serving_tier=reflect_response.get("fast_path") or "tier2",
+            fast_path_fallback_reason=reflect_response.get("fast_path_fallback_reason"),
         )
         try:
             backend = await self._get_backend()
