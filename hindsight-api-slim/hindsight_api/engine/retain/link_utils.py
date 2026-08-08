@@ -3,6 +3,7 @@ Link creation utilities for temporal, semantic, and entity links.
 """
 
 import logging
+import re
 import time
 from datetime import UTC
 
@@ -23,6 +24,23 @@ logger = logging.getLogger(__name__)
 
 # Sentinel UUID used in the unique index to represent NULL entity_id
 _NIL_ENTITY_UUID = "00000000-0000-0000-0000-000000000000"
+
+# Collapses any run of whitespace (including \n, \r, \t) to a single space.
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
+
+
+def _normalize_entity_name(name: str) -> str:
+    """Collapse internal whitespace runs (including newlines/tabs) to a single
+    space and strip leading/trailing whitespace; case is left untouched.
+
+    Motivation: production banks were measured (2026-08-08) with entity
+    canonical_name values containing embedded newlines -- extraction
+    artifacts -- which shears any line-oriented consumer (psql -A output,
+    logs, exports). Case handling is unchanged because the entity registry
+    matches on LOWER(canonical_name) separately.
+    """
+    return _WHITESPACE_RUN_RE.sub(" ", name).strip()
+
 
 # Maximum number of temporal links to keep per unit (from_unit_id).
 # Retrieval only reads top 10-20 per unit via LATERAL join, so keeping
@@ -163,9 +181,12 @@ def _prepare_entities_for_resolution(
         formatted_entities = []
         for ent in entity_list:
             if hasattr(ent, "text"):
-                formatted_entities.append({"text": ent.text, "type": "CONCEPT"})
+                raw_text, entity_type = ent.text, "CONCEPT"
             elif isinstance(ent, dict):
-                formatted_entities.append({"text": ent.get("text", ""), "type": ent.get("type", "CONCEPT")})
+                raw_text, entity_type = ent.get("text", ""), ent.get("type", "CONCEPT")
+            else:
+                continue
+            formatted_entities.append({"text": _normalize_entity_name(raw_text), "type": entity_type})
         all_entities.append(formatted_entities)
 
     total_entities = sum(len(ents) for ents in all_entities)
