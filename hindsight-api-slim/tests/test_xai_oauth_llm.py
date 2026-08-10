@@ -21,6 +21,7 @@ import logging
 import os
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,7 @@ from hindsight_api.engine.providers.xai_oauth_llm import (
     XaiOAuthQuotaExhaustedError,
     _ChatUsage,
     _conversation_affinity_id,
+    _error_detail,
     _token_counts,
 )
 
@@ -635,7 +637,7 @@ def test_a_failed_store_write_leaves_the_previous_credential_intact(tmp_path, mo
 
 
 def test_a_terminal_rejection_is_retried_once_then_quarantines(tmp_path):
-    """400/401/403 from the token endpoint: one retry, then the grant is dead."""
+    """400/401 from the token endpoint: one retry, then the grant is dead."""
     store = _write_store(tmp_path / "s.json", expires_in=10.0, obtained_ago=3600.0)
     denied = _FakeResponse(400, json.dumps({"error": "invalid_grant"}))
     manager, http, _ = _make_manager(tmp_path, post_replies=[denied, denied], store=store)
@@ -670,6 +672,73 @@ def test_a_server_error_is_not_quarantined(tmp_path):
 
     assert http.post_count == 1
     assert read_credential(store).refresh_token == REFRESH_TOKEN
+
+
+def test_a_403_from_the_token_endpoint_is_not_quarantined(tmp_path):
+    """A 403 is an edge/policy answer, not an OAuth "this grant is dead".
+
+    RFC 6749 spells a spent or revoked refresh token as 400 ``invalid_grant``;
+    403 is what a layer in front of the issuer returns. Quarantining on it
+    would turn a transient refusal into a mandatory interactive re-login —
+    the same reasoning the API side already applies to its own 403s.
+    """
+    store = _write_store(tmp_path / "s.json", expires_in=10.0, obtained_ago=3600.0)
+    manager, http, _ = _make_manager(tmp_path, post_replies=[_FakeResponse(403, "forbidden")], store=store)
+
+    with pytest.raises(XaiOAuthRefreshError, match="403"):
+        manager.get_access_token()
+
+    assert http.post_count == 1
+    assert read_credential(store).refresh_token == REFRESH_TOKEN
+    assert "last_auth_error" not in json.loads(store.read_text())
+
+
+def test_a_rejection_is_not_quarantined_when_the_store_moved_to_another_grant(tmp_path):
+    """xAI rotates the refresh token, so a rejection can mean "already spent".
+
+    A writer this host's lock does not cover (a store shared with a host whose
+    filesystem ignores flock) can land its own rotation first. Wiping the store
+    then would destroy a live grant and demand a login for nothing, so the
+    rejection is rechecked against the store before anything is discarded.
+    """
+    store = _write_store(tmp_path / "s.json", expires_in=10.0, obtained_ago=3600.0)
+
+    def _sibling_rotates_the_grant() -> None:
+        _write_store(
+            store,
+            access_token="sibling-access-token",
+            refresh_token="sibling-refresh-token",
+            expires_in=3600.0,
+            obtained_ago=0.0,
+        )
+
+    denied = _FakeResponse(400, json.dumps({"error": "invalid_grant"}))
+    http = _FakeSyncHttp([denied, denied], on_post=_sibling_rotates_the_grant)
+    manager = XaiOAuthManager(
+        store,
+        refresh_skew_seconds=60.0,
+        refresh_timeout_seconds=20.0,
+        min_refresh_gap_seconds=0.0,
+        http_client=http,  # type: ignore[arg-type]
+    )
+
+    assert manager.get_access_token() == "sibling-access-token"
+    assert http.post_count == 2
+    payload = json.loads(store.read_text())
+    assert payload["tokens"]["refresh_token"] == "sibling-refresh-token"
+    assert "last_auth_error" not in payload
+
+
+def test_a_rejection_still_quarantines_when_the_store_holds_the_same_grant(tmp_path):
+    """The recheck must not become a blanket excuse to never quarantine."""
+    store = _write_store(tmp_path / "s.json", expires_in=10.0, obtained_ago=3600.0)
+    denied = _FakeResponse(400, json.dumps({"error": "invalid_grant"}))
+    manager, _, _ = _make_manager(tmp_path, post_replies=[denied, denied], store=store)
+
+    with pytest.raises(XaiOAuthLoginRequiredError):
+        manager.get_access_token()
+
+    assert json.loads(store.read_text())["tokens"] == {}
 
 
 # ===========================================================================
@@ -860,6 +929,65 @@ async def test_an_upstream_error_body_is_not_echoed_into_the_error(tmp_path, mon
     assert str(len(secret_ish)) in str(exc.value)
 
 
+async def test_a_json_error_body_surfaces_its_code_and_message(tmp_path, monkeypatch):
+    """A permanent 4xx has to say why, or it cannot be diagnosed.
+
+    Measured against the live API: sending ``reasoning_effort: "none"`` returns
+    exactly this body, and reporting it as "HTTP 400 (98 bytes)" leaves an
+    operator no way to tell a rejected parameter from a bad model name.
+    """
+    body = json.dumps(
+        {"code": "invalid-argument", "error": "This model does not support `reasoning_effort` value `none`."}
+    )
+    llm = _make_llm(tmp_path, monkeypatch, replies=[_FakeResponse(400, body)])
+
+    with pytest.raises(RuntimeError) as exc:
+        await llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=0)
+
+    message = str(exc.value)
+    assert "HTTP 400" in message
+    assert "invalid-argument" in message
+    assert "does not support `reasoning_effort`" in message
+
+
+async def test_an_unrecognized_json_body_still_carries_no_detail(tmp_path, monkeypatch):
+    """Only ``code``/``error`` travel — never arbitrary keys of the body."""
+    body = json.dumps({"prompt": "sk-should-never-appear-in-an-exception", "messages": ["secret"]})
+    llm = _make_llm(tmp_path, monkeypatch, replies=[_FakeResponse(400, body)])
+
+    with pytest.raises(RuntimeError) as exc:
+        await llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=0)
+
+    assert "sk-should-never-appear" not in str(exc.value)
+    assert "secret" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ('{"code": "invalid-argument", "error": "bad value"}', "invalid-argument: bad value"),
+        ('{"error": {"code": "quota", "message": "over limit"}}', "quota: over limit"),
+        ('{"error": "plain message"}', "plain message"),
+        ('{"code": "solo-code"}', "solo-code"),
+        ('{"error": "same", "code": "same"}', "same"),
+        ("not json at all", ""),
+        ("[1, 2, 3]", ""),
+        ("{}", ""),
+        ('{"error": {"message": null}}', ""),
+        ('{"error": true}', ""),
+    ],
+)
+def test_error_detail_reads_only_the_recognized_fields(body, expected):
+    assert _error_detail(body) == expected
+
+
+def test_error_detail_is_length_capped():
+    detail = _error_detail(json.dumps({"error": "x" * 500}))
+
+    assert len(detail) <= llm_mod.MAX_ERROR_DETAIL_CHARS + 3
+    assert detail.endswith("...")
+
+
 # ===========================================================================
 # 6. Conversation affinity id
 # ===========================================================================
@@ -987,6 +1115,31 @@ async def test_reasoning_effort_and_the_token_cap_land_in_the_body(tmp_path, mon
     assert body["reasoning_effort"] == "high"
     assert body["max_tokens"] == 64
     assert "max_completion_tokens" not in body
+
+
+@pytest.mark.parametrize("effort", ["none", "None", "  none  ", ""])
+async def test_a_none_reasoning_effort_is_omitted_rather_than_sent(tmp_path, monkeypatch, effort):
+    """xAI answers ``reasoning_effort: "none"`` with a non-retryable HTTP 400.
+
+    ``none`` is a real value elsewhere in Hindsight (it is the documented way
+    to let an OpenAI reasoning model accept function tools), so a deployment
+    can carry it into this lane through the global or any per-operation
+    override. Forwarding it would fail every call on the lane.
+    """
+    llm = _make_llm(tmp_path, monkeypatch, reasoning_effort=effort)
+
+    await llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=0)
+
+    assert "reasoning_effort" not in llm._client.calls[0]["json"]
+
+
+async def test_a_none_reasoning_effort_is_also_omitted_from_a_tool_call(tmp_path, monkeypatch):
+    llm = _make_llm(tmp_path, monkeypatch, reasoning_effort="none")
+    tools = [{"type": "function", "function": {"name": "search", "parameters": {}}}]
+
+    await llm.call_with_tools(messages=[{"role": "user", "content": "hi"}], tools=tools, max_retries=0)
+
+    assert "reasoning_effort" not in llm._client.calls[0]["json"]
 
 
 # ===========================================================================
@@ -1474,6 +1627,221 @@ async def test_recycling_closes_the_stale_client(tmp_path, monkeypatch):
     await llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=1)
 
     assert closed == [tracked]
+
+
+class _GatedFakeAsyncHttp(_FakeAsyncHttp):
+    """A fake whose designated call parks until the test releases it."""
+
+    def __init__(self, replies: list[_FakeResponse], *, gate_on_call: int = 0) -> None:
+        super().__init__(replies)
+        self.gate = asyncio.Event()
+        self.entered = asyncio.Event()
+        self.closed = False
+        self._gate_on_call = gate_on_call
+
+    async def post(self, url: str, json: Any = None, headers: Any = None) -> _FakeResponse:
+        index = len(self.calls)
+        self.calls.append({"url": url, "json": json, "headers": dict(headers or {})})
+        if index == self._gate_on_call:
+            self.entered.set()
+            await self.gate.wait()
+        return self._replies[min(index, len(self._replies) - 1)]
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+async def _settle() -> None:
+    """Give scheduled background tasks a turn without a wall-clock wait."""
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+async def test_a_recycle_leaves_a_sibling_request_on_the_stale_client_alive(tmp_path, monkeypatch):
+    """One backend's 5xx must not cancel the other requests in flight.
+
+    A provider instance is shared by every concurrent call on its lane. Closing
+    the stale client on the spot yanks the connection out from under siblings
+    mid-response — measured, they surface ``httpx.ReadError`` and retry, which
+    re-sends a completion the upstream already accepted and fails outright any
+    sibling that was on its final attempt.
+    """
+    llm = _make_llm(tmp_path, monkeypatch)
+    gated = _GatedFakeAsyncHttp([_ok_reply("sibling")])
+    llm._client = gated  # type: ignore[assignment]
+    replacement = _FakeAsyncHttp([_ok_reply("fresh")])
+    llm._new_client = lambda: replacement  # type: ignore[method-assign]
+
+    sibling = asyncio.create_task(llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=0))
+    await gated.entered.wait()
+
+    await llm._recycle_client()
+
+    assert llm._client is replacement
+    assert not gated.closed, "the stale client was closed while a sibling was still using it"
+
+    gated.gate.set()
+    assert await sibling == "sibling"
+
+    await _settle()
+    assert gated.closed, "the stale client must still be closed once it drains"
+
+
+async def test_the_retrying_call_does_not_wait_for_the_sibling_to_drain(tmp_path, monkeypatch):
+    """Deferring the close must not defer the retry it exists to unblock."""
+    llm = _make_llm(tmp_path, monkeypatch)
+    gated = _GatedFakeAsyncHttp([_ok_reply("sibling")])
+    llm._client = gated  # type: ignore[assignment]
+    llm._new_client = lambda: _FakeAsyncHttp([_ok_reply("fresh")])  # type: ignore[method-assign]
+
+    sibling = asyncio.create_task(llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=0))
+    await gated.entered.wait()
+
+    # Completes even though the sibling is still parked on the stale client.
+    await asyncio.wait_for(llm._recycle_client(), timeout=1.0)
+
+    gated.gate.set()
+    await sibling
+    await _settle()
+
+
+async def test_cleanup_closes_a_client_still_draining_from_a_recycle(tmp_path, monkeypatch):
+    """Shutdown must neither hang on nor leak a client that never drained."""
+    llm = _make_llm(tmp_path, monkeypatch)
+    gated = _GatedFakeAsyncHttp([_ok_reply("sibling")])
+    llm._client = gated  # type: ignore[assignment]
+    llm._new_client = lambda: _FakeAsyncHttp([_ok_reply("fresh")])  # type: ignore[method-assign]
+
+    sibling = asyncio.create_task(llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=0))
+    await gated.entered.wait()
+    await llm._recycle_client()
+
+    await asyncio.wait_for(llm.cleanup(), timeout=1.0)
+
+    assert gated.closed
+
+    gated.gate.set()
+    with suppress(Exception):
+        await sibling
+
+
+# ===========================================================================
+# 14. Credential-side transients rejoin the retry loop
+# ===========================================================================
+
+
+async def test_a_transient_refresh_failure_is_retried_like_any_other_blip(tmp_path, monkeypatch):
+    """A hiccup reaching auth.x.ai must not fail the whole operation outright.
+
+    The same failure one hop later — against api.x.ai — gets the full retry
+    budget, so a credential-side transient getting none was an inconsistency,
+    not a policy.
+    """
+
+    async def _no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(llm_mod.asyncio, "sleep", _no_sleep)
+    llm = _make_llm(tmp_path, monkeypatch, replies=[_ok_reply("recovered")])
+    attempts: list[float] = []
+
+    def _flaky(min_ttl: float) -> str:
+        attempts.append(min_ttl)
+        if len(attempts) == 1:
+            raise XaiOAuthRefreshError("xai-oauth refresh network error: ConnectError")
+        return ACCESS_TOKEN
+
+    llm._auth.get_access_token = _flaky  # type: ignore[method-assign]
+
+    assert await llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=2) == "recovered"
+    assert len(attempts) == 2
+    assert len(llm._client.calls) == 1
+
+
+async def test_a_transient_refresh_failure_is_retried_in_the_tool_loop(tmp_path, monkeypatch):
+    async def _no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(llm_mod.asyncio, "sleep", _no_sleep)
+    llm = _make_llm(tmp_path, monkeypatch, replies=[_ok_reply("recovered")])
+    attempts: list[float] = []
+
+    def _flaky(min_ttl: float) -> str:
+        attempts.append(min_ttl)
+        if len(attempts) == 1:
+            raise XaiOAuthRefreshError("xai-oauth refresh network error: ConnectError")
+        return ACCESS_TOKEN
+
+    llm._auth.get_access_token = _flaky  # type: ignore[method-assign]
+    tools = [{"type": "function", "function": {"name": "search", "parameters": {}}}]
+
+    result = await llm.call_with_tools(messages=[{"role": "user", "content": "hi"}], tools=tools, max_retries=2)
+
+    assert result.content == "recovered"
+    assert len(attempts) == 2
+
+
+async def test_a_login_required_credential_is_still_fatal_on_the_first_attempt(tmp_path, monkeypatch):
+    """Only the transients rejoin the loop; a dead grant must not be retried."""
+
+    async def _no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(llm_mod.asyncio, "sleep", _no_sleep)
+    llm = _make_llm(tmp_path, monkeypatch)
+    attempts: list[float] = []
+
+    def _dead(min_ttl: float) -> str:
+        attempts.append(min_ttl)
+        raise XaiOAuthLoginRequiredError("no credential")
+
+    llm._auth.get_access_token = _dead  # type: ignore[method-assign]
+
+    with pytest.raises(XaiOAuthLoginRequiredError):
+        await llm.call(messages=[{"role": "user", "content": "hi"}], max_retries=5)
+
+    assert len(attempts) == 1
+    assert len(llm._client.calls) == 0
+
+
+# ===========================================================================
+# 15. Startup verification
+# ===========================================================================
+
+
+async def test_verification_waves_through_a_real_rate_limit(tmp_path, monkeypatch):
+    """An exhausted rate limit is not a misconfiguration; startup continues."""
+
+    async def _no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(llm_mod.asyncio, "sleep", _no_sleep)
+    llm = _make_llm(tmp_path, monkeypatch, replies=[_FakeResponse(429, "slow down")])
+
+    await llm.verify_connection()
+
+
+async def test_verification_does_not_mistake_a_byte_count_for_a_rate_limit(tmp_path, monkeypatch):
+    """A 5xx whose message merely contains "429" must still fail startup.
+
+    The error text states the body's byte count and the upstream's error
+    string, so a substring test on "429" lets a broken lane pass verification —
+    here a 500 with a 429-byte body, which reads as "HTTP 500 (429 bytes)".
+    """
+
+    async def _no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(llm_mod.asyncio, "sleep", _no_sleep)
+    server_error = _FakeResponse(500, "x" * 429)
+    llm = _make_llm(tmp_path, monkeypatch, replies=[server_error])
+    # verify_connection retries, and a >=500 recycles the client: without this
+    # the replacement would be a real httpx.AsyncClient and the retry would
+    # leave the process for api.x.ai, which no test here may do.
+    llm._new_client = lambda: _FakeAsyncHttp([server_error])  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="verification failed"):
+        await llm.verify_connection()
 
 
 # ===========================================================================

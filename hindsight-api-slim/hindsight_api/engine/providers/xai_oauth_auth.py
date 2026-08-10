@@ -27,6 +27,11 @@ Store
 token, ``expires_at``, ``obtained_at``, the granted scope, and the discovered
 ``token_endpoint``.
 
+xAI issues a **new refresh token with every refresh** and retires the old one,
+so the store is not a read-only credential drop: whichever process refreshes
+must be able to write back, and every process serving this provider must read
+the same file rather than its own copy of one login's output.
+
 Multi-instance safety
 ---------------------
 Refresh state lives in the store, not on the manager: several provider
@@ -156,7 +161,15 @@ DEFAULT_MIN_REFRESH_GAP_SECONDS = 30.0
 AUTH_LOCK_TIMEOUT_SECONDS = 20.0
 
 #: OAuth token-endpoint statuses that mean the grant itself is dead.
-TERMINAL_REFRESH_STATUSES = frozenset({400, 401, 403})
+#:
+#: RFC 6749 section 5.2 answers a spent or revoked ``refresh_token`` with 400
+#: ``invalid_grant``, and 401 covers client authentication. A 403 is not a
+#: token-endpoint error shape at all — it is what an edge or policy layer in
+#: front of the issuer returns — so it stays off this set: quarantining on one
+#: would trade a transient upstream refusal for a mandatory interactive
+#: re-login, which is the same reasoning ``xai_oauth_llm`` applies to a 403
+#: from the API side.
+TERMINAL_REFRESH_STATUSES = frozenset({400, 401})
 
 LOGIN_COMMAND = "python -m hindsight_api.engine.providers.xai_oauth_auth login"
 
@@ -771,9 +784,11 @@ class XaiOAuthManager:
     def _refresh_locked(self, credential: StoredCredential, *, reason: str) -> str:
         """Exchange the refresh token and persist the result. Lock must be held.
 
-        A terminal status (400/401/403) is retried exactly once — a single
-        network-level oddity should not cost the operator a re-login — and then
-        quarantines the store and raises the login remediation.
+        A terminal status (see :data:`TERMINAL_REFRESH_STATUSES`) is retried
+        exactly once — a single network-level oddity should not cost the
+        operator a re-login — and then, unless the store has meanwhile moved to
+        a different grant, quarantines the store and raises the login
+        remediation.
         """
         endpoint = self._token_endpoint(credential)
         log_reason = f" ({reason})" if reason else ""
@@ -808,6 +823,18 @@ class XaiOAuthManager:
                 attempt,
             )
 
+        # xAI rotates the refresh token on every successful refresh, so a
+        # rejection can simply mean some other writer spent this one first and
+        # the store already holds its replacement. Quarantining then would
+        # destroy a live grant and force an interactive login for nothing. The
+        # in-process lock plus the recheck in refresh() rule that out among
+        # this host's managers, but not against a store shared with a host
+        # whose filesystem does not honour flock — so re-read before wiping.
+        superseded = self._superseded_access_token(credential)
+        if superseded is not None:
+            logger.info("xai-oauth refresh rejection ignored: the store already holds a different grant")
+            return superseded
+
         quarantine_credential(
             self._token_path,
             code=f"refresh_rejected_{last_status}",
@@ -817,6 +844,20 @@ class XaiOAuthManager:
             f"The xAI token endpoint rejected the stored grant (HTTP {last_status}). "
             f"Run the xai-oauth login on the host that owns the token store: {LOGIN_COMMAND}"
         )
+
+    def _superseded_access_token(self, rejected: StoredCredential) -> str | None:
+        """Return a usable access token when the store moved on under us.
+
+        ``None`` when the store still holds the grant that was just rejected,
+        or holds nothing readable — both cases the caller must quarantine.
+        """
+        try:
+            current = read_credential(self._token_path)
+        except XaiOAuthError:
+            return None
+        if current.refresh_token == rejected.refresh_token or not current.access_token:
+            return None
+        return current.access_token
 
     def _persist_refreshed(self, credential: StoredCredential, response: httpx.Response) -> str:
         try:

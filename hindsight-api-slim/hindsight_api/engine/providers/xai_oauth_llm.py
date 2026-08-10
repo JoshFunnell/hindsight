@@ -44,7 +44,7 @@ import json
 import logging
 import os
 import time
-from contextlib import AbstractAsyncContextManager, nullcontext
+from contextlib import AbstractAsyncContextManager, nullcontext, suppress
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -61,6 +61,7 @@ from hindsight_api.engine.providers.xai_oauth_auth import (
     XaiOAuthError,
     XaiOAuthLoginRequiredError,
     XaiOAuthManager,
+    XaiOAuthRefreshError,
 )
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.engine.structured_output import strict_json_schema
@@ -75,6 +76,7 @@ __all__ = [
     "XaiOAuthLLM",
     "XaiOAuthLoginRequiredError",
     "XaiOAuthQuotaExhaustedError",
+    "XaiOAuthRefreshError",
 ]
 
 #: Provider-specific base URL override. It wins over the generic
@@ -91,6 +93,16 @@ CONV_ID_HEADER = "x-grok-conv-id"
 
 #: Body marker xAI returns when the account's spending limit stopped the call.
 SPENDING_LIMIT_CODE = "personal-team-blocked:spending-limit"
+
+#: ``reasoning_effort`` value that means "no explicit effort". xAI rejects it
+#: as a value, so this lane expresses it by omitting the field entirely.
+REASONING_EFFORT_NONE = "none"
+
+#: Longest upstream error message carried into an exception. The full body is
+#: never echoed (it can be arbitrarily large and is not ours to relay); the
+#: recognized error fields are, truncated, because a permanent 4xx that
+#: reports only a byte count cannot be diagnosed.
+MAX_ERROR_DETAIL_CHARS = 200
 
 #: Debug-only response-header logging on a non-2xx reply (default off). See
 #: the module docstring's Logging section for the exact carve-out.
@@ -406,6 +418,12 @@ class XaiOAuthLLM(LLMInterface):
         self._auth_lock = asyncio.Lock()
         self._client_lock = asyncio.Lock()
         self._client = httpx.AsyncClient(timeout=self.timeout)
+        # In-flight request count per client object, and the future that fires
+        # when a retired client's last request lands. Both keyed by the client
+        # itself, because a recycle can leave more than one alive at a time.
+        self._inflight: dict[Any, int] = {}
+        self._drained: dict[Any, asyncio.Future[None]] = {}
+        self._draining: set[asyncio.Task[None]] = set()
 
         logger.info("xai-oauth provider initialized: model=%s base_url=%s", self.model, self.base_url)
 
@@ -460,7 +478,16 @@ class XaiOAuthLLM(LLMInterface):
         if conv_id:
             headers[CONV_ID_HEADER] = conv_id
 
-        response = await self._client.post(f"{self.base_url}/chat/completions", json=body, headers=headers)
+        # Pin the client for the whole request: a concurrent recycle swaps
+        # self._client, and this request must both finish on the connection it
+        # started on and be counted against that client, not its replacement.
+        client = self._client
+        self._inflight[client] = self._inflight.get(client, 0) + 1
+        try:
+            response = await client.post(f"{self.base_url}/chat/completions", json=body, headers=headers)
+        finally:
+            self._release_client(client)
+
         if not (200 <= response.status_code < 300):
             _log_non_2xx_response_headers(response)
         return _UpstreamReply(
@@ -493,11 +520,56 @@ class XaiOAuthLLM(LLMInterface):
         Scoped to >=500 by the caller only: a 4xx is a request-shaped problem
         the connection did not cause, and 408/429 are timeout/rate-limit
         signals, not evidence the connection itself is bad.
+
+        The stale client is closed once its last in-flight request lands, not
+        immediately. This provider instance is shared by every concurrent call
+        on its lane, so closing on the spot would yank the connection out from
+        under siblings mid-response: measured, they surface ``httpx.ReadError``
+        and retry, which re-sends completions the upstream had already accepted
+        and can fail outright a sibling that was on its final attempt. One
+        backend's 5xx must not cost the other requests in flight.
         """
         async with self._client_lock:
             stale = self._client
             self._client = self._new_client()
+            busy = bool(self._inflight.get(stale))
+            if busy:
+                waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+                self._drained[stale] = waiter
+
+        if not busy:
             await stale.aclose()
+            return
+
+        task = asyncio.create_task(self._close_when_drained(stale, waiter))
+        self._draining.add(task)
+        task.add_done_callback(self._draining.discard)
+
+    def _release_client(self, client: Any) -> None:
+        """Drop one in-flight count, waking a retired client's closer at zero."""
+        remaining = self._inflight.get(client, 1) - 1
+        if remaining > 0:
+            self._inflight[client] = remaining
+            return
+        self._inflight.pop(client, None)
+        waiter = self._drained.get(client)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+
+    async def _close_when_drained(self, stale: Any, waiter: asyncio.Future[None]) -> None:
+        """Close a retired client once nothing is using it any more."""
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            # cleanup() cancels the wait so shutdown does not block on a
+            # sibling; the close below still has to happen, so this is
+            # swallowed deliberately rather than propagated.
+            pass
+        finally:
+            self._drained.pop(stale, None)
+            self._inflight.pop(stale, None)
+            with suppress(Exception):
+                await stale.aclose()
 
     def _classify_forbidden(self, reply: _UpstreamReply) -> Exception:
         """Turn a 403 into one of three classifications, none of them credential failures.
@@ -554,8 +626,10 @@ class XaiOAuthLLM(LLMInterface):
             # Retry 408/429 and 5xx; other 4xx are request-shaped problems that
             # will fail identically on every attempt.
             retryable = reply.status_code in (408, 429) or reply.status_code >= 500
+            detail = _error_detail(reply.body_text)
             raise _UpstreamStatusError(
-                f"{_actual_host(self.base_url)} returned HTTP {reply.status_code} ({len(reply.body_text)} bytes)",
+                f"{_actual_host(self.base_url)} returned HTTP {reply.status_code} ({len(reply.body_text)} bytes)"
+                + (f": {detail}" if detail else ""),
                 retryable=retryable,
                 retry_after=reply.retry_after,
                 status_code=reply.status_code,
@@ -579,14 +653,23 @@ class XaiOAuthLLM(LLMInterface):
         body: dict[str, Any] = {
             "model": self.model,
             "messages": [dict(message) for message in messages],
-            # BEHAVIOUR CHANGE, deliberate: reaching api.x.ai as provider=openai
-            # only sends reasoning_effort when _supports_reasoning_model()
-            # matches — a model-name heuristic (gpt-5/o1/o3/deepseek) that
-            # "grok-4.5" does not match, so the member-configured effort never
-            # reached xAI on that path. Sending it here is the first time that
-            # setting takes effect on this lane.
-            "reasoning_effort": self.reasoning_effort,
         }
+        # BEHAVIOUR CHANGE, deliberate: reaching api.x.ai as provider=openai
+        # only sends reasoning_effort when _supports_reasoning_model()
+        # matches — a model-name heuristic (gpt-5/o1/o3/deepseek) that
+        # "grok-4.5" does not match, so the member-configured effort never
+        # reached xAI on that path. Sending it here is the first time that
+        # setting takes effect on this lane.
+        #
+        # "none" is the exception, and it has to be dropped rather than
+        # forwarded: it is a real value elsewhere in Hindsight (the documented
+        # way to make an OpenAI reasoning model accept function tools), but xAI
+        # answers it with HTTP 400 "This model does not support
+        # `reasoning_effort` value `none`" — a non-retryable status, so a
+        # deployment carrying that setting would fail every call on this lane.
+        # Omitting the field is what "no explicit effort" means on this API.
+        if self.reasoning_effort and self.reasoning_effort.strip().lower() != REASONING_EFFORT_NONE:
+            body["reasoning_effort"] = self.reasoning_effort
         if max_completion_tokens is not None:
             body["max_tokens"] = max_completion_tokens
         if temperature is not None:
@@ -624,7 +707,14 @@ class XaiOAuthLLM(LLMInterface):
             # not block startup (the same allowance the Codex provider makes).
             logger.warning("xai-oauth quota exhausted for %s, continuing startup: %s", self.model, e)
         except Exception as e:
-            if "429" in str(e):
+            # Match on the status this carries, not on "429" appearing in the
+            # message: the message also states the body's byte count and now
+            # the upstream's error text, so a substring test lets an unrelated
+            # failure ("HTTP 500 (429 bytes)") pass itself off as a rate limit
+            # and wave a genuinely broken lane through startup. Every upstream
+            # status reaches here as an _UpstreamStatusError, so nothing that
+            # was recognised before stops being recognised.
+            if isinstance(e, _UpstreamStatusError) and e.status_code == 429:
                 logger.warning("xai-oauth rate limited for %s, continuing startup: %s", self.model, e)
                 return
             raise RuntimeError(f"xai-oauth connection verification failed for {self.model}: {e}") from e
@@ -735,7 +825,15 @@ class XaiOAuthLLM(LLMInterface):
                     )
                 return result
 
-            except (_UpstreamStatusError, httpx.RequestError) as e:
+            # XaiOAuthRefreshError is retried alongside the transport errors: a
+            # credential-side blip (a network error reaching auth.x.ai, a 5xx
+            # from the token endpoint, the anti-spin gap not yet elapsed) is as
+            # transient as the same blip against the API, and leaving it out
+            # meant one unlucky refresh failed the whole operation with no
+            # retry while an identical failure one hop later got ten. The
+            # states a retry cannot fix raise XaiOAuthLoginRequiredError, which
+            # is deliberately absent here and stays fatal.
+            except (_UpstreamStatusError, httpx.RequestError, XaiOAuthRefreshError) as e:
                 last_exception = e
                 retryable = e.retryable if isinstance(e, _UpstreamStatusError) else True
                 if retryable and attempt < max_retries:
@@ -837,7 +935,7 @@ class XaiOAuthLLM(LLMInterface):
                     thoughts_tokens=counts.thoughts_tokens,
                 )
 
-            except (_UpstreamStatusError, httpx.RequestError) as e:
+            except (_UpstreamStatusError, httpx.RequestError, XaiOAuthRefreshError) as e:
                 last_exception = e
                 retryable = e.retryable if isinstance(e, _UpstreamStatusError) else True
                 if retryable and attempt < max_retries:
@@ -860,7 +958,18 @@ class XaiOAuthLLM(LLMInterface):
         raise RuntimeError("xai-oauth tool call failed after all retries with no exception captured")
 
     async def cleanup(self) -> None:
-        """Close the HTTP client and the credential manager's own client."""
+        """Close every HTTP client and the credential manager's own client.
+
+        Clients still draining from a recycle are closed too: their waiter is
+        cancelled so shutdown does not block on a request that may never land,
+        and :meth:`_close_when_drained` closes them on the way out.
+        """
+        draining = list(self._draining)
+        for task in draining:
+            task.cancel()
+        for task in draining:
+            with suppress(asyncio.CancelledError):
+                await task
         await self._client.aclose()
         self._auth.close()
 
@@ -972,3 +1081,48 @@ def _error_code(body_text: str) -> str:
         return error
     code = payload.get("code")
     return code if isinstance(code, str) else ""
+
+
+def _scalar(value: Any) -> str:
+    """Render a JSON scalar for an error message, or '' for anything else."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return ""
+    return str(value).strip()
+
+
+def _error_detail(body_text: str) -> str:
+    """Summarize an upstream error body from its recognized fields only.
+
+    Returns ``''`` for a body that is not a JSON object or that names neither
+    an error code nor an error message.
+
+    Why this exists: a non-retryable 4xx reported as nothing but a status and a
+    byte count is undiagnosable — the operator cannot tell a rejected parameter
+    from a bad model name without reproducing the call by hand. The whole body
+    still never travels (it is unbounded, and relaying it wholesale is how
+    prompt text ends up in logs); only ``code`` and the error message do, capped
+    at :data:`MAX_ERROR_DETAIL_CHARS`.
+    """
+    try:
+        payload = json.loads(body_text)
+    except (json.JSONDecodeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+
+    error = payload.get("error")
+    code = _scalar(payload.get("code"))
+    message = ""
+    if isinstance(error, dict):
+        code = _scalar(error.get("code")) or code
+        message = _scalar(error.get("message"))
+    else:
+        message = _scalar(error)
+
+    parts = [part for part in (code, message) if part]
+    if len(parts) == 2 and parts[0] == parts[1]:
+        parts.pop()
+    detail = ": ".join(parts)
+    if len(detail) > MAX_ERROR_DETAIL_CHARS:
+        detail = detail[:MAX_ERROR_DETAIL_CHARS].rstrip() + "..."
+    return detail
