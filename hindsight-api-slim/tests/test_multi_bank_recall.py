@@ -429,7 +429,10 @@ async def test_orchestrator_partial_failure_metadata():
     assert banks["bank-a"]["status"] == "ok"
     assert banks["bank-a"]["count"] == 1
     assert banks["bank-b"]["status"] == "error"
-    assert "boom" in banks["bank-b"]["error"]
+    # Client-visible text is generic — no exception class or message oracle.
+    assert banks["bank-b"]["error"] == "recall failed for this bank"
+    assert "RuntimeError" not in banks["bank-b"]["error"]
+    assert "boom" not in banks["bank-b"]["error"]
     assert [f.id for f in result.results] == ["a1"]
 
 
@@ -747,3 +750,96 @@ async def test_orchestrator_rejects_over_cap_bank_ids():
     assert excinfo.value.status_code == 422
     assert str(MAX_MULTI_BANK_RECALL_BANKS) in str(excinfo.value)
     # Must fail before fan-out — no sub-call attempts required when count is known.
+
+
+# --- Job D auth / metadata fixes ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_validation_error_propagates_not_soft_fail():
+    """OperationValidationError (auth denial) must re-raise, not soft-fail into metadata."""
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "ok", reranker=0.5)],
+            "bank-b": OperationValidationError("forbidden for bank-b", status_code=403),
+        }
+    )
+    with pytest.raises(OperationValidationError) as excinfo:
+        await MemoryEngine.recall_multi_async(
+            engine,
+            ["bank-a", "bank-b"],
+            "query",
+            request_context=RC,
+            max_tokens=10_000,
+        )
+    assert excinfo.value.status_code == 403
+    assert "forbidden for bank-b" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_cancel_precedes_validation_error():
+    """When both cancel and validation errors are present, cancellation wins."""
+    engine = _harness(
+        bank_results={
+            "bank-a": OperationCancelledError("client disconnected"),
+            "bank-b": OperationValidationError("forbidden", status_code=403),
+        }
+    )
+    with pytest.raises(OperationCancelledError, match="client disconnected"):
+        await MemoryEngine.recall_multi_async(
+            engine,
+            ["bank-a", "bank-b"],
+            "query",
+            request_context=RC,
+            max_tokens=10_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_runtime_error_still_soft_fails():
+    """Ordinary infrastructure errors remain soft partial failures (regression guard)."""
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "ok", reranker=0.9)],
+            "bank-b": RuntimeError("db timeout"),
+        }
+    )
+    result = await MemoryEngine.recall_multi_async(
+        engine,
+        ["bank-a", "bank-b"],
+        "query",
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    banks = result.metadata[META_MULTI_BANK][META_BANKS]
+    assert banks["bank-a"]["status"] == "ok"
+    assert banks["bank-b"]["status"] == "error"
+    assert [f.id for f in result.results] == ["a1"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_client_metadata_has_no_exception_oracle():
+    """Client-visible per-bank error must not leak exception class or repr."""
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "ok", reranker=0.5)],
+            "bank-b": RuntimeError("secret internal detail"),
+        }
+    )
+    result = await MemoryEngine.recall_multi_async(
+        engine,
+        ["bank-a", "bank-b"],
+        "query",
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    err = result.metadata[META_MULTI_BANK][META_BANKS]["bank-b"]["error"]
+    assert err == "recall failed for this bank"
+    assert "RuntimeError" not in err
+    assert "secret" not in err
+    # No exception-style repr leakage in the whole multi_bank block.
+    import json
+
+    blob = json.dumps(result.metadata[META_MULTI_BANK])
+    assert "RuntimeError" not in blob
+    assert "secret internal detail" not in blob

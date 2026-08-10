@@ -162,6 +162,56 @@ async def test_multi_bank_recall_maps_operation_validation_error(mock_memory):
 
 
 @pytest.mark.asyncio
+async def test_multi_bank_precheck_invoked_once_per_distinct_bank(mock_memory):
+    """Precheck must cover every distinct bank_id, not only bank_ids[0]."""
+    from hindsight_api.extensions import ValidationResult
+
+    precheck = AsyncMock(return_value=ValidationResult.accept())
+    validator = MagicMock()
+    validator.precheck = precheck
+    mock_memory._operation_validator = validator
+
+    app = create_app(mock_memory, initialize_memory=False)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/default/memories/recall",
+            # duplicate "allowed" proves de-dupe: 3 entries → 2 precheck calls
+            json={"bank_ids": ["allowed", "gated", "allowed"], "query": "hello world"},
+        )
+    assert resp.status_code == 200, resp.text
+    assert precheck.await_count == 2
+    checked = [c.args[0].bank_id for c in precheck.await_args_list]
+    assert checked == ["allowed", "gated"]
+
+
+@pytest.mark.asyncio
+async def test_multi_bank_precheck_denies_non_primary_bank(mock_memory):
+    """A gated second bank must be rejected even when the first bank is allowed."""
+    from hindsight_api.extensions import ValidationResult
+
+    async def _precheck(ctx):
+        if ctx.bank_id == "gated":
+            return ValidationResult.reject("not allowed on gated", status_code=403)
+        return ValidationResult.accept()
+
+    validator = MagicMock()
+    validator.precheck = AsyncMock(side_effect=_precheck)
+    mock_memory._operation_validator = validator
+
+    app = create_app(mock_memory, initialize_memory=False)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/default/memories/recall",
+            json={"bank_ids": ["allowed", "gated"], "query": "hello world"},
+        )
+    assert resp.status_code == 403
+    assert "gated" in resp.json()["detail"] or "not allowed" in resp.json()["detail"]
+    mock_memory.recall_multi_async.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_single_bank_recall_path_unchanged(api_client, mock_memory):
     """Existing single-bank endpoint still calls recall_async, not multi."""
     mock_memory.recall_async = AsyncMock(

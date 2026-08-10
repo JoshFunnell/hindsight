@@ -4773,7 +4773,8 @@ def _register_routes(app: FastAPI):
                 detail=f"Query too long: {query_tokens} tokens exceeds maximum of {max_query_tokens}. Please shorten your query.",
             )
 
-        # Precheck against the first bank (path-less route; body is available here).
+        # Precheck every distinct bank (body is already parsed on this path-less route).
+        # Checking only bank_ids[0] would let a caller hide a gated bank behind an allowed one.
         validator = getattr(app.state.memory, "_operation_validator", None)
         if validator is not None:
             from hindsight_api.extensions import PrecheckContext
@@ -4788,19 +4789,24 @@ def _register_routes(app: FastAPI):
                     parsed = -1
                 if parsed >= 0:
                     content_length = parsed
-            precheck_result = await validator.precheck(
-                PrecheckContext(
-                    operation=PrecheckOperation.RECALL,
-                    bank_id=primary_bank,
-                    request_context=request_context,
-                    content_length=content_length,
+            seen_precheck: set[str] = set()
+            for bid in request.bank_ids:
+                if bid in seen_precheck:
+                    continue
+                seen_precheck.add(bid)
+                precheck_result = await validator.precheck(
+                    PrecheckContext(
+                        operation=PrecheckOperation.RECALL,
+                        bank_id=bid,
+                        request_context=request_context,
+                        content_length=content_length,
+                    )
                 )
-            )
-            if not precheck_result.allowed:
-                raise HTTPException(
-                    status_code=precheck_result.status_code,
-                    detail=precheck_result.reason or "Operation not allowed",
-                )
+                if not precheck_result.allowed:
+                    raise HTTPException(
+                        status_code=precheck_result.status_code,
+                        detail=precheck_result.reason or "Operation not allowed",
+                    )
 
         try:
             fact_types = request.types if request.types else list(VALID_RECALL_FACT_TYPES)

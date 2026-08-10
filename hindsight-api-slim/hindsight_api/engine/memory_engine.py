@@ -5382,10 +5382,12 @@ class MemoryEngine(MemoryEngineInterface):
 
         **Attribution:** every merged result is stamped with ``bank_id``.
 
-        **Failures:** ordinary bank errors do not kill the call — partial results are
-        returned with per-bank status in ``metadata["multi_bank"]["banks"]``.
-        ``OperationCancelledError`` (client disconnect) is re-raised immediately so the
-        HTTP layer can map it to 499; cancellation is not a soft partial result.
+        **Failures:** ordinary bank infrastructure errors do not kill the call — partial
+        results are returned with per-bank status in ``metadata["multi_bank"]["banks"]``
+        (client-visible error text is generic; details are logged server-side).
+        Precedence for hard failures re-raised from the gather: ``OperationCancelledError``
+        first (HTTP 499), then ``OperationValidationError`` (auth/validation denials —
+        same mapping as single-bank recall). Neither soft-fails into a 200.
 
         **Dedup:** none in v1 (cross-bank duplicate facts are possible). Exact-text
         dedup is a cheap v2; see module docstring on ``multi_bank_recall``.
@@ -5437,15 +5439,22 @@ class MemoryEngine(MemoryEngineInterface):
         # Resolve per-bank enable_reranking so score-merge auto-fallback can run
         # before (or without) depending on result scores. Failed config lookups
         # are treated as "unknown / not CE-safe" → force interleave for score mode.
+        # Client-visible config_error is generic; details stay in the server log.
         enable_flags: list[bool] = []
-        config_errors: dict[str, str] = {}
+        config_lookup_failed: set[str] = set()
         for bid in ordered_bank_ids:
             try:
                 cfg = await self._config_resolver.get_bank_config(bid, request_context)
                 enable_flags.append(bool(cfg.get("enable_reranking", True)))
             except Exception as e:
                 enable_flags.append(False)
-                config_errors[bid] = f"config lookup failed: {type(e).__name__}: {e!r}"
+                config_lookup_failed.add(bid)
+                logger.warning(
+                    "[RECALL MULTI %s] bank config lookup failed: %s: %r",
+                    bid[:8] if len(bid) >= 8 else bid,
+                    type(e).__name__,
+                    e,
+                )
 
         merge_requested: MultiBankMerge = merge
         merge_applied: MultiBankMerge = merge_requested
@@ -5494,10 +5503,15 @@ class MemoryEngine(MemoryEngineInterface):
             return_exceptions=True,
         )
 
-        # Cancellation kills the whole multi-bank request — never soft-fail into
-        # partial metadata (HTTP must map this to 499, not 200).
+        # Hard failures first — never soft-fail into partial 200 metadata.
+        # Precedence: cancellation (499) before auth/validation denials.
+        from hindsight_api.extensions.operation_validator import OperationValidationError
+
         for outcome in gathered:
             if isinstance(outcome, OperationCancelledError):
+                raise outcome
+        for outcome in gathered:
+            if isinstance(outcome, OperationValidationError):
                 raise outcome
 
         bank_statuses: dict[str, dict] = {}
@@ -5505,12 +5519,20 @@ class MemoryEngine(MemoryEngineInterface):
         successful_outcomes: list[tuple[str, RecallResultModel]] = []
         for bid, outcome in zip(ordered_bank_ids, gathered, strict=True):
             if isinstance(outcome, BaseException):
+                # Soft-fail ordinary infrastructure errors. Client metadata is generic
+                # (no exception class/repr oracle); details stay server-side.
+                logger.warning(
+                    "[RECALL MULTI %s] per-bank recall failed: %s: %r",
+                    bid[:8] if len(bid) >= 8 else bid,
+                    type(outcome).__name__,
+                    outcome,
+                )
                 bank_statuses[bid] = {
                     "status": "error",
-                    "error": f"{type(outcome).__name__}: {outcome!r}",
+                    "error": "recall failed for this bank",
                 }
-                if bid in config_errors:
-                    bank_statuses[bid]["config_error"] = config_errors[bid]
+                if bid in config_lookup_failed:
+                    bank_statuses[bid]["config_error"] = "bank config lookup failed"
                 continue
             # Successful RecallResultModel — keep full outcome for include_* side dicts.
             count = len(outcome.results)
