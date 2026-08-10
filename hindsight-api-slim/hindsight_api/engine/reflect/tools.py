@@ -33,7 +33,12 @@ logger = logging.getLogger(__name__)
 #: observation text they accompany.
 #:
 #: Identity, text, dates, tags and ``source_fact_ids`` are deliberately kept.
-_UNREAD_RESULT_FIELDS = ("scores", "metadata", "entities", "chunk_id", "document_id")
+#: So is ``entities``: it carries canonical entity *names* (not ids), which are
+#: semantically useful retrieval handles -- the canonical name can differ from
+#: the surface text ("Bob" in the text vs canonical "Robert Smith"). Reflect's
+#: recalls don't populate it today (``include_entities`` defaults to False), but
+#: trimming it would bake in dropping the names if that ever flips on.
+_UNREAD_RESULT_FIELDS = ("scores", "metadata", "chunk_id", "document_id")
 
 
 def _drop_unread_fields(d: dict[str, Any]) -> dict[str, Any]:

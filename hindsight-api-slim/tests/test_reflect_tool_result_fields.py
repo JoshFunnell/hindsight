@@ -25,7 +25,7 @@ def _dumped_observation() -> dict:
         "source_fact_ids": ["f1", "f2"],
         "scores": {"semantic": 0.71, "reranker": 0.93, "final": 1.04},
         "metadata": {"ingest_batch": "b-17"},
-        "entities": [{"name": "deploy", "type": "process"}],
+        "entities": ["Robert Smith"],
         "chunk_id": "chunk-9",
         "document_id": "doc-3",
     }
@@ -43,9 +43,15 @@ class DropUnreadFieldsTests(unittest.TestCase):
         Citations key on ``id``; ``based_on`` persists id/text/type/context; the
         expand tool takes memory_ids. Dropping any of these would silently
         degrade answers rather than raise.
+
+        ``entities`` survives too: it carries canonical entity *names* (not
+        ids), which are semantic signal the surface text may lack ("Bob" in the
+        text vs canonical "Robert Smith"). Reflect's recalls don't populate it
+        yet, but the trim must not eat the names once ``include_entities`` is
+        turned on.
         """
         trimmed = _drop_unread_fields(_dumped_observation())
-        for field in ("id", "text", "occurred_start", "tags", "source_fact_ids"):
+        for field in ("id", "text", "occurred_start", "tags", "source_fact_ids", "entities"):
             self.assertIn(field, trimmed, f"{field} is load-bearing and must survive the trim")
 
     def test_missing_fields_are_not_an_error(self):
