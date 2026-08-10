@@ -124,6 +124,40 @@ class MemoryEngineInterface(ABC):
         ...
 
     @abstractmethod
+    async def recall_multi_async(
+        self,
+        bank_ids: list[str],
+        query: str,
+        *,
+        merge: str = "score",
+        budget: "Budget | None" = None,
+        max_tokens: int = 4096,
+        enable_trace: bool = False,
+        fact_type: list[str] | None = None,
+        question_date: datetime | None = None,
+        include_entities: bool = False,
+        max_entity_tokens: int = 500,
+        include_chunks: bool = False,
+        max_chunk_tokens: int = 8192,
+        request_context: "RequestContext",
+    ) -> "RecallResult":
+        """
+        Recall across multiple banks and merge results (thin orchestrator above recall_async).
+
+        Runs one recall_async per bank in parallel (asyncio task per bank). Merge modes:
+        - ``score`` (default): sort union by each result's normalized cross-encoder score;
+          auto-falls back to ``interleave`` when any bank did not run cross_encoder.
+        - ``interleave``: round-robin by per-bank rank.
+
+        Partial bank failures do not fail the call; see response metadata for per-bank status.
+        v1 does not dedup across banks.
+
+        Returns:
+            RecallResult with bank_id stamped on each result and multi_bank metadata.
+        """
+        ...
+
+    @abstractmethod
     async def reflect_async(
         self,
         bank_id: str,
