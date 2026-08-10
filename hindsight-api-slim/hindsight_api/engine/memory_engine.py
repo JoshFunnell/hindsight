@@ -404,6 +404,7 @@ from .mental_model_refresh import (
     RefreshMode,
     RefreshOutcome,
 )
+from .multi_bank_recall import MultiBankMerge
 from .multi_llm import MultiLLMProvider
 from .query_analyzer import QueryAnalyzer
 from .reflect import run_reflect_agent
@@ -5223,6 +5224,184 @@ class MemoryEngine(MemoryEngineInterface):
             return result
         finally:
             recall_span_context.__exit__(None, None, None)
+
+    async def recall_multi_async(
+        self,
+        bank_ids: list[str],
+        query: str,
+        *,
+        merge: MultiBankMerge = "score",
+        budget: Budget | None = None,
+        max_tokens: int = 4096,
+        enable_trace: bool = False,
+        fact_type: list[str] | None = None,
+        prefer_observations: bool = False,
+        question_date: datetime | None = None,
+        include_entities: bool = False,
+        max_entity_tokens: int = 500,
+        include_chunks: bool = False,
+        max_chunk_tokens: int = 8192,
+        include_source_facts: bool = False,
+        max_source_facts_tokens: int = 4096,
+        max_source_facts_tokens_per_observation: int = -1,
+        request_context: "RequestContext",
+        tags: list[str] | None = None,
+        tags_match: TagsMatch = "any",
+        tag_groups: list[TagGroup] | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        min_scores: MinScores | None = None,
+        _connection_budget: int | None = None,
+        _quiet: bool = False,
+        reranking: RecallReranking = "cross_encoder",
+    ) -> RecallResultModel:
+        """Recall across multiple banks and merge (thin orchestrator above ``recall_async``).
+
+        One ``recall_async`` sub-call per bank runs concurrently via ``asyncio.gather``
+        (task-per-bank so each keeps its own ``_current_bank_id`` ContextVar binding).
+        Existing ``recall_async`` is not modified.
+
+        **Merge modes** (``merge``):
+        - ``score`` (default): sort the union by each result's normalized cross-encoder
+          score (``scores.reranker``). Auto-falls back to ``interleave`` when any queried
+          bank would not run cross_encoder (``enable_reranking=false`` → rrf, or caller
+          requested ``rrf``/``interleave``). Fallback is recorded in response metadata.
+        - ``interleave``: round-robin by per-bank rank (bankA#1, bankB#1, ...).
+
+        **Token budget:** the caller's full ``max_tokens`` is passed to each sub-call;
+        the merged list is then cut to ``max_tokens`` (same until-budget semantics as
+        single-bank). Slight over-fetch is the accepted v1 cost.
+
+        **Attribution:** every merged result is stamped with ``bank_id``.
+
+        **Failures:** one bank erroring does not kill the call — partial results are
+        returned with per-bank status in ``metadata["multi_bank"]["banks"]``.
+
+        **Dedup:** none in v1 (cross-bank duplicate facts are possible). Exact-text
+        dedup is a cheap v2; see module docstring on ``multi_bank_recall``.
+        """
+        from .multi_bank_recall import (
+            build_multi_bank_metadata,
+            cross_encoder_eligible,
+            cut_to_token_budget,
+            interleave_merge,
+            score_merge,
+        )
+
+        if merge not in ("score", "interleave"):
+            raise ValueError(f"merge must be 'score' or 'interleave', got {merge!r}")
+
+        # Preserve caller order; de-dupe so a bank is only recalled once.
+        seen: set[str] = set()
+        ordered_bank_ids: list[str] = []
+        for bid in bank_ids:
+            if bid not in seen:
+                seen.add(bid)
+                ordered_bank_ids.append(bid)
+
+        if not ordered_bank_ids:
+            return RecallResultModel(
+                results=[],
+                metadata=build_multi_bank_metadata(
+                    merge_requested=merge,
+                    merge_applied=merge,
+                    merge_fallback_reason=None,
+                    bank_statuses={},
+                ),
+            )
+
+        # Resolve per-bank enable_reranking so score-merge auto-fallback can run
+        # before (or without) depending on result scores. Failed config lookups
+        # are treated as "unknown / not CE-safe" → force interleave for score mode.
+        enable_flags: list[bool] = []
+        config_errors: dict[str, str] = {}
+        for bid in ordered_bank_ids:
+            try:
+                cfg = await self._config_resolver.get_bank_config(bid, request_context)
+                enable_flags.append(bool(cfg.get("enable_reranking", True)))
+            except Exception as e:
+                enable_flags.append(False)
+                config_errors[bid] = f"config lookup failed: {type(e).__name__}: {e!r}"
+
+        merge_requested: MultiBankMerge = merge
+        merge_applied: MultiBankMerge = merge_requested
+        merge_fallback_reason: str | None = None
+        if merge_requested == "score":
+            eligible, reason = cross_encoder_eligible(
+                requested_reranking=reranking,
+                bank_enable_reranking=enable_flags,
+            )
+            if not eligible:
+                merge_applied = "interleave"
+                merge_fallback_reason = reason
+
+        # Fan-out: task-per-bank keeps @_bind_bank_id ContextVar isolation.
+        async def _one(bank_id: str) -> RecallResultModel:
+            return await self.recall_async(
+                bank_id,
+                query,
+                budget=budget,
+                max_tokens=max_tokens,
+                enable_trace=enable_trace,
+                fact_type=fact_type,
+                prefer_observations=prefer_observations,
+                question_date=question_date,
+                include_entities=include_entities,
+                max_entity_tokens=max_entity_tokens,
+                include_chunks=include_chunks,
+                max_chunk_tokens=max_chunk_tokens,
+                include_source_facts=include_source_facts,
+                max_source_facts_tokens=max_source_facts_tokens,
+                max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
+                request_context=request_context,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=tag_groups,
+                created_after=created_after,
+                created_before=created_before,
+                min_scores=min_scores,
+                _connection_budget=_connection_budget,
+                _quiet=_quiet,
+                reranking=reranking,
+            )
+
+        gathered = await asyncio.gather(
+            *(_one(bid) for bid in ordered_bank_ids),
+            return_exceptions=True,
+        )
+
+        bank_statuses: dict[str, dict] = {}
+        successful: list[tuple[str, list[MemoryFact]]] = []
+        for bid, outcome in zip(ordered_bank_ids, gathered, strict=True):
+            if isinstance(outcome, BaseException):
+                bank_statuses[bid] = {
+                    "status": "error",
+                    "error": f"{type(outcome).__name__}: {outcome!r}",
+                }
+                if bid in config_errors:
+                    bank_statuses[bid]["config_error"] = config_errors[bid]
+                continue
+            # Successful RecallResultModel
+            count = len(outcome.results)
+            bank_statuses[bid] = {"status": "ok", "count": count}
+            successful.append((bid, list(outcome.results)))
+
+        if merge_applied == "score":
+            merged = score_merge(successful)
+        else:
+            merged = interleave_merge(successful)
+
+        cut = cut_to_token_budget(merged, max_tokens)
+
+        return RecallResultModel(
+            results=cut,
+            metadata=build_multi_bank_metadata(
+                merge_requested=merge_requested,
+                merge_applied=merge_applied,
+                merge_fallback_reason=merge_fallback_reason,
+                bank_statuses=bank_statuses,
+            ),
+        )
 
     async def _search_with_retries(
         self,
