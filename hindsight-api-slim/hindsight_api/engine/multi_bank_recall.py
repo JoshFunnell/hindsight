@@ -20,6 +20,9 @@ from .token_encoding import get_token_encoding
 
 MultiBankMerge = Literal["score", "interleave"]
 
+# Hard cap on parallel bank fan-out (engine + HTTP request model).
+MAX_MULTI_BANK_RECALL_BANKS = 10
+
 # Metadata keys written into ``RecallResult.metadata`` by the orchestrator.
 META_MULTI_BANK = "multi_bank"
 META_MERGE_REQUESTED = "merge_requested"
@@ -28,6 +31,13 @@ META_MERGE_FALLBACK_REASON = "merge_fallback_reason"
 META_BANKS = "banks"
 META_DEDUP = "dedup"
 META_DEDUP_V1 = "none"  # v1: no cross-bank dedup
+
+# Distinct post-gather fallback reason when returned facts lack usable CE scores
+# (e.g. RRF passthrough cross-encoder sets scores.reranker=None for every result).
+FALLBACK_NO_USABLE_RERANKER_SCORES = (
+    "no usable cross-encoder scores in returned results (scores.reranker is None); "
+    "score-merge would not order by relevance"
+)
 
 _T = TypeVar("_T")
 
@@ -152,7 +162,7 @@ def cross_encoder_eligible(
     requested_reranking: str,
     bank_enable_reranking: Sequence[bool],
 ) -> tuple[bool, str | None]:
-    """Whether score-merge is valid for this multi-bank call.
+    """Whether score-merge is *predicted* valid from config (pre-flight).
 
     Returns ``(True, None)`` when every bank would resolve to cross_encoder, else
     ``(False, reason)`` describing why score-merge must fall back to interleave.
@@ -160,6 +170,11 @@ def cross_encoder_eligible(
     Mirrors ``_resolve_reranking``: only ``cross_encoder`` is downgraded when
     ``enable_reranking`` is false (to ``rrf``). Caller-requested ``rrf`` / ``interleave``
     never produce comparable ``scores.reranker`` values.
+
+    This is necessary but not sufficient: the orchestrator also checks
+    :func:`has_usable_reranker_scores` on the actual returned facts (post-gather),
+    because an RRF passthrough cross-encoder still "resolves" to cross_encoder yet
+    writes ``scores.reranker=None`` on every result.
     """
     if requested_reranking != "cross_encoder":
         return (
@@ -172,6 +187,22 @@ def cross_encoder_eligible(
             "one or more banks have enable_reranking=false (resolved reranking would be rrf)",
         )
     return True, None
+
+
+def has_usable_reranker_scores(bank_results: Sequence[tuple[str, Sequence[MemoryFact]]]) -> bool:
+    """True when returned facts include at least one usable ``scores.reranker`` value.
+
+    Empty result sets are treated as usable (nothing to mis-order). If any facts are
+    present, at least one must carry a non-None ``scores.reranker``; otherwise
+    score-merge degenerates to bank-concatenation under a stable sort of all -inf.
+    """
+    saw_fact = False
+    for _bank_id, facts in bank_results:
+        for fact in facts:
+            saw_fact = True
+            if fact.scores is not None and fact.scores.reranker is not None:
+                return True
+    return not saw_fact
 
 
 def build_multi_bank_metadata(

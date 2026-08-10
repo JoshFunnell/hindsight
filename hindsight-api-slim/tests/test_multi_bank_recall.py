@@ -22,8 +22,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from hindsight_api.cancellation import OperationCancelledError
 from hindsight_api.engine.memory_engine import MemoryEngine, _bind_bank_id, get_current_bank_id
 from hindsight_api.engine.multi_bank_recall import (
+    FALLBACK_NO_USABLE_RERANKER_SCORES,
+    MAX_MULTI_BANK_RECALL_BANKS,
     META_BANKS,
     META_DEDUP,
     META_DEDUP_V1,
@@ -35,6 +38,7 @@ from hindsight_api.engine.multi_bank_recall import (
     build_multi_bank_metadata,
     cross_encoder_eligible,
     cut_to_token_budget,
+    has_usable_reranker_scores,
     interleave_merge,
     score_merge,
     stamp_bank_id,
@@ -47,6 +51,7 @@ from hindsight_api.engine.response_models import (
     RecallResult,
     RecallScores,
 )
+from hindsight_api.extensions.operation_validator import OperationValidationError
 from hindsight_api.models import RequestContext
 
 RC = RequestContext(tenant_id="default")
@@ -648,3 +653,97 @@ async def test_orchestrator_include_none_when_subcalls_omit_side_dicts():
     assert result.entities is None
     assert result.chunks is None
     assert result.source_facts is None
+
+
+# --- Job C audit fixes --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_cancellation_propagates_not_soft_fail():
+    """OperationCancelledError from any sub-call must re-raise, not enter bank metadata."""
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "ok", reranker=0.5)],
+            "bank-b": OperationCancelledError("client disconnected"),
+        }
+    )
+    with pytest.raises(OperationCancelledError, match="client disconnected"):
+        await MemoryEngine.recall_multi_async(
+            engine,
+            ["bank-a", "bank-b"],
+            "query",
+            request_context=RC,
+            max_tokens=10_000,
+        )
+
+
+def test_has_usable_reranker_scores_empty_is_ok():
+    assert has_usable_reranker_scores([("a", []), ("b", [])]) is True
+
+
+def test_has_usable_reranker_scores_all_none_is_false():
+    facts = [
+        ("a", [_fact("a1", "x", reranker=None, final=0.9)]),
+        ("b", [_fact("b1", "y", reranker=None, final=0.8)]),
+    ]
+    assert has_usable_reranker_scores(facts) is False
+
+
+def test_has_usable_reranker_scores_any_usable_is_true():
+    facts = [
+        ("a", [_fact("a1", "x", reranker=None, final=0.9)]),
+        ("b", [_fact("b1", "y", reranker=0.3)]),
+    ]
+    assert has_usable_reranker_scores(facts) is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_null_reranker_falls_back_to_interleave_order():
+    """All scores.reranker None + merge=score → interleave applied, real interleave order.
+
+    Without the post-gather check, score-merge would stable-sort all -inf and
+    concatenate banks (a1,a2,b1,b2) while claiming merge_applied='score'.
+    """
+    engine = _harness(
+        bank_results={
+            "bank-a": [
+                _fact("a1", "A1", reranker=None, final=0.9),
+                _fact("a2", "A2", reranker=None, final=0.8),
+            ],
+            "bank-b": [
+                _fact("b1", "B1", reranker=None, final=0.7),
+                _fact("b2", "B2", reranker=None, final=0.6),
+            ],
+        }
+    )
+    result = await MemoryEngine.recall_multi_async(
+        engine,
+        ["bank-a", "bank-b"],
+        "query",
+        merge="score",
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    mb = result.metadata[META_MULTI_BANK]
+    assert mb[META_MERGE_REQUESTED] == "score"
+    assert mb[META_MERGE_APPLIED] == "interleave"
+    assert mb[META_MERGE_FALLBACK_REASON] == FALLBACK_NO_USABLE_RERANKER_SCORES
+    # Genuine interleave order — not bank concatenation (a1,a2,b1,b2).
+    assert [f.id for f in result.results] == ["a1", "b1", "a2", "b2"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_rejects_over_cap_bank_ids():
+    too_many = [f"bank-{i}" for i in range(MAX_MULTI_BANK_RECALL_BANKS + 1)]
+    engine = _harness(bank_results={bid: [] for bid in too_many})
+    with pytest.raises(OperationValidationError) as excinfo:
+        await MemoryEngine.recall_multi_async(
+            engine,
+            too_many,
+            "query",
+            request_context=RC,
+            max_tokens=10_000,
+        )
+    assert excinfo.value.status_code == 422
+    assert str(MAX_MULTI_BANK_RECALL_BANKS) in str(excinfo.value)
+    # Must fail before fan-out — no sub-call attempts required when count is known.

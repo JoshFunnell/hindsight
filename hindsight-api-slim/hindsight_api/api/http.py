@@ -628,8 +628,11 @@ class MultiBankRecallRequest(RecallRequest):
     )
 
     bank_ids: list[str] = Field(
-        description="Memory banks to query in parallel. Order is preserved for interleave merge.",
+        description=(
+            "Memory banks to query in parallel (max 10). Order is preserved for interleave merge."
+        ),
         min_length=1,
+        max_length=10,
     )
     merge: Literal["score", "interleave"] = Field(
         default="score",

@@ -5382,17 +5382,22 @@ class MemoryEngine(MemoryEngineInterface):
 
         **Attribution:** every merged result is stamped with ``bank_id``.
 
-        **Failures:** one bank erroring does not kill the call — partial results are
+        **Failures:** ordinary bank errors do not kill the call — partial results are
         returned with per-bank status in ``metadata["multi_bank"]["banks"]``.
+        ``OperationCancelledError`` (client disconnect) is re-raised immediately so the
+        HTTP layer can map it to 499; cancellation is not a soft partial result.
 
         **Dedup:** none in v1 (cross-bank duplicate facts are possible). Exact-text
         dedup is a cheap v2; see module docstring on ``multi_bank_recall``.
         """
         from .multi_bank_recall import (
+            FALLBACK_NO_USABLE_RERANKER_SCORES,
+            MAX_MULTI_BANK_RECALL_BANKS,
             bank_rank_from_merged,
             build_multi_bank_metadata,
             cross_encoder_eligible,
             cut_to_token_budget,
+            has_usable_reranker_scores,
             interleave_merge,
             score_merge,
             union_merge_dicts,
@@ -5408,6 +5413,15 @@ class MemoryEngine(MemoryEngineInterface):
             if bid not in seen:
                 seen.add(bid)
                 ordered_bank_ids.append(bid)
+
+        if len(ordered_bank_ids) > MAX_MULTI_BANK_RECALL_BANKS:
+            from hindsight_api.extensions.operation_validator import OperationValidationError
+
+            raise OperationValidationError(
+                f"Too many bank_ids: {len(ordered_bank_ids)} exceeds maximum of "
+                f"{MAX_MULTI_BANK_RECALL_BANKS} parallel banks per multi-bank recall.",
+                status_code=422,
+            )
 
         if not ordered_bank_ids:
             return RecallResultModel(
@@ -5480,6 +5494,12 @@ class MemoryEngine(MemoryEngineInterface):
             return_exceptions=True,
         )
 
+        # Cancellation kills the whole multi-bank request — never soft-fail into
+        # partial metadata (HTTP must map this to 499, not 200).
+        for outcome in gathered:
+            if isinstance(outcome, OperationCancelledError):
+                raise outcome
+
         bank_statuses: dict[str, dict] = {}
         successful_facts: list[tuple[str, list[MemoryFact]]] = []
         successful_outcomes: list[tuple[str, RecallResultModel]] = []
@@ -5497,6 +5517,12 @@ class MemoryEngine(MemoryEngineInterface):
             bank_statuses[bid] = {"status": "ok", "count": count}
             successful_facts.append((bid, list(outcome.results)))
             successful_outcomes.append((bid, outcome))
+
+        # Post-gather evidence check: pre-flight config said CE was fine, but the
+        # returned facts may still lack scores.reranker (RRF passthrough, etc.).
+        if merge_applied == "score" and not has_usable_reranker_scores(successful_facts):
+            merge_applied = "interleave"
+            merge_fallback_reason = FALLBACK_NO_USABLE_RERANKER_SCORES
 
         if merge_applied == "score":
             merged = score_merge(successful_facts)

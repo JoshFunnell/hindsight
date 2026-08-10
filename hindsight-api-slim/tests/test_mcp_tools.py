@@ -1193,12 +1193,13 @@ class TestRecallMultiBankParams:
         mock_memory.recall_async.assert_called_once()
         mock_memory.recall_multi_async.assert_not_called()
 
-    async def test_one_bank_id_stays_single_bank(self, mock_memory):
-        """Per plan: only 2+ bank_ids engage multi; a single entry leaves current behaviour."""
+    async def test_one_bank_id_selects_that_bank(self, mock_memory):
+        """A single-element bank_ids selects THAT bank (not the session bank)."""
         mcp = _make_mcp_server(mock_memory, {"recall"})
-        await _tools(mcp)["recall"].fn(query="test", bank_ids=["only-one"])
+        await _tools(mcp)["recall"].fn(query="test", bank_ids=["work"])
         mock_memory.recall_async.assert_called_once()
         mock_memory.recall_multi_async.assert_not_called()
+        assert mock_memory.recall_async.call_args.kwargs["bank_id"] == "work"
 
     async def test_multi_default_merge_is_score(self, mock_memory):
         mcp = _make_mcp_server(mock_memory, {"recall"})

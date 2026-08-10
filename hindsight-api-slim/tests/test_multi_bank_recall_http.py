@@ -125,6 +125,17 @@ async def test_multi_bank_recall_rejects_empty_bank_ids(api_client, mock_memory)
 
 
 @pytest.mark.asyncio
+async def test_multi_bank_recall_rejects_over_cap_bank_ids(api_client, mock_memory):
+    """HTTP model max_length=10 rejects 11 bank_ids before the engine is called."""
+    resp = await api_client.post(
+        "/v1/default/memories/recall",
+        json={"bank_ids": [f"b{i}" for i in range(11)], "query": "hello world"},
+    )
+    assert resp.status_code == 422
+    mock_memory.recall_multi_async.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_multi_bank_recall_rejects_empty_query(api_client, mock_memory):
     resp = await api_client.post(
         "/v1/default/memories/recall",

@@ -839,9 +839,10 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
     if config.recall_description is None:
         description = (
             base_description
-            + "\n\nMulti-bank: pass bank_ids (2+) to search several banks in parallel. "
+            + "\n\nMulti-bank: pass bank_ids (2+) to search several banks in parallel; "
+            "a single bank_ids entry selects that bank; omit to use bank_id/session. "
             "merge='score' (default) orders by cross-encoder score and auto-falls back to "
-            "interleave when any bank lacks CE scores; merge='interleave' round-robins by rank. "
+            "interleave when CE scores are not usable; merge='interleave' round-robins by rank. "
             "Results include bank_id; metadata.multi_bank reports per-bank status and fallback."
         )
     else:
@@ -928,8 +929,8 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                     not calibrated across queries, so only threshold against scores you've calibrated for your
                     own data.
                 bank_id: Optional bank to search in (defaults to session bank). Use for single-bank operations.
-                bank_ids: Optional list of bank ids. When 2+ are provided, runs multi-bank recall
-                    (parallel sub-calls + merge). With 0 or 1 entry, single-bank behaviour is unchanged.
+                bank_ids: Optional list of bank ids. 2+ runs multi-bank recall; a single entry selects
+                    that bank for single-bank recall; empty/omitted uses bank_id or the session bank.
                 merge: Multi-bank merge mode — 'score' (default) or 'interleave'. score auto-falls back
                     to interleave when CE is not comparable across banks.
             """
@@ -956,7 +957,8 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                         **common,
                     )
                 else:
-                    target_bank = bank_id or config.bank_id_resolver()
+                    # Length-1 bank_ids selects THAT bank; empty falls back to bank_id/session.
+                    target_bank = cleaned_ids[0] if len(cleaned_ids) == 1 else (bank_id or config.bank_id_resolver())
                     if target_bank is None:
                         return "Error: No bank_id configured"
                     recall_result = await memory.recall_async(bank_id=target_bank, **common)
@@ -1011,8 +1013,8 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                     All inclusive and AND-ed; omit for no score filtering. The reranker's absolute scores are
                     not calibrated across queries, so only threshold against scores you've calibrated for your
                     own data.
-                bank_ids: Optional list of bank ids. When 2+ are provided, runs multi-bank recall
-                    (parallel sub-calls + merge). With 0 or 1 entry, single-bank behaviour is unchanged.
+                bank_ids: Optional list of bank ids. 2+ runs multi-bank recall; a single entry selects
+                    that bank for single-bank recall; empty/omitted uses the session bank.
                 merge: Multi-bank merge mode — 'score' (default) or 'interleave'. score auto-falls back
                     to interleave when CE is not comparable across banks.
             """
@@ -1039,7 +1041,8 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                         **common,
                     )
                 else:
-                    target_bank = config.bank_id_resolver()
+                    # Length-1 bank_ids selects THAT bank; empty falls back to session.
+                    target_bank = cleaned_ids[0] if len(cleaned_ids) == 1 else config.bank_id_resolver()
                     if target_bank is None:
                         return {"error": "No bank_id configured", "results": []}
                     recall_result = await memory.recall_async(bank_id=target_bank, **common)
