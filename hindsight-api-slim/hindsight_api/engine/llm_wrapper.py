@@ -1414,6 +1414,7 @@ class LLMProvider:
         # does so without building the full HindsightConfig, keeping from_env() a
         # lightweight env-only loader (see test_llm_provider_from_env_keeps_lightweight_loader).
         from ..config import (
+            DEFAULT_LLM_CACHE_AFFINITY,
             DEFAULT_LLM_GROQ_SERVICE_TIER,
             DEFAULT_LLM_OPENAI_SERVICE_TIER,
             DEFAULT_LLM_PROMPT_CACHE_ENABLED,
@@ -1460,7 +1461,9 @@ class LLMProvider:
         model = os.getenv(ENV_LLM_MODEL) or _get_default_model_for_provider(provider)
         extra_body = json.loads(os.getenv(ENV_LLM_EXTRA_BODY, "null"))
         default_headers = json.loads(os.getenv(ENV_LLM_DEFAULT_HEADERS, "null"))
-        cache_affinity = os.getenv(ENV_LLM_CACHE_AFFINITY) or None
+        # Same default as HindsightConfig.from_env: this entry point must not
+        # resolve to a different mode than the engine's own config path.
+        cache_affinity = os.getenv(ENV_LLM_CACHE_AFFINITY, DEFAULT_LLM_CACHE_AFFINITY) or None
         prompt_cache_enabled = os.getenv(
             ENV_LLM_PROMPT_CACHE_ENABLED, str(DEFAULT_LLM_PROMPT_CACHE_ENABLED)
         ).lower() in (

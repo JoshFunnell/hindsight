@@ -419,10 +419,62 @@ def test_config_reads_global_and_per_operation_affinity(clean_llm_env):
     assert config.consolidation_llm_cache_affinity is None
 
 
-def test_config_affinity_defaults_to_none(clean_llm_env):
+def test_config_affinity_defaults_to_auto(clean_llm_env):
+    """Unset means "auto", not "off".
+
+    "auto" only emits a hint for hosts documented to accept one (see
+    test_auto_default_sends_nothing_to_an_unrecognized_backend), so defaulting
+    it on costs unknown backends nothing while every xAI/OpenAI deployment gets
+    the cache hit it was otherwise silently losing.
+    """
     from hindsight_api.config import HindsightConfig
 
-    assert HindsightConfig.from_env().llm_cache_affinity is None
+    assert HindsightConfig.from_env().llm_cache_affinity == "auto"
+
+
+def test_llm_provider_from_env_defaults_to_auto(clean_llm_env):
+    """The two env entry points must agree; they resolved differently before."""
+    clean_llm_env.setenv("HINDSIGHT_API_LLM_PROVIDER", "openai")
+    clean_llm_env.setenv("HINDSIGHT_API_LLM_API_KEY", "sk-test")
+
+    assert LLMProvider.from_env().cache_affinity == "auto"
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("openai", "https://my-proxy.internal/v1"),
+        ("openai", "http://localhost:8000/v1"),
+        ("ollama", "http://localhost:11434/v1"),
+        ("groq", "https://api.groq.com/openai/v1"),
+        ("deepseek", "https://api.deepseek.com"),
+        ("openrouter", "https://openrouter.ai/api/v1"),
+        ("lmstudio", "http://localhost:1234/v1"),
+        ("", "https://vllm.internal/v1"),
+    ],
+)
+def test_auto_default_sends_nothing_to_an_unrecognized_backend(provider, base_url):
+    """The safety property that makes "auto" viable as a default.
+
+    An OpenAI-compatible backend that never documented either mechanism must
+    receive a byte-identical request. "auto" is an allowlist, so anything off it
+    resolves to none rather than being probed with an unfamiliar field.
+    """
+    assert resolve_cache_affinity(CacheAffinityMode.AUTO, provider, base_url) is CacheAffinityMode.NONE
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url", "expected"),
+    [
+        ("openai", "https://api.x.ai/v1", CacheAffinityMode.XAI_CONV_ID),
+        ("openai", "https://grok.com/v1", CacheAffinityMode.XAI_CONV_ID),
+        ("openai", None, CacheAffinityMode.OPENAI_PROMPT_CACHE_KEY),
+        ("openai", "https://api.openai.com/v1", CacheAffinityMode.OPENAI_PROMPT_CACHE_KEY),
+        ("openai", "https://myco.openai.azure.com/", CacheAffinityMode.OPENAI_PROMPT_CACHE_KEY),
+    ],
+)
+def test_auto_default_sends_a_hint_only_to_documented_hosts(provider, base_url, expected):
+    assert resolve_cache_affinity(CacheAffinityMode.AUTO, provider, base_url) is expected
 
 
 def test_indexed_member_carries_affinity(clean_llm_env):

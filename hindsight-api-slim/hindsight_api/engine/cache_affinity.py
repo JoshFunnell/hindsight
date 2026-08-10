@@ -16,10 +16,12 @@ runs an explicit ``CachedContent`` manager). This module is the equivalent for
 the OpenAI-compatible family — ``OpenAICompatibleLLM`` and its ``fireworks``
 and ``nous`` subclasses — which sent no affinity hint at all.
 
-Opt-in per member (``cache_affinity``), default ``none``: unknown
-OpenAI-compatible backends may reject unfamiliar body fields, so silence is the
-safe default. Every helper here is fail-open — when no id can be derived the
-request goes out byte-identical to before.
+Default ``auto`` per member (``cache_affinity``). ``auto`` is an allowlist, not a
+best-effort probe: it emits a hint only for hosts documented to accept one and
+resolves to ``none`` for everything else, so an unknown OpenAI-compatible backend
+never receives an unfamiliar field. Every helper here is fail-open — when no id
+can be derived the request goes out byte-identical to before. Set ``none`` to
+disable entirely.
 """
 
 from __future__ import annotations

@@ -226,9 +226,14 @@ DEFAULT_LLM_EXTRA_BODY = None  # None = no extra body params; JSON dict merged i
 DEFAULT_LLM_DEFAULT_HEADERS = (
     None  # None = no extra headers; JSON dict passed as default_headers to provider SDK clients
 )
-# None behaves as "none": pure opt-in. Unknown OpenAI-compatible backends may reject an
-# unfamiliar body field, so silence is the safe default rather than "auto".
-DEFAULT_LLM_CACHE_AFFINITY = None
+# "auto" is safe as a default because it is an allowlist, not a best-effort probe:
+# it emits a hint only for hosts documented to accept one (x.ai / grok.com get the
+# header, native OpenAI / openai.com / Azure OpenAI get the field) and resolves to
+# "none" for every other backend, so vLLM, ollama, groq, openrouter and any custom
+# OpenAI-compatible endpoint keep receiving byte-identical requests. Measured on a
+# live xAI backend: 29% of a shared prefix cached without the header vs 99% with it,
+# so defaulting to "none" silently costs most deployments the benefit.
+DEFAULT_LLM_CACHE_AFFINITY = "auto"
 
 
 def parse_gemini_service_tier(value: str | None) -> str | None:
