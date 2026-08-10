@@ -23,6 +23,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+#: Retrieval plumbing that the reflect agent never reads, dropped from tool
+#: results before they reach the model.
+#:
+#: These are scoring and provenance internals, not evidence: the agent cites by
+#: ``id``, ``based_on`` persists only id/text/type/context, and the expand tool
+#: takes ``memory_ids`` and resolves chunks server-side -- so nothing downstream
+#: needs them, while on real banks they measure several times the size of the
+#: observation text they accompany.
+#:
+#: Identity, text, dates, tags and ``source_fact_ids`` are deliberately kept.
+_UNREAD_RESULT_FIELDS = ("scores", "metadata", "entities", "chunk_id", "document_id")
+
+
+def _drop_unread_fields(d: dict[str, Any]) -> dict[str, Any]:
+    """Strip retrieval plumbing from one serialized tool result.
+
+    Mutates and returns ``d``, which is always a fresh ``model_dump()`` by the
+    time it gets here -- never a caller's dict.
+    """
+    for k in _UNREAD_RESULT_FIELDS:
+        d.pop(k, None)
+    return d
+
+
 def _prune_nulls(d: dict[str, Any]) -> dict[str, Any]:
     """Drop keys whose value is None or an empty collection (``""``, ``[]``, ``{}``).
 
@@ -252,8 +276,10 @@ async def tool_search_observations(
     return {
         "query": query,
         "count": len(result.results),
-        "observations": [_prune_nulls(m.model_dump()) for m in result.results],
-        "source_facts": {k: _prune_nulls(v.model_dump()) for k, v in (result.source_facts or {}).items()},
+        "observations": [_drop_unread_fields(_prune_nulls(m.model_dump())) for m in result.results],
+        "source_facts": {
+            k: _drop_unread_fields(_prune_nulls(v.model_dump())) for k, v in (result.source_facts or {}).items()
+        },
         "is_stale": is_stale,
         "freshness": freshness,
     }
@@ -320,7 +346,11 @@ async def tool_recall(
 
     return {
         "query": query,
-        "memories": [_prune_nulls(m.model_dump()) for m in result.results],
+        "memories": [_drop_unread_fields(_prune_nulls(m.model_dump())) for m in result.results],
+        # ``chunks`` is deliberately not trimmed: ChunkInfo carries only
+        # chunk_text / chunk_index / truncated, so it holds none of the fields
+        # above and the call would be a no-op. Pinned by
+        # test_chunk_info_carries_no_unread_fields.
         "chunks": {k: _prune_nulls(v.model_dump()) for k, v in (result.chunks or {}).items()},
     }
 
