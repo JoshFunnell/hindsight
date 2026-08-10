@@ -13005,6 +13005,47 @@ class MemoryEngine(MemoryEngineInterface):
                 fast_path_fallback_reason=fast_path_fallback_reason,
             )
 
+        # Identifier-retention gate: a refresh can drop anchored identifiers
+        # (dates, paths, shas, registry ids) while the document GROWS, so the
+        # emptiness check above cannot see it. Graded -- warns on a small loss,
+        # refuses on a large one -- because losing one or two is often
+        # legitimate churn. Measured over 364 refresh events: 337 lost nothing,
+        # 20 lost 1-2, 7 lost 3+. Runs AFTER the #3112 delta-window guard so a
+        # failed delta keeps its own, more precise refusal instead of being
+        # relabelled as identifier loss. Logic and the measurement live in
+        # engine/identifier_retention.py; this is only the call site, so the
+        # decision stays unit-testable without a DB.
+        from .identifier_retention import evaluate as _evaluate_identifier_retention
+
+        _ident_refuse, _ident_warning = _evaluate_identifier_retention(
+            current_content, final_content, has_delta_baseline
+        )
+        if _ident_warning:
+            warnings.append(_ident_warning)
+            # The names ARE the signal ("the warning exists to be read"), and
+            # ``run.warnings`` only reach dry-run previews and keep_trace
+            # traces -- so the persisted reflect_response carries the warning
+            # on the warn path and the refuse path alike.
+            reflect_response_payload["identifier_retention"] = _ident_warning
+        if _ident_refuse:
+            # Same preserve-and-fail shape as the guards above, under its own
+            # outcome value: a retention refusal labelled "empty candidate"
+            # would be factually wrong (the candidate is non-empty here) and
+            # would pollute any metric keyed on the outcome enum.
+            return _build_refresh_run(
+                ctx,
+                evidence,
+                effective_mode=effective_mode,
+                mode_fallback_reason=mode_fallback_reason,
+                final_content=final_content,
+                final_structured=None,
+                delta_operations=delta_operations,
+                reflect_response=reflect_response_payload,
+                outcome="refresh_failed_identifier_retention",
+                warnings=warnings,
+                fast_path_fallback_reason=fast_path_fallback_reason,
+            )
+
         # When delta is not applied (full mode, or delta fallback), parse the
         # candidate markdown so the next refresh has a structured baseline to
         # operate against.
@@ -13159,6 +13200,20 @@ class MemoryEngine(MemoryEngineInterface):
                     run.mode_fallback_reason or "delta_not_applied",
                     "delta operations did not reach the document, and the reflect candidate covers only "
                     "memories newer than the last refresh, so writing it would drop the rest of the document.",
+                )
+
+            if run.outcome == "refresh_failed_identifier_retention":
+                # The candidate was NOT empty -- it dropped too many anchored
+                # identifiers from the existing content. The detail names them
+                # verbatim: the names usually make the cause obvious at a
+                # glance, where a bare count would send a human diffing two
+                # document versions.
+                await _preserve_and_fail(
+                    "identifier_retention",
+                    next(
+                        (w for w in run.warnings if w.startswith("identifier-retention:")),
+                        "the candidate dropped too many anchored identifiers from the existing content.",
+                    ),
                 )
 
             # Parse the final stored content into structured_output when a schema is

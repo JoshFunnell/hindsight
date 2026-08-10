@@ -39,6 +39,7 @@ RefreshOutcome = Literal[
     "content_preserved_no_new_facts",
     "refresh_failed_empty_candidate",
     "refresh_failed_delta_not_applied",
+    "refresh_failed_identifier_retention",
 ]
 
 #: Which tier of the deterministic delta fast path produced a refresh. ``tier0``
