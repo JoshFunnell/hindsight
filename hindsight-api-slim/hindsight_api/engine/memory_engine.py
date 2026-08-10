@@ -5389,11 +5389,13 @@ class MemoryEngine(MemoryEngineInterface):
         dedup is a cheap v2; see module docstring on ``multi_bank_recall``.
         """
         from .multi_bank_recall import (
+            bank_rank_from_merged,
             build_multi_bank_metadata,
             cross_encoder_eligible,
             cut_to_token_budget,
             interleave_merge,
             score_merge,
+            union_merge_dicts,
         )
 
         if merge not in ("score", "interleave"):
@@ -5479,7 +5481,8 @@ class MemoryEngine(MemoryEngineInterface):
         )
 
         bank_statuses: dict[str, dict] = {}
-        successful: list[tuple[str, list[MemoryFact]]] = []
+        successful_facts: list[tuple[str, list[MemoryFact]]] = []
+        successful_outcomes: list[tuple[str, RecallResultModel]] = []
         for bid, outcome in zip(ordered_bank_ids, gathered, strict=True):
             if isinstance(outcome, BaseException):
                 bank_statuses[bid] = {
@@ -5489,20 +5492,41 @@ class MemoryEngine(MemoryEngineInterface):
                 if bid in config_errors:
                     bank_statuses[bid]["config_error"] = config_errors[bid]
                 continue
-            # Successful RecallResultModel
+            # Successful RecallResultModel — keep full outcome for include_* side dicts.
             count = len(outcome.results)
             bank_statuses[bid] = {"status": "ok", "count": count}
-            successful.append((bid, list(outcome.results)))
+            successful_facts.append((bid, list(outcome.results)))
+            successful_outcomes.append((bid, outcome))
 
         if merge_applied == "score":
-            merged = score_merge(successful)
+            merged = score_merge(successful_facts)
         else:
-            merged = interleave_merge(successful)
+            merged = interleave_merge(successful_facts)
 
         cut = cut_to_token_budget(merged, max_tokens)
 
+        # Union-merge entities/chunks/source_facts across successful banks. On key
+        # collision keep the bank whose results ranked higher in the merged order
+        # (chunk ids already embed bank ids, so real collisions are rare).
+        bank_rank = bank_rank_from_merged(cut)
+        entities = union_merge_dicts(
+            [(bid, outcome.entities) for bid, outcome in successful_outcomes],
+            bank_rank=bank_rank,
+        )
+        chunks = union_merge_dicts(
+            [(bid, outcome.chunks) for bid, outcome in successful_outcomes],
+            bank_rank=bank_rank,
+        )
+        source_facts = union_merge_dicts(
+            [(bid, outcome.source_facts) for bid, outcome in successful_outcomes],
+            bank_rank=bank_rank,
+        )
+
         return RecallResultModel(
             results=cut,
+            entities=entities,
+            chunks=chunks,
+            source_facts=source_facts,
             metadata=build_multi_bank_metadata(
                 merge_requested=merge_requested,
                 merge_applied=merge_applied,

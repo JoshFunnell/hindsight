@@ -12,8 +12,8 @@ v1 limitations (documented for callers / PR):
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Literal
+from collections.abc import Mapping, Sequence
+from typing import Literal, TypeVar
 
 from .response_models import MemoryFact
 from .token_encoding import get_token_encoding
@@ -29,10 +29,56 @@ META_BANKS = "banks"
 META_DEDUP = "dedup"
 META_DEDUP_V1 = "none"  # v1: no cross-bank dedup
 
+_T = TypeVar("_T")
+
+# Banks with no facts in the merged list still may contribute side dicts
+# (e.g. chunks fetched independently of max_tokens); rank them after all others.
+_SIDE_DICT_UNRANKED = 10**9
+
 
 def stamp_bank_id(fact: MemoryFact, bank_id: str) -> MemoryFact:
     """Return a copy of ``fact`` with ``bank_id`` set (orchestrator attribution)."""
     return fact.model_copy(update={"bank_id": bank_id})
+
+
+def bank_rank_from_merged(facts: Sequence[MemoryFact]) -> dict[str, int]:
+    """Map each bank_id to its best (earliest) position in the merged result list.
+
+    Lower rank wins on side-dict key collisions. Banks absent from ``facts`` are
+    omitted (callers treat them as unranked).
+    """
+    ranks: dict[str, int] = {}
+    for index, fact in enumerate(facts):
+        bid = fact.bank_id
+        if bid is not None and bid not in ranks:
+            ranks[bid] = index
+    return ranks
+
+
+def union_merge_dicts(
+    bank_dicts: Sequence[tuple[str, Mapping[str, _T] | None]],
+    *,
+    bank_rank: Mapping[str, int],
+) -> dict[str, _T] | None:
+    """Union-merge optional per-bank dicts; on key collision keep the higher-ranked bank.
+
+    ``bank_rank`` maps bank_id → rank (lower is better), typically from
+    :func:`bank_rank_from_merged`. Banks not present in ``bank_rank`` sort last.
+    Returns ``None`` when no bank contributed any entries (mirrors single-bank
+    ``include_*`` omitted behaviour).
+    """
+    winners: dict[str, tuple[int, _T]] = {}
+    for bank_id, mapping in bank_dicts:
+        if not mapping:
+            continue
+        rank = bank_rank.get(bank_id, _SIDE_DICT_UNRANKED)
+        for key, value in mapping.items():
+            previous = winners.get(key)
+            if previous is None or rank < previous[0]:
+                winners[key] = (rank, value)
+    if not winners:
+        return None
+    return {key: pair[1] for key, pair in winners.items()}
 
 
 def _reranker_score(fact: MemoryFact) -> float:

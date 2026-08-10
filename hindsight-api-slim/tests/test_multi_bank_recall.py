@@ -31,14 +31,22 @@ from hindsight_api.engine.multi_bank_recall import (
     META_MERGE_FALLBACK_REASON,
     META_MERGE_REQUESTED,
     META_MULTI_BANK,
+    bank_rank_from_merged,
     build_multi_bank_metadata,
     cross_encoder_eligible,
     cut_to_token_budget,
     interleave_merge,
     score_merge,
     stamp_bank_id,
+    union_merge_dicts,
 )
-from hindsight_api.engine.response_models import MemoryFact, RecallResult, RecallScores
+from hindsight_api.engine.response_models import (
+    ChunkInfo,
+    EntityState,
+    MemoryFact,
+    RecallResult,
+    RecallScores,
+)
 from hindsight_api.models import RequestContext
 
 RC = RequestContext(tenant_id="default")
@@ -192,12 +200,46 @@ def test_build_multi_bank_metadata_shape():
     assert block[META_DEDUP] == META_DEDUP_V1
 
 
+def test_union_merge_dicts_union_and_collision_by_rank():
+    """On collision keep the bank with the better (lower) rank from the merged order."""
+    merged = [
+        stamp_bank_id(_fact("a1", "top from A", reranker=0.9), "bank-a"),
+        stamp_bank_id(_fact("b1", "from B", reranker=0.5), "bank-b"),
+    ]
+    ranks = bank_rank_from_merged(merged)
+    assert ranks == {"bank-a": 0, "bank-b": 1}
+
+    # Distinct keys union
+    entities = union_merge_dicts(
+        [
+            ("bank-a", {"Alice": EntityState(entity_id="e-a", canonical_name="Alice")}),
+            ("bank-b", {"Bob": EntityState(entity_id="e-b", canonical_name="Bob")}),
+        ],
+        bank_rank=ranks,
+    )
+    assert set(entities) == {"Alice", "Bob"}
+
+    # Collision: same key — bank-a ranks higher so its value wins
+    chunks = union_merge_dicts(
+        [
+            ("bank-a", {"shared": ChunkInfo(chunk_text="from A", chunk_index=0)}),
+            ("bank-b", {"shared": ChunkInfo(chunk_text="from B", chunk_index=0)}),
+        ],
+        bank_rank=ranks,
+    )
+    assert chunks is not None
+    assert chunks["shared"].chunk_text == "from A"
+
+    # None / empty → None
+    assert union_merge_dicts([("bank-a", None), ("bank-b", {})], bank_rank=ranks) is None
+
+
 # --- orchestrator (mocked recall_async) ---------------------------------------
 
 
 def _harness(
     *,
-    bank_results: dict[str, list[MemoryFact] | Exception],
+    bank_results: dict[str, list[MemoryFact] | Exception | RecallResult],
     enable_reranking: dict[str, bool] | None = None,
 ) -> MemoryEngine:
     """Minimal MemoryEngine shell: real recall_multi_async, mocked sub-calls + config."""
@@ -207,11 +249,18 @@ def _harness(
         outcome = bank_results[bank_id]
         if isinstance(outcome, Exception):
             raise outcome
+        if isinstance(outcome, RecallResult):
+            return outcome
         return RecallResult(results=list(outcome))
 
     engine.recall_async = fake_recall  # type: ignore[method-assign]
 
-    enable_reranking = enable_reranking or {bid: True for bid in bank_results}
+    enable_reranking = enable_reranking or {
+        bid: True for bid in bank_results if not isinstance(bank_results[bid], Exception)
+    }
+    # Failed banks may still need config flags
+    for bid in bank_results:
+        enable_reranking.setdefault(bid, True)
 
     async def fake_config(bank_id: str, request_context):
         return {"enable_reranking": enable_reranking.get(bank_id, True)}
@@ -504,3 +553,98 @@ async def test_orchestrator_passes_full_max_tokens_to_each_subcall():
         max_tokens=1234,
     )
     assert seen_max == {"b1": 1234, "b2": 1234}
+
+
+# --- B0: include_* side-dict merge --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_merges_entities_chunks_source_facts():
+    """include_* payloads from successful banks are union-merged into the response."""
+    engine = _harness(
+        bank_results={
+            "bank-a": RecallResult(
+                results=[_fact("a1", "A top", reranker=0.9)],
+                entities={"Alice": EntityState(entity_id="ea", canonical_name="Alice")},
+                chunks={"a_doc_0": ChunkInfo(chunk_text="chunk A", chunk_index=0)},
+                source_facts={"sf-a": _fact("sf-a", "source from A")},
+            ),
+            "bank-b": RecallResult(
+                results=[_fact("b1", "B mid", reranker=0.5)],
+                entities={"Bob": EntityState(entity_id="eb", canonical_name="Bob")},
+                chunks={"b_doc_0": ChunkInfo(chunk_text="chunk B", chunk_index=0)},
+                source_facts={"sf-b": _fact("sf-b", "source from B")},
+            ),
+        }
+    )
+    result = await MemoryEngine.recall_multi_async(
+        engine,
+        ["bank-a", "bank-b"],
+        "query",
+        merge="score",
+        include_entities=True,
+        include_chunks=True,
+        include_source_facts=True,
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    assert result.entities is not None and set(result.entities) == {"Alice", "Bob"}
+    assert result.chunks is not None and set(result.chunks) == {"a_doc_0", "b_doc_0"}
+    assert result.source_facts is not None and set(result.source_facts) == {"sf-a", "sf-b"}
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_side_dict_collision_prefers_higher_ranked_bank():
+    """On key collision, keep the bank whose results ranked higher in the merged list."""
+    # bank-b has the higher CE score → ranks first after score-merge → wins collisions.
+    engine = _harness(
+        bank_results={
+            "bank-a": RecallResult(
+                results=[_fact("a1", "low", reranker=0.2)],
+                entities={"Shared": EntityState(entity_id="from-a", canonical_name="Shared")},
+                chunks={"shared_key": ChunkInfo(chunk_text="from A", chunk_index=0)},
+                source_facts={"sf-shared": _fact("sf-shared", "from A")},
+            ),
+            "bank-b": RecallResult(
+                results=[_fact("b1", "high", reranker=0.95)],
+                entities={"Shared": EntityState(entity_id="from-b", canonical_name="Shared")},
+                chunks={"shared_key": ChunkInfo(chunk_text="from B", chunk_index=0)},
+                source_facts={"sf-shared": _fact("sf-shared", "from B")},
+            ),
+        }
+    )
+    result = await MemoryEngine.recall_multi_async(
+        engine,
+        ["bank-a", "bank-b"],
+        "query",
+        merge="score",
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    assert [f.id for f in result.results] == ["b1", "a1"]
+    assert result.entities is not None
+    assert result.entities["Shared"].entity_id == "from-b"
+    assert result.chunks is not None
+    assert result.chunks["shared_key"].chunk_text == "from B"
+    assert result.source_facts is not None
+    assert result.source_facts["sf-shared"].text == "from B"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_include_none_when_subcalls_omit_side_dicts():
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "only", reranker=0.5)],
+            "bank-b": [_fact("b1", "only", reranker=0.4)],
+        }
+    )
+    result = await MemoryEngine.recall_multi_async(
+        engine,
+        ["bank-a", "bank-b"],
+        "query",
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    assert result.entities is None
+    assert result.chunks is None
+    assert result.source_facts is None
