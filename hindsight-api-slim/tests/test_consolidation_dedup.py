@@ -625,17 +625,17 @@ async def test_process_batch_creates_when_dedup_target_vanished() -> None:
     create_action.assert_awaited_once()
     assert create_action.await_args.kwargs["text"] == "Uzbek YouTube content is very rich."
     assert create_action.await_args.kwargs["source_memory_ids"] == [mem_id]
-    assert result == ([{"action": "created"}], 0, False)
+    assert result == ([{"action": "created"}], 0, None)
 
 
 async def test_process_batch_reports_skipped_when_create_skipped() -> None:
     # _execute_create_action returns "skipped" (all sources deleted in the write txn) ->
     # _process_memory_batch must NOT mark the memory created; it falls through to skipped.
     result, _create_action, _mem_id = await _run_create_batch("skipped")
-    assert result == ([{"action": "skipped", "reason": "no_durable_knowledge"}], 0, False)
+    assert result == ([{"action": "skipped", "reason": "no_durable_knowledge"}], 0, None)
 
 
 async def test_process_batch_reports_created_when_create_created() -> None:
     # _execute_create_action returns "created" -> the memory is marked created.
     result, _create_action, _mem_id = await _run_create_batch("created")
-    assert result == ([{"action": "created"}], 0, False)
+    assert result == ([{"action": "created"}], 0, None)
