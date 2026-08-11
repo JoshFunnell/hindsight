@@ -48,7 +48,12 @@ def test_entity_leaf_parses_from_dict():
 
 def test_entity_leaf_parses_nested_in_compounds():
     group = _ADAPTER.validate_python(
-        {"or": [{"entities": ["atlas"]}, {"and": [{"tags": ["topic:infra"]}, {"entities": ["Northstar"], "match": "all"}]}]}
+        {
+            "or": [
+                {"entities": ["atlas"]},
+                {"and": [{"tags": ["topic:infra"]}, {"entities": ["Northstar"], "match": "all"}]},
+            ]
+        }
     )
     validate_entity_leaf_placement([group])  # no NOT anywhere -> fine
 
@@ -98,7 +103,9 @@ def test_sql_all_emits_distinct_count_arity():
 
 
 def test_sql_mixed_tags_and_entities_param_accounting():
-    group = _ADAPTER.validate_python({"and": [{"tags": ["topic:infra"], "match": "any_strict"}, {"entities": ["atlas"]}]})
+    group = _ADAPTER.validate_python(
+        {"and": [{"tags": ["topic:infra"], "match": "any_strict"}, {"entities": ["atlas"]}]}
+    )
     clause, params, next_offset = build_tag_groups_where_clause([group], param_offset=5)
     assert "$5" in clause and "$6" in clause
     assert params == [["topic:infra"], ["atlas"]]
