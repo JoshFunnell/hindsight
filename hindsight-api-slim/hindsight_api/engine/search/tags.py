@@ -276,6 +276,7 @@ class TagGroupEntityLeaf(BaseModel):
     # committed openapi.json did not.
     match: Literal["any", "all"] = Field(default="any", title="EntityMatch")
 
+
 class TagGroupAnd(BaseModel):
     """Compound AND group: all child filters must match."""
 
