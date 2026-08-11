@@ -11844,7 +11844,8 @@
               "content_written",
               "content_preserved_no_new_facts",
               "refresh_failed_empty_candidate",
-              "refresh_failed_delta_not_applied"
+              "refresh_failed_delta_not_applied",
+              "refresh_failed_identifier_retention"
             ],
             "title": "Outcome",
             "description": "What a real refresh would do with the document."
@@ -12191,7 +12192,8 @@
               "content_written",
               "content_preserved_no_new_facts",
               "refresh_failed_empty_candidate",
-              "refresh_failed_delta_not_applied"
+              "refresh_failed_delta_not_applied",
+              "refresh_failed_identifier_retention"
             ],
             "title": "Outcome",
             "description": "What the refresh did with the document."

@@ -3119,7 +3119,8 @@ export type MentalModelDryRunRefreshResult = {
     | "content_written"
     | "content_preserved_no_new_facts"
     | "refresh_failed_empty_candidate"
-    | "refresh_failed_delta_not_applied";
+    | "refresh_failed_delta_not_applied"
+    | "refresh_failed_identifier_retention";
   /**
    * Fast Path
    *
@@ -3351,7 +3352,8 @@ export type MentalModelRefreshTrace = {
     | "content_written"
     | "content_preserved_no_new_facts"
     | "refresh_failed_empty_candidate"
-    | "refresh_failed_delta_not_applied";
+    | "refresh_failed_delta_not_applied"
+    | "refresh_failed_identifier_retention";
   /**
    * Fast Path
    *

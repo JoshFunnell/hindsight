@@ -7989,6 +7989,7 @@ components:
           - content_preserved_no_new_facts
           - refresh_failed_empty_candidate
           - refresh_failed_delta_not_applied
+          - refresh_failed_identifier_retention
           title: Outcome
           type: string
         fast_path:
@@ -8281,6 +8282,7 @@ components:
           - content_preserved_no_new_facts
           - refresh_failed_empty_candidate
           - refresh_failed_delta_not_applied
+          - refresh_failed_identifier_retention
           title: Outcome
           type: string
         fast_path:
