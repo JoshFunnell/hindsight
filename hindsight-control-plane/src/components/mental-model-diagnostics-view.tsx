@@ -221,12 +221,24 @@ export function TraceSummary({ trace }: { trace: MentalModelRefreshTrace }) {
         translated prose: these are the enum names the dry-run payload, the
         stored trace and the docs all use, so a reader comparing this line
         against a `reflect_response` sees the same token.
+
+        The enum NAMES sit in `{"..."}` expressions rather than bare JSX text so
+        `npm run i18n:check` does not read them as untranslated prose: that check
+        scans JSXText nodes and human-facing attributes, and an expression-container
+        string literal is neither. Keep them wrapped if you edit this line.
       */}
-      {trace.fast_path && <span className="font-mono"> &middot; fast_path={trace.fast_path}</span>}
+      {trace.fast_path && (
+        <span className="font-mono">
+          {" "}
+          &middot; {"fast_path="}
+          {trace.fast_path}
+        </span>
+      )}
       {trace.fast_path_fallback_reason && (
         <span className="font-mono text-amber-700 dark:text-amber-400">
           {" "}
-          &middot; fast_path_fallback_reason={trace.fast_path_fallback_reason}
+          &middot; {"fast_path_fallback_reason="}
+          {trace.fast_path_fallback_reason}
         </span>
       )}
     </span>
