@@ -697,6 +697,12 @@ export type BankTemplateConfig = {
    */
   consolidation_max_memories_per_round?: number | null;
   /**
+   * Consolidation Dead Letter Warn Fraction
+   *
+   * Share of a consolidation run's attempted memories that must dead-letter before an end-of-run warning is logged (0 disables)
+   */
+  consolidation_dead_letter_warn_fraction?: number | null;
+  /**
    * Consolidation Llm Parallelism
    *
    * Number of consolidation LLM batches processed concurrently

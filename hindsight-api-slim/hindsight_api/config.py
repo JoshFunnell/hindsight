@@ -646,6 +646,7 @@ ENV_ENABLE_OBSERVATIONS = "HINDSIGHT_API_ENABLE_OBSERVATIONS"
 ENV_ENABLE_AUTO_CONSOLIDATION = "HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION"
 ENV_CONSOLIDATION_BATCH_SIZE = "HINDSIGHT_API_CONSOLIDATION_BATCH_SIZE"
 ENV_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND"
+ENV_CONSOLIDATION_DEAD_LETTER_WARN_FRACTION = "HINDSIGHT_API_CONSOLIDATION_DEAD_LETTER_WARN_FRACTION"
 ENV_CONSOLIDATION_LLM_BATCH_SIZE = "HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE"
 ENV_CONSOLIDATION_DEDUP_THRESHOLD = "HINDSIGHT_API_CONSOLIDATION_DEDUP_THRESHOLD"
 ENV_CONSOLIDATION_LLM_PARALLELISM = "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM"
@@ -1211,6 +1212,9 @@ DEFAULT_CONSOLIDATION_BATCH_SIZE = 50  # Memories to load per batch (internal me
 DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = (
     100  # Max memories per consolidation round (0 = unlimited). Limits how long one bank holds a worker slot.
 )
+# Warn at end of run when this share of a run's attempted memories dead-lettered.
+# 0 disables the warning; 1.0 warns only when every attempted memory failed.
+DEFAULT_CONSOLIDATION_DEAD_LETTER_WARN_FRACTION = 0.5
 DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE = 8  # Facts per LLM call (1 = no batching; >1 = batch mode)
 # Cosine >= this between a newly-created or freshly-updated observation and an existing one
 # triggers a focused 1-by-1 LLM "merge or keep" pass (the LLM reads both, so numbers/negation/
@@ -2403,6 +2407,7 @@ class HindsightConfig:
     consolidation_batch_size: int
     consolidation_dedup_threshold: float
     consolidation_max_memories_per_round: int
+    consolidation_dead_letter_warn_fraction: float
     consolidation_llm_batch_size: int
     consolidation_llm_parallelism: int
     consolidation_max_tokens: int
@@ -2681,6 +2686,7 @@ class HindsightConfig:
         "consolidation_llm_batch_size",
         "consolidation_llm_parallelism",
         "consolidation_max_memories_per_round",
+        "consolidation_dead_letter_warn_fraction",
         "consolidation_source_facts_max_tokens",
         "consolidation_source_facts_max_tokens_per_observation",
         "observations_mission",
@@ -3651,6 +3657,12 @@ class HindsightConfig:
                 os.getenv(
                     ENV_CONSOLIDATION_MAX_MEMORIES_PER_ROUND,
                     str(DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND),
+                )
+            ),
+            consolidation_dead_letter_warn_fraction=float(
+                os.getenv(
+                    ENV_CONSOLIDATION_DEAD_LETTER_WARN_FRACTION,
+                    str(DEFAULT_CONSOLIDATION_DEAD_LETTER_WARN_FRACTION),
                 )
             ),
             consolidation_dedup_threshold=float(

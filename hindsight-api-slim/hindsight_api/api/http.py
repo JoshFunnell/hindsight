@@ -2667,6 +2667,13 @@ class BankTemplateConfig(BaseModel):
     consolidation_max_memories_per_round: int | None = Field(
         default=None, description="Max memory units fed into a single consolidation round"
     )
+    consolidation_dead_letter_warn_fraction: float | None = Field(
+        default=None,
+        description=(
+            "Share of a consolidation run's attempted memories that must dead-letter "
+            "before an end-of-run warning is logged (0 disables)"
+        ),
+    )
     consolidation_llm_parallelism: int | None = Field(
         default=None, description="Number of consolidation LLM batches processed concurrently"
     )

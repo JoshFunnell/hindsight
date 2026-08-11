@@ -59,6 +59,7 @@ type BankTemplateConfig struct {
 	StoreDocumentText NullableBool `json:"store_document_text,omitempty"`
 	EnableAutoConsolidation NullableBool `json:"enable_auto_consolidation,omitempty"`
 	ConsolidationMaxMemoriesPerRound NullableInt32 `json:"consolidation_max_memories_per_round,omitempty"`
+	ConsolidationDeadLetterWarnFraction NullableFloat32 `json:"consolidation_dead_letter_warn_fraction,omitempty"`
 	ConsolidationLlmParallelism NullableInt32 `json:"consolidation_llm_parallelism,omitempty"`
 	RecallIncludeChunks NullableBool `json:"recall_include_chunks,omitempty"`
 	RecallMaxTokens NullableInt32 `json:"recall_max_tokens,omitempty"`
@@ -1718,6 +1719,48 @@ func (o *BankTemplateConfig) UnsetConsolidationMaxMemoriesPerRound() {
 	o.ConsolidationMaxMemoriesPerRound.Unset()
 }
 
+// GetConsolidationDeadLetterWarnFraction returns the ConsolidationDeadLetterWarnFraction field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *BankTemplateConfig) GetConsolidationDeadLetterWarnFraction() float32 {
+	if o == nil || IsNil(o.ConsolidationDeadLetterWarnFraction.Get()) {
+		var ret float32
+		return ret
+	}
+	return *o.ConsolidationDeadLetterWarnFraction.Get()
+}
+
+// GetConsolidationDeadLetterWarnFractionOk returns a tuple with the ConsolidationDeadLetterWarnFraction field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *BankTemplateConfig) GetConsolidationDeadLetterWarnFractionOk() (*float32, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.ConsolidationDeadLetterWarnFraction.Get(), o.ConsolidationDeadLetterWarnFraction.IsSet()
+}
+
+// HasConsolidationDeadLetterWarnFraction returns a boolean if a field has been set.
+func (o *BankTemplateConfig) HasConsolidationDeadLetterWarnFraction() bool {
+	if o != nil && o.ConsolidationDeadLetterWarnFraction.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetConsolidationDeadLetterWarnFraction gets a reference to the given NullableFloat32 and assigns it to the ConsolidationDeadLetterWarnFraction field.
+func (o *BankTemplateConfig) SetConsolidationDeadLetterWarnFraction(v float32) {
+	o.ConsolidationDeadLetterWarnFraction.Set(&v)
+}
+// SetConsolidationDeadLetterWarnFractionNil sets the value for ConsolidationDeadLetterWarnFraction to be an explicit nil
+func (o *BankTemplateConfig) SetConsolidationDeadLetterWarnFractionNil() {
+	o.ConsolidationDeadLetterWarnFraction.Set(nil)
+}
+
+// UnsetConsolidationDeadLetterWarnFraction ensures that no value is present for ConsolidationDeadLetterWarnFraction, not even an explicit nil
+func (o *BankTemplateConfig) UnsetConsolidationDeadLetterWarnFraction() {
+	o.ConsolidationDeadLetterWarnFraction.Unset()
+}
+
 // GetConsolidationLlmParallelism returns the ConsolidationLlmParallelism field value if set, zero value otherwise (both if not set or set to explicit null).
 func (o *BankTemplateConfig) GetConsolidationLlmParallelism() int32 {
 	if o == nil || IsNil(o.ConsolidationLlmParallelism.Get()) {
@@ -2048,6 +2091,9 @@ func (o BankTemplateConfig) ToMap() (map[string]interface{}, error) {
 	}
 	if o.ConsolidationMaxMemoriesPerRound.IsSet() {
 		toSerialize["consolidation_max_memories_per_round"] = o.ConsolidationMaxMemoriesPerRound.Get()
+	}
+	if o.ConsolidationDeadLetterWarnFraction.IsSet() {
+		toSerialize["consolidation_dead_letter_warn_fraction"] = o.ConsolidationDeadLetterWarnFraction.Get()
 	}
 	if o.ConsolidationLlmParallelism.IsSet() {
 		toSerialize["consolidation_llm_parallelism"] = o.ConsolidationLlmParallelism.Get()

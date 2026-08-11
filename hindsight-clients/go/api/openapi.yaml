@@ -5273,6 +5273,9 @@ components:
         consolidation_max_memories_per_round:
           nullable: true
           type: integer
+        consolidation_dead_letter_warn_fraction:
+          nullable: true
+          type: number
         consolidation_llm_parallelism:
           nullable: true
           type: integer

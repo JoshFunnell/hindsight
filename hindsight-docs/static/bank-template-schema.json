@@ -541,6 +541,19 @@
           "description": "Max memory units fed into a single consolidation round",
           "title": "Consolidation Max Memories Per Round"
         },
+        "consolidation_dead_letter_warn_fraction": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Share of a consolidation run's attempted memories that must dead-letter before an end-of-run warning is logged (0 disables)",
+          "title": "Consolidation Dead Letter Warn Fraction"
+        },
         "consolidation_llm_parallelism": {
           "anyOf": [
             {

@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import asyncpg
 from pydantic import BaseModel, field_validator
 
-from ...config import get_config
+from ...config import ENV_CONSOLIDATION_DEAD_LETTER_WARN_FRACTION, get_config
 from ...worker.stage import set_stage
 from ..db import DatabaseBackend
 from ..db_utils import acquire_with_retry
@@ -1050,6 +1050,61 @@ async def _count_unconsolidated_rows(
     )
 
 
+#: A run must dead-letter at least this many memories before the end-of-run warning
+#: fires, regardless of the configured fraction. Without a floor, a bank consolidating
+#: one or two memories at a time would warn on every isolated failure, and a warning
+#: that fires constantly is one operators learn to scroll past -- the same end state as
+#: not having it, but with false confidence that the case is covered.
+DEAD_LETTER_WARN_MIN_MEMORIES = 3
+
+
+def dead_letter_warning(bank_id: str, processed: int, failed: int, warn_fraction: float) -> str | None:
+    """Return an operator-facing warning if this run dead-lettered a large share of its work.
+
+    Memories that exhaust consolidation retries are stamped ``consolidation_failed_at``
+    and are then skipped by every later run. That is the correct conservative behaviour
+    -- the engine cannot know whether the provider refused this content or was simply
+    unavailable -- but it is silent: the rows leave the pending set and nothing says so.
+    A provider outage or a quota window can therefore park a whole batch indefinitely,
+    and in practice it is noticed weeks later, if at all.
+
+    This deliberately infers nothing about WHY the failures happened. It reads two
+    counters the job already keeps and compares them to a threshold. There is no
+    inspection of provider exception types, status codes or message text, so it cannot
+    go stale as providers change their error vocabulary, and it behaves identically for
+    a failure mode nobody has seen yet.
+
+    Returns None when there is nothing to say, so the caller logs only on a real signal
+    and the decision stays testable without capturing log output.
+    """
+    # Counters only, and both must be sane: a negative one means the caller's
+    # accounting is broken, and a broken counter must not be reported as a
+    # dead-letter event (processed=-5, failed=10 would otherwise read as "200%").
+    if processed < 0 or failed <= 0:
+        return None
+    attempted = processed + failed
+    if attempted <= 0:
+        return None
+    # A non-positive fraction disables the warning outright; operators who have accepted
+    # a lossy provider should be able to silence it without patching.
+    if warn_fraction <= 0:
+        return None
+    if failed < DEAD_LETTER_WARN_MIN_MEMORIES:
+        return None
+    fraction = failed / attempted
+    if fraction < warn_fraction:
+        return None
+    return (
+        f"[CONSOLIDATION] bank={bank_id} dead-lettered {failed}/{attempted} memories "
+        f"({fraction:.0%}) in this run. They are stamped consolidation_failed_at and "
+        f"will NOT be retried by later runs. If this was a provider outage or quota "
+        f"window rather than unusable content, clear the stamps with: "
+        f"POST /v1/default/banks/{bank_id}/consolidation/recover "
+        f"(CLI: hindsight bank consolidation-recover {bank_id}). "
+        f"Set {ENV_CONSOLIDATION_DEAD_LETTER_WARN_FRACTION}=0 to silence this."
+    )
+
+
 async def run_consolidation_job(
     memory_engine: "MemoryEngine",
     bank_id: str,
@@ -1668,6 +1723,29 @@ async def _run_consolidation_job(
         stats["mental_models_refreshed"] = mental_models_refreshed
 
     perf.flush()
+
+    # Surface a run that parked a large share of its work. Emitted once per run, after
+    # the totals are final, so it reports the run's actual outcome rather than a
+    # mid-flight batch that later batches may recover from.
+    #
+    # The two counters mean what the warning says they mean: ``memories_failed`` is
+    # incremented only for an ``action == "failed"`` result, which is emitted at the
+    # one site that marks a memory with ``consolidation_failed_at`` -- after adaptive
+    # splitting has already retried it down to a single-memory batch. So it counts
+    # terminal dead-letter stamps from THIS run, not transient batch errors that a
+    # later split recovered, and ``memories_processed`` is its success counterpart.
+    # Read from the bank-resolved config, not get_config(): this knob is per-bank
+    # configurable and exportable in a bank template, so reading the process-global
+    # would let a bank-level value store, export and import cleanly while never taking
+    # effect. Same object the sibling consolidation knobs above are read from.
+    warning = dead_letter_warning(
+        bank_id,
+        stats["memories_processed"],
+        stats["memories_failed"],
+        config.consolidation_dead_letter_warn_fraction,
+    )
+    if warning:
+        logger.warning(warning)
 
     return {"status": "completed", "bank_id": bank_id, **stats}
 
