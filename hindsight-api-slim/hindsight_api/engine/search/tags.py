@@ -266,8 +266,15 @@ class TagGroupEntityLeaf(BaseModel):
     """
 
     entities: list[str] = Field(min_length=1)
-    match: Literal["any", "all"] = "any"
-
+    # Distinct OpenAPI title. Without it this enum serialises as
+    # title: "Match", the same title TagGroupLeaf's DIFFERENT match enum
+    # already uses (any/all/any_strict/all_strict/exact). progenitor/typify
+    # keys inline enums BY TITLE, so the second definition fails to conform
+    # and Rust client generation dies with TypeError(InvalidValue) at
+    # build.rs:199 -- reproduced 2026-08-11. The collision only appears in a
+    # REGENERATED spec, which is why CI saw it and a local build of the
+    # committed openapi.json did not.
+    match: Literal["any", "all"] = Field(default="any", title="EntityMatch")
 
 class TagGroupAnd(BaseModel):
     """Compound AND group: all child filters must match."""
