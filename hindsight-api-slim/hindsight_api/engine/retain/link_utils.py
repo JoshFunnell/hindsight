@@ -26,19 +26,20 @@ logger = logging.getLogger(__name__)
 # Sentinel UUID used in the unique index to represent NULL entity_id
 _NIL_ENTITY_UUID = "00000000-0000-0000-0000-000000000000"
 
-# Collapses any run of whitespace (including \n, \r, \t) to a single space.
+# Any run of whitespace, including the \n / \r / \t that extraction sometimes
+# leaves inside a candidate entity name.
 _WHITESPACE_RUN_RE = re.compile(r"\s+")
 
 
 def _normalize_entity_name(name: str) -> str:
-    """Collapse internal whitespace runs (including newlines/tabs) to a single
-    space and strip leading/trailing whitespace; case is left untouched.
+    """Collapse internal whitespace runs to a single space and strip the ends.
 
-    Motivation: production banks were measured (2026-08-08) with entity
-    canonical_name values containing embedded newlines -- extraction
-    artifacts -- which shears any line-oriented consumer (psql -A output,
-    logs, exports). Case handling is unchanged because the entity registry
-    matches on LOWER(canonical_name) separately.
+    Extraction can hand back names carrying embedded newlines/tabs, which then
+    become ``entities.canonical_name`` values that shear every line-oriented
+    consumer (``psql -A`` output, log lines, exports) — issue #3275. Case is
+    deliberately untouched: the entity registry already matches on
+    ``LOWER(canonical_name)``, so lowercasing here would only lose the display
+    form.
     """
     return _WHITESPACE_RUN_RE.sub(" ", name).strip()
 
@@ -195,15 +196,20 @@ def _prepare_entities_for_resolution(
     """
     Convert LLM entities into the flat format expected by entity resolver.
 
-    Also drops candidate names that are tag-shaped (e.g. "domain:lens") rather
-    than real entities -- see `_is_tag_shaped_name`. A tag-shaped name that is
-    also a configured entity label (e.g. "use:use-001" from a tag-type label
-    group) is exempt: label values are deliberately "key:value" shaped and
-    must still reach entity resolution (GH-1558 exact-match path).
+    Candidate names are whitespace-normalized here (see ``_normalize_entity_name``)
+    and names that are empty afterwards are dropped, so no downstream stage has to
+    cope with an entity whose canonical name is blank or spans several lines.
+    Tag-shaped category labels (e.g. ``domain:lens``) are also skipped — see
+    ``_is_tag_shaped_name`` — unless they are configured entity labels (e.g.
+    ``use:use-001``), which are deliberately ``key:value`` shaped (GH-1558) and
+    must still reach entity resolution.
+    All of this happens before the flat list and ``entity_to_unit`` are derived,
+    keeping the resolver's positional invariant (output index-aligned with input)
+    intact.
 
     Args:
-        entity_labels: Optional configured label taxonomy, used only to
-            exempt configured label values from the tag-shape skip.
+        entity_labels: Optional configured label taxonomy, used only to exempt
+            configured label values from the tag-shape skip.
 
     Returns:
         Tuple of (all_entities_flat, all_entities, entity_to_unit) where:
@@ -216,9 +222,16 @@ def _prepare_entities_for_resolution(
 
     substep_start = time.time()
     all_entities = []
+    dropped_empty = 0
     skipped_tag_shaped = 0
     for entity_list in llm_entities:
         formatted_entities = []
+        # Normalization can make two candidates that reached here as distinct
+        # strings ("Acme\nCorp" from extraction, "Acme Corp" from the caller's
+        # own entity list) identical, and the upstream dedup in
+        # entity_processing runs on the raw text. Without this, the same entity
+        # would be resolved twice for one fact and its mention_count bumped twice.
+        seen_in_fact: set[str] = set()
         for ent in entity_list:
             if hasattr(ent, "text"):
                 raw_text, entity_type = ent.text, "CONCEPT"
@@ -228,14 +241,37 @@ def _prepare_entities_for_resolution(
                 continue
 
             normalized_text = _normalize_entity_name(raw_text)
-            is_configured_label = bool(labels_cfg) and is_label_entity(normalized_text, labels_cfg, labels_lookup)
+            if not normalized_text:
+                # A blank or whitespace-only candidate would otherwise be created
+                # as an entity with an empty canonical_name — the resolver has no
+                # guard of its own.
+                dropped_empty += 1
+                continue
+
+            # After empty-drop, before dedupe: only non-empty names are checked,
+            # and skipped tags never enter seen_in_fact (so the skip counter
+            # counts each tag-shaped occurrence, and dedupe only tracks survivors).
+            is_configured_label = bool(labels_cfg) and is_label_entity(
+                normalized_text, labels_cfg, labels_lookup
+            )
             if not is_configured_label and _is_tag_shaped_name(normalized_text):
                 skipped_tag_shaped += 1
                 logger.debug("Skipping tag-shaped candidate entity name: %r", normalized_text)
                 continue
 
+            if normalized_text.lower() in seen_in_fact:
+                continue
+            seen_in_fact.add(normalized_text.lower())
+
             formatted_entities.append({"text": normalized_text, "type": entity_type})
         all_entities.append(formatted_entities)
+
+    if dropped_empty:
+        _log(
+            log_buffer,
+            f"  [6.1] Dropped {dropped_empty} empty candidate entity name(s)",
+            level="debug",
+        )
 
     if skipped_tag_shaped:
         _log(
