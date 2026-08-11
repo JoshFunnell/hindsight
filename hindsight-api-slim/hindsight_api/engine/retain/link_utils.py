@@ -251,9 +251,7 @@ def _prepare_entities_for_resolution(
             # After empty-drop, before dedupe: only non-empty names are checked,
             # and skipped tags never enter seen_in_fact (so the skip counter
             # counts each tag-shaped occurrence, and dedupe only tracks survivors).
-            is_configured_label = bool(labels_cfg) and is_label_entity(
-                normalized_text, labels_cfg, labels_lookup
-            )
+            is_configured_label = bool(labels_cfg) and is_label_entity(normalized_text, labels_cfg, labels_lookup)
             if not is_configured_label and _is_tag_shaped_name(normalized_text):
                 skipped_tag_shaped += 1
                 logger.debug("Skipping tag-shaped candidate entity name: %r", normalized_text)
