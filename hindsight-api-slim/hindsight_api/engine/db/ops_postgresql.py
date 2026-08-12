@@ -13,6 +13,7 @@ from .ops import (
     LinkExpansionRows,
     TagListingParts,
     UpdatedWindow,
+    document_serialization_sql,
     graph_maintenance_bank_serialization_sql,
 )
 from .result import ResultRow
@@ -522,25 +523,44 @@ class PostgreSQLOps(DataAccessOps):
         # retry wrap in run_graph_maintenance_job stays as a backstop for the
         # residual paths (FK cascade from prune_orphan_entities, Oracle).
         #
-        # The staleness predicate is an INTERSECT of the two entities' unit sets
-        # rather than the equivalent `unit_entities u1 JOIN u2 ON u1.unit_id =
-        # u2.unit_id` self-join (#2473): both INTERSECT branches resolve as Index
-        # Only Scans on idx_unit_entities_entity_unit (entity_id, unit_id), so the
-        # per-pair cost is bounded by the two entities' degrees. The self-join let
-        # the planner pick an anti-join that rescanned a high-degree hub entity's
-        # membership set for every pair — 28-30min on a bank with a ~100K-membership
-        # hub, even when zero rows were stale. Don't "simplify" it back.
+        # Staleness is decided against a SET of currently-live pairs built ONCE
+        # per sweep, not with a per-cooccurrence-row check (#3367). The old form
+        # ran a correlated `NOT EXISTS (… INTERSECT …)` for every row, and each
+        # evaluation re-scanned a hub entity's full membership set — cost scaled
+        # as (cooccurrence rows) × (hub degree), 88-140s on a real bank with a
+        # ~22K-degree hub (and 215s in a 12K-degree repro). #2473 had swapped an
+        # earlier hub-rescanning self-join to that INTERSECT, but only made each
+        # per-row check cheaper — it kept the per-row structure, so the product
+        # blew up again at scale.
+        #
+        # `live` instead groups unit_entities by unit (self-join on unit_id) to
+        # emit every co-occurring (e1<e2) pair in one materialised pass: its cost
+        # is driven by unit degree (entities per unit — small), never by entity
+        # degree, so a hub contributes only its per-unit membership, not a rescan
+        # per edge. The victims anti-join then hashes against it. Scope `live` to
+        # this bank's entities (`u1 -> bank entity`; a unit co-member is in the
+        # same bank): graph maintenance runs per-bank, so an unscoped schema-wide
+        # build would re-derive every bank's pairs on every bank's run —
+        # O(banks × schema) per cycle instead of O(schema). MATERIALIZED keeps
+        # the planner from inlining `live` back into a per-row correlated plan.
         result = await conn.execute(
             f"""
-            WITH victims AS (
+            WITH live AS MATERIALIZED (
+                SELECT u1.entity_id AS e1, u2.entity_id AS e2
+                FROM {entities_table} be
+                JOIN {ue_table} u1 ON u1.entity_id = be.id
+                JOIN {ue_table} u2 ON u2.unit_id = u1.unit_id
+                                  AND u2.entity_id > u1.entity_id
+                WHERE be.bank_id = $1
+            ),
+            victims AS (
                 SELECT c.entity_id_1, c.entity_id_2
                 FROM {ec_table} c
                 JOIN {entities_table} e ON e.id = c.entity_id_1
                 WHERE e.bank_id = $1
                   AND NOT EXISTS (
-                      SELECT unit_id FROM {ue_table} WHERE entity_id = c.entity_id_1
-                      INTERSECT
-                      SELECT unit_id FROM {ue_table} WHERE entity_id = c.entity_id_2
+                      SELECT 1 FROM live l
+                      WHERE l.e1 = c.entity_id_1 AND l.e2 = c.entity_id_2
                   )
                 ORDER BY c.entity_id_1, c.entity_id_2
                 FOR UPDATE OF c
@@ -1234,7 +1254,7 @@ class PostgreSQLOps(DataAccessOps):
             if exclude_ids:
                 return await conn.fetch(
                     f"""
-                    SELECT operation_id, operation_type, task_payload, retry_count
+                    SELECT operation_id, operation_type, task_payload, retry_count, serialization_key, bank_id
                     FROM {table}
                     WHERE status = 'pending'
                       AND task_payload IS NOT NULL
@@ -1253,7 +1273,7 @@ class PostgreSQLOps(DataAccessOps):
             else:
                 return await conn.fetch(
                     f"""
-                    SELECT operation_id, operation_type, task_payload, retry_count
+                    SELECT operation_id, operation_type, task_payload, retry_count, serialization_key, bank_id
                     FROM {table}
                     WHERE status = 'pending'
                       AND task_payload IS NOT NULL
@@ -1271,7 +1291,7 @@ class PostgreSQLOps(DataAccessOps):
             if exclude_ids:
                 return await conn.fetch(
                     f"""
-                    SELECT operation_id, operation_type, task_payload, retry_count
+                    SELECT operation_id, operation_type, task_payload, retry_count, serialization_key, bank_id
                     FROM {table}
                     WHERE status = 'pending'
                       AND task_payload IS NOT NULL
@@ -1288,7 +1308,7 @@ class PostgreSQLOps(DataAccessOps):
             else:
                 return await conn.fetch(
                     f"""
-                    SELECT operation_id, operation_type, task_payload, retry_count
+                    SELECT operation_id, operation_type, task_payload, retry_count, serialization_key, bank_id
                     FROM {table}
                     WHERE status = 'pending'
                       AND task_payload IS NOT NULL
@@ -1329,7 +1349,7 @@ class PostgreSQLOps(DataAccessOps):
         extra = " AND ".join(conditions)
         return await conn.fetch(
             f"""
-            SELECT operation_id, operation_type, task_payload, retry_count
+            SELECT operation_id, operation_type, task_payload, retry_count, serialization_key, bank_id
             FROM {table}
             WHERE status = 'pending'
               AND task_payload IS NOT NULL
@@ -1376,7 +1396,7 @@ class PostgreSQLOps(DataAccessOps):
         extra_clause = (" AND " + " AND ".join(conditions)) if conditions else ""
         return await conn.fetch(
             f"""
-            SELECT operation_id, operation_type, task_payload, retry_count
+            SELECT operation_id, operation_type, task_payload, retry_count, serialization_key, bank_id
             FROM {table}
             WHERE status = 'pending'
               AND task_payload IS NOT NULL
@@ -1427,13 +1447,14 @@ class PostgreSQLOps(DataAccessOps):
             else:
                 rows = await conn.fetch(
                     f"""
-                    SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count
+                    SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
                     FROM {table} o
                     WHERE o.status = 'pending'
                       AND o.task_payload IS NOT NULL
                       AND o.operation_type = $1
                       AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
                       AND {graph_maintenance_bank_serialization_sql(table, "o")}
+                      AND {document_serialization_sql(table, "o")}
                     ORDER BY o.created_at
                     LIMIT $2
                     FOR UPDATE SKIP LOCKED
@@ -1455,7 +1476,7 @@ class PostgreSQLOps(DataAccessOps):
             if claimed_ids:
                 rows = await conn.fetch(
                     f"""
-                    SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count
+                    SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
                     FROM {table} o
                     WHERE o.status = 'pending'
                       AND o.task_payload IS NOT NULL
@@ -1463,6 +1484,7 @@ class PostgreSQLOps(DataAccessOps):
                       AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
                       AND o.operation_id != ALL($1::uuid[])
                       AND {graph_maintenance_bank_serialization_sql(table, "o")}
+                      AND {document_serialization_sql(table, "o")}
                     ORDER BY o.created_at
                     LIMIT $2
                     FOR UPDATE SKIP LOCKED
@@ -1473,13 +1495,14 @@ class PostgreSQLOps(DataAccessOps):
             else:
                 rows = await conn.fetch(
                     f"""
-                    SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count
+                    SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
                     FROM {table} o
                     WHERE o.status = 'pending'
                       AND o.task_payload IS NOT NULL
                       AND o.operation_type != 'consolidation'
                       AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
                       AND {graph_maintenance_bank_serialization_sql(table, "o")}
+                      AND {document_serialization_sql(table, "o")}
                     ORDER BY o.created_at
                     LIMIT $1
                     FOR UPDATE SKIP LOCKED
@@ -1520,6 +1543,19 @@ class PostgreSQLOps(DataAccessOps):
 
         # Mark all claimed rows as processing
         operation_ids = [row["operation_id"] for row in all_rows]
+        await self.mark_operations_processing(conn, table, worker_id, operation_ids)
+
+        return all_rows
+
+    async def mark_operations_processing(
+        self,
+        conn: DatabaseConnection,
+        table: str,
+        worker_id: str,
+        operation_ids: list,
+    ) -> None:
+        if not operation_ids:
+            return
         await conn.execute(
             f"""
             UPDATE {table}
@@ -1530,4 +1566,31 @@ class PostgreSQLOps(DataAccessOps):
             operation_ids,
         )
 
-        return all_rows
+    async def fetch_foldable_retain_peers(
+        self,
+        conn: DatabaseConnection,
+        table: str,
+        bank_id: str,
+        serialization_key: str,
+        limit: int,
+    ) -> list[ResultRow]:
+        if limit <= 0:
+            return []
+        return await conn.fetch(
+            f"""
+            SELECT operation_id, task_payload, retry_count
+            FROM {table}
+            WHERE status = 'pending'
+              AND task_payload IS NOT NULL
+              AND operation_type = 'retain'
+              AND bank_id = $1
+              AND serialization_key = $2
+              AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+            ORDER BY created_at, operation_id
+            LIMIT $3
+            FOR UPDATE SKIP LOCKED
+            """,
+            bank_id,
+            serialization_key,
+            limit,
+        )
