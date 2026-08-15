@@ -34,7 +34,7 @@ import { pool } from "./core/util";
 import { getHarness, HARNESS_NAMES } from "./harness/registry";
 import { diag } from "./core/diag";
 import { buildRetainStamp } from "./core/retain-stamp";
-import { log as plog, setLogLevel } from "./core/log";
+import { describeError, log as plog, setLogLevel } from "./core/log";
 
 const DIFF_BATCH = 50; // per-run cap on per-commit diff ingestion (bounded session cost)
 const LOCK_STALE_MS = 30 * 60 * 1000;
@@ -49,7 +49,9 @@ const REPO = arg("repo");
 const cfg0 = loadConfig({ harness: arg("harness") ?? undefined, path: arg("config") });
 const BANK =
   arg("bank") ?? (REPO ? deriveBankId(cfg0, REPO, arg("harness") ?? cfg0.harness) : cfg0.bankId);
-const resolved0 = BANK ? applyBankConfig(cfg0, BANK) : { cfg: cfg0, bankId: BANK };
+const resolved0 = BANK
+  ? applyBankConfig(cfg0, BANK, REPO ?? undefined)
+  : { cfg: cfg0, bankId: BANK };
 const cfg = resolved0.cfg;
 const FINAL_BANK = resolved0.bankId ?? BANK;
 if (cfg.disabled) {
@@ -317,7 +319,7 @@ async function main() {
 main().catch((e) => {
   diag("deepen", "deepen_failed", {
     bank: FINAL_BANK,
-    error: String((e as Error)?.message || e).slice(0, 200),
+    error: describeError(e),
   });
   console.error("deepen failed:", (e as Error).message || e);
   try {

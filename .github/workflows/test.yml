@@ -32,6 +32,7 @@ jobs:
       integration-tests: ${{ steps.filter.outputs.integration-tests }}
       integrations-openclaw: ${{ steps.filter.outputs.integrations-openclaw }}
       integrations-ai-sdk: ${{ steps.filter.outputs.integrations-ai-sdk }}
+      integrations-eliza: ${{ steps.filter.outputs.integrations-eliza }}
       integrations-agent-framework: ${{ steps.filter.outputs.integrations-agent-framework }}
       integrations-composio: ${{ steps.filter.outputs.integrations-composio }}
       integrations-chat: ${{ steps.filter.outputs.integrations-chat }}
@@ -143,6 +144,8 @@ jobs:
             - 'hindsight-integrations/openclaw/**'
           integrations-ai-sdk:
             - 'hindsight-integrations/ai-sdk/**'
+          integrations-eliza:
+            - 'hindsight-integrations/eliza/**'
           integrations-agent-framework:
             - 'hindsight-integrations/agent-framework/**'
           integrations-composio:
@@ -885,6 +888,37 @@ jobs:
       working-directory: ./hindsight-integrations/ai-sdk
       run: npm run test:deno
 
+  build-eliza-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-eliza == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/eliza
+      run: npm ci
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/eliza
+      run: npm test
+
+    - name: Build
+      working-directory: ./hindsight-integrations/eliza
+      run: npm run build
+
   test-opencode-integration:
     needs: [detect-changes]
     if: >-
@@ -1420,6 +1454,30 @@ jobs:
           ~/.cargo/git
           hindsight-cli/target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install cargo-about
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-about@0.9.1
+
+    - name: Verify cargo-about
+      run: cargo about --version
+
+    # cargo-about resolves the dependency graph for every target platform, so it
+    # needs crates this host never builds (e.g. the Android-only
+    # android_system_properties). Populate the registry first: `cargo fetch`
+    # without --target downloads for all targets, and Cargo.lock is not checked
+    # in, so nothing is cached from a previous step.
+    - name: Fetch crate sources for the license scan
+      working-directory: hindsight-cli
+      run: cargo fetch
+
+    - name: Generate and verify license manifest
+      working-directory: hindsight-cli
+      run: |
+        cargo about generate --offline --manifest-path Cargo.toml --config about.toml about.hbs --output-file /tmp/THIRD_PARTY_LICENSES.txt
+        test -s /tmp/THIRD_PARTY_LICENSES.txt
+        grep -Fq "THIRD-PARTY SOFTWARE LICENSES" /tmp/THIRD_PARTY_LICENSES.txt
 
     - name: Run unit tests
       working-directory: hindsight-cli
