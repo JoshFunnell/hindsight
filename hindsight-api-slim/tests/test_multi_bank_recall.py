@@ -59,6 +59,7 @@ from hindsight_api.engine.response_models import (
     RecallScores,
 )
 from hindsight_api.extensions.operation_validator import OperationValidationError
+from hindsight_api.extensions.tenant import AuthenticationError
 from hindsight_api.models import RequestContext
 
 RC = RequestContext(tenant_id="default")
@@ -268,6 +269,11 @@ def _harness(
         return RecallResult(results=list(outcome))
 
     engine.recall_async = fake_recall  # type: ignore[method-assign]
+
+    async def fake_auth(request_context: RequestContext) -> str:
+        return "public"
+
+    engine._authenticate_tenant = fake_auth  # type: ignore[method-assign]
 
     enable_reranking = enable_reranking or {
         bid: True for bid in bank_results if not isinstance(bank_results[bid], Exception)
@@ -518,6 +524,11 @@ async def test_orchestrator_contextvar_isolation_across_parallel_subcalls():
         return RecallResult(results=[_fact(f"{bank_id}-1", bank_id, reranker=0.5)])
 
     engine.recall_async = bound_recall  # type: ignore[method-assign]
+
+    async def fake_auth(request_context: RequestContext) -> str:
+        return "public"
+
+    engine._authenticate_tenant = fake_auth  # type: ignore[method-assign]
     engine._config_resolver = SimpleNamespace(  # type: ignore[attr-defined]
         get_bank_config=AsyncMock(return_value={"enable_reranking": True})
     )
@@ -559,6 +570,11 @@ async def test_orchestrator_passes_full_max_tokens_to_each_subcall():
         return RecallResult(results=[_fact(f"{bank_id}-1", "x" * 50, reranker=0.5)])
 
     engine.recall_async = tracking_recall  # type: ignore[method-assign]
+
+    async def fake_auth(request_context: RequestContext) -> str:
+        return "public"
+
+    engine._authenticate_tenant = fake_auth  # type: ignore[method-assign]
     engine._config_resolver = SimpleNamespace(  # type: ignore[attr-defined]
         get_bank_config=AsyncMock(return_value={"enable_reranking": True})
     )
@@ -688,6 +704,83 @@ async def test_orchestrator_cancellation_propagates_not_soft_fail():
             request_context=RC,
             max_tokens=10_000,
         )
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_authentication_error_propagates_not_soft_fail():
+    """Tenant AuthenticationError from any sub-call must re-raise, not enter bank metadata.
+
+    Auth is per-request (tenant), not per-bank. The 2026-08-10 P1#(3) re-raise
+    covered OperationValidationError only; AuthenticationError fell into the
+    generic soft-fail (live-measured 2026-08-15: multi POST -> 200).
+    """
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "ok", reranker=0.5)],
+            "bank-b": AuthenticationError("Invalid API key"),
+        }
+    )
+    with pytest.raises(AuthenticationError, match="Invalid API key"):
+        await MemoryEngine.recall_multi_async(
+            engine,
+            ["bank-a", "bank-b"],
+            "query",
+            request_context=RC,
+            max_tokens=10_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_upfront_tenant_auth_failure_skips_fanout():
+    """Unauthenticated multi-recall fails before any per-bank recall_async starts."""
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "ok", reranker=0.5)],
+            "bank-b": [_fact("b1", "ok", reranker=0.4)],
+        }
+    )
+    called: list[str] = []
+    original = engine.recall_async
+
+    async def tracking_recall(bank_id: str, query: str, **kwargs):
+        called.append(bank_id)
+        return await original(bank_id, query, **kwargs)
+
+    engine.recall_async = tracking_recall  # type: ignore[method-assign]
+
+    async def reject_auth(request_context: RequestContext) -> str:
+        raise AuthenticationError("Invalid API key")
+
+    engine._authenticate_tenant = reject_auth  # type: ignore[method-assign]
+    with pytest.raises(AuthenticationError, match="Invalid API key"):
+        await MemoryEngine.recall_multi_async(
+            engine,
+            ["bank-a", "bank-b"],
+            "query",
+            request_context=RC,
+            max_tokens=10_000,
+        )
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_validation_error_from_bank_propagates_not_soft_fail():
+    """OperationValidationError from any sub-call still re-raises (unchanged)."""
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "ok", reranker=0.5)],
+            "bank-b": OperationValidationError("bank denied", status_code=403),
+        }
+    )
+    with pytest.raises(OperationValidationError, match="bank denied") as excinfo:
+        await MemoryEngine.recall_multi_async(
+            engine,
+            ["bank-a", "bank-b"],
+            "query",
+            request_context=RC,
+            max_tokens=10_000,
+        )
+    assert excinfo.value.status_code == 403
 
 
 def test_has_usable_reranker_scores_empty_is_ok():
