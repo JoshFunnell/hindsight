@@ -22,20 +22,31 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from hindsight_api.cancellation import OperationCancelledError
 from hindsight_api.engine.memory_engine import MemoryEngine, _bind_bank_id, get_current_bank_id
 from hindsight_api.engine.multi_bank_recall import (
+    DEFAULT_PER_BANK_MERGE_CAP,
+    FALLBACK_NO_USABLE_RERANKER_SCORES,
+    MAX_MULTI_BANK_RECALL_BANKS,
     META_BANKS,
     META_DEDUP,
+    META_DEDUP_DROPPED,
     META_DEDUP_V1,
     META_MERGE_APPLIED,
     META_MERGE_FALLBACK_REASON,
     META_MERGE_REQUESTED,
     META_MULTI_BANK,
+    META_PER_BANK_CAP,
     bank_rank_from_merged,
     build_multi_bank_metadata,
+    cap_per_bank_results,
     cross_encoder_eligible,
     cut_to_token_budget,
+    dedup_exact_normalized,
+    has_usable_reranker_scores,
     interleave_merge,
+    merge_cap_dedup_cut,
+    normalize_dedup_key,
     score_merge,
     stamp_bank_id,
     union_merge_dicts,
@@ -47,6 +58,7 @@ from hindsight_api.engine.response_models import (
     RecallResult,
     RecallScores,
 )
+from hindsight_api.extensions.operation_validator import OperationValidationError
 from hindsight_api.models import RequestContext
 
 RC = RequestContext(tenant_id="default")
@@ -198,6 +210,8 @@ def test_build_multi_bank_metadata_shape():
     assert block[META_MERGE_FALLBACK_REASON] == "test reason"
     assert block[META_BANKS]["a"]["status"] == "ok"
     assert block[META_DEDUP] == META_DEDUP_V1
+    assert block[META_DEDUP_DROPPED] == 0
+    assert block[META_PER_BANK_CAP] == DEFAULT_PER_BANK_MERGE_CAP
 
 
 def test_union_merge_dicts_union_and_collision_by_rank():
@@ -424,7 +438,11 @@ async def test_orchestrator_partial_failure_metadata():
     assert banks["bank-a"]["status"] == "ok"
     assert banks["bank-a"]["count"] == 1
     assert banks["bank-b"]["status"] == "error"
-    assert "boom" in banks["bank-b"]["error"]
+    # Live overlay (2026-08-10 audit): client metadata is generic — no exception
+    # class/repr oracle. Details stay in the server log.
+    assert banks["bank-b"]["error"] == "recall failed for this bank"
+    assert "boom" not in banks["bank-b"]["error"]
+    assert "RuntimeError" not in banks["bank-b"]["error"]
     assert [f.id for f in result.results] == ["a1"]
 
 
@@ -648,3 +666,177 @@ async def test_orchestrator_include_none_when_subcalls_omit_side_dicts():
     assert result.entities is None
     assert result.chunks is None
     assert result.source_facts is None
+
+
+# --- 2026-08-10 audit-fix hunks (already live in overlay bak-pretrackA) --------
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_cancellation_propagates_not_soft_fail():
+    """OperationCancelledError from any sub-call must re-raise, not enter bank metadata."""
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "ok", reranker=0.5)],
+            "bank-b": OperationCancelledError("client disconnected"),
+        }
+    )
+    with pytest.raises(OperationCancelledError, match="client disconnected"):
+        await MemoryEngine.recall_multi_async(
+            engine,
+            ["bank-a", "bank-b"],
+            "query",
+            request_context=RC,
+            max_tokens=10_000,
+        )
+
+
+def test_has_usable_reranker_scores_empty_is_ok():
+    assert has_usable_reranker_scores([("a", []), ("b", [])]) is True
+
+
+def test_has_usable_reranker_scores_all_none_is_false():
+    facts = [
+        ("a", [_fact("a1", "x", reranker=None, final=0.9)]),
+        ("b", [_fact("b1", "y", reranker=None, final=0.8)]),
+    ]
+    assert has_usable_reranker_scores(facts) is False
+
+
+def test_has_usable_reranker_scores_any_usable_is_true():
+    facts = [
+        ("a", [_fact("a1", "x", reranker=None, final=0.9)]),
+        ("b", [_fact("b1", "y", reranker=0.3)]),
+    ]
+    assert has_usable_reranker_scores(facts) is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_null_reranker_falls_back_to_interleave_order():
+    """All scores.reranker None + merge=score -> interleave applied, real interleave order.
+
+    Without the post-gather check, score-merge would stable-sort all -inf and
+    concatenate banks (a1,a2,b1,b2) while claiming merge_applied='score'.
+    """
+    engine = _harness(
+        bank_results={
+            "bank-a": [
+                _fact("a1", "A1", reranker=None, final=0.9),
+                _fact("a2", "A2", reranker=None, final=0.8),
+            ],
+            "bank-b": [
+                _fact("b1", "B1", reranker=None, final=0.7),
+                _fact("b2", "B2", reranker=None, final=0.6),
+            ],
+        }
+    )
+    result = await MemoryEngine.recall_multi_async(
+        engine,
+        ["bank-a", "bank-b"],
+        "query",
+        merge="score",
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    mb = result.metadata[META_MULTI_BANK]
+    assert mb[META_MERGE_REQUESTED] == "score"
+    assert mb[META_MERGE_APPLIED] == "interleave"
+    assert mb[META_MERGE_FALLBACK_REASON] == FALLBACK_NO_USABLE_RERANKER_SCORES
+    # Genuine interleave order -- not bank concatenation (a1,a2,b1,b2).
+    assert [f.id for f in result.results] == ["a1", "b1", "a2", "b2"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_rejects_over_cap_bank_ids():
+    too_many = [f"bank-{i}" for i in range(MAX_MULTI_BANK_RECALL_BANKS + 1)]
+    engine = _harness(bank_results={bid: [] for bid in too_many})
+    with pytest.raises(OperationValidationError) as excinfo:
+        await MemoryEngine.recall_multi_async(
+            engine,
+            too_many,
+            "query",
+            request_context=RC,
+            max_tokens=10_000,
+        )
+    assert excinfo.value.status_code == 422
+    assert str(MAX_MULTI_BANK_RECALL_BANKS) in str(excinfo.value)
+
+
+# --- 2026-08-12 track-A helpers (overlay minus bak-pretrackA) -------------------
+
+
+def test_normalize_dedup_key_casefold_and_whitespace():
+    assert normalize_dedup_key("  Foo   BAR\t") == "foo bar"
+    assert normalize_dedup_key(None) == ""
+
+
+def test_dedup_exact_normalized_keeps_first_and_counts_drops():
+    facts = [
+        _fact("a1", "Same Sentence", reranker=0.9),
+        _fact("b1", "same   sentence", reranker=0.8),
+        _fact("c1", "different", reranker=0.7),
+    ]
+    kept, dropped = dedup_exact_normalized(facts)
+    assert [f.id for f in kept] == ["a1", "c1"]
+    assert dropped == 1
+
+
+def test_cap_per_bank_results_trims_and_never_starves_to_zero():
+    bank_a = [_fact(f"a{i}", f"A{i}", reranker=0.9 - i * 0.01) for i in range(5)]
+    bank_b = [_fact("b1", "B1", reranker=0.5)]
+    capped = cap_per_bank_results([("bank-a", bank_a), ("bank-b", bank_b)], max_per_bank=2)
+    assert [f.id for f in capped[0][1]] == ["a0", "a1"]
+    assert [f.id for f in capped[1][1]] == ["b1"]
+    # max_per_bank <= 0 is clamped to 1 so a bank with results is never emptied.
+    starved = cap_per_bank_results([("bank-a", bank_a)], max_per_bank=0)
+    assert [f.id for f in starved[0][1]] == ["a0"]
+
+
+def test_merge_cap_dedup_cut_orders_then_dedups_then_cuts():
+    from hindsight_api.engine.memory_engine import count_tokens
+
+    a1 = _fact("a1", "alpha alpha", reranker=0.9)
+    b1 = _fact("b1", "ALPHA   ALPHA", reranker=0.8)  # duplicate of a1 after normalize
+    a2 = _fact("a2", "gamma gamma", reranker=0.7)
+    budget = count_tokens(a1.text) + count_tokens(a2.text)
+    cut, dropped = merge_cap_dedup_cut(
+        [("bank-a", [a1, a2]), ("bank-b", [b1])],
+        merge="score",
+        max_tokens=budget,
+        max_per_bank=50,
+    )
+    # score order a1, b1, a2 -- b1 dropped as duplicate before the token cut.
+    assert [f.id for f in cut] == ["a1", "a2"]
+    assert dropped == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_track_a_metadata_and_dedup():
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "Same Sentence", reranker=0.9)],
+            "bank-b": [_fact("b1", "same   sentence", reranker=0.5)],
+        }
+    )
+    result = await MemoryEngine.recall_multi_async(
+        engine,
+        ["bank-a", "bank-b"],
+        "query",
+        merge="score",
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    mb = result.metadata[META_MULTI_BANK]
+    assert [f.id for f in result.results] == ["a1"]
+    assert mb[META_DEDUP] == "exact_normalized"
+    assert mb[META_DEDUP_DROPPED] == 1
+    assert mb[META_PER_BANK_CAP] == DEFAULT_PER_BANK_MERGE_CAP
+
+
+def test_recall_multi_async_defaults_prefer_observations_true():
+    """Track-A: multi-bank fan-out default only; single-bank recall_async stays False."""
+    import inspect
+
+    multi_default = inspect.signature(MemoryEngine.recall_multi_async).parameters["prefer_observations"].default
+    single_default = inspect.signature(MemoryEngine.recall_async).parameters["prefer_observations"].default
+    assert multi_default is True
+    assert single_default is False
