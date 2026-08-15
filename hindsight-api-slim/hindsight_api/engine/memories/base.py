@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING, Any
 from ...extensions.base import Extension
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from ..search.retrieval import GraphRetriever, SemanticBm25Result
+    from ..search.retrieval import GraphRetriever
 
 
 class MemoryTxn:
@@ -61,6 +61,21 @@ class MemoryTxn:
     system subclasses this to carry whatever it needs to defer the writes'
     visibility until the caller's transaction is known to have committed. The base is
     deliberately empty: only the store that minted a handle interprets it."""
+
+
+class StoreWriteUnavailable(RuntimeError):
+    """The store cannot accept writes for this bank *right now*, but will shortly.
+
+    Distinct from a failure: nothing is wrong, the bank is briefly closed to writes — a store
+    migrating a bank between backends holds it for a few seconds while it takes the final delta
+    and flips. The caller should retry rather than surface an error, which is why the API maps
+    this to 503 with a `Retry-After` rather than a 5xx that reads as a bug.
+
+    Raised from :meth:`MemoriesExtension.assert_writable` and from bank-scoped write methods.
+    """
+
+    #: Seconds a caller should wait before retrying. A cutover freeze is drain + a reconcile.
+    retry_after: int = 30
 
 
 # Keys used in an implementation's opaque metadata bag for the `memory_units`
@@ -359,6 +374,50 @@ def build_fact_records(
     return records
 
 
+@dataclass
+class RelinkPassResult:
+    """What one relink drain got through.
+
+    ``queue_exhausted`` is False when the pass stopped on its deadline (or the
+    runaway-iteration cap) with rows still queued — not a failure, since every
+    batch commits before the next is claimed, but the caller needs to know the
+    queue is not empty so it can arrange for the rest to be picked up.
+    """
+
+    units_processed: int = 0
+    links_added: int = 0
+    queue_exhausted: bool = True
+
+
+@dataclass
+class EntityPrunePassResult:
+    """What one entity-prune drain got through.
+
+    ``entities_examined`` counts candidates claimed, not rows deleted: most
+    candidates turn out to be alive and are kept, which is the pass working as
+    intended rather than wasted effort.
+    """
+
+    entities_examined: int = 0
+    orphan_entities_pruned: int = 0
+    stale_cooccurrences_pruned: int = 0
+    queue_exhausted: bool = True
+
+
+@dataclass
+class RecallArms:
+    """One fact_type's per-arm candidate lists from :meth:`MemoriesExtension.recall_unified`.
+
+    Each list holds ``RetrievalResult`` items, unfused — RRF/rerank happen downstream.
+    ``temporal`` is empty unless a window was given; ``graph`` is empty when that arm is off.
+    """
+
+    semantic: list = field(default_factory=list)
+    bm25: list = field(default_factory=list)
+    graph: list = field(default_factory=list)
+    temporal: list = field(default_factory=list)
+
+
 class MemoriesExtension(Extension, ABC):
     """Storage + retrieval for memory units and their links, behind one interface.
 
@@ -393,6 +452,35 @@ class MemoriesExtension(Extension, ABC):
     #: ``list_chunk_texts`` / ``count_chunks`` / ``document_content_hash`` methods below instead of
     #: the inline SQL. Cold, never-searched, key-based — see docs/documents-chunks.md.
     owns_document_store: bool = False
+
+    def writes_memory_rows_in_sql_for(self, bank_id: str) -> bool:
+        """Per-bank form of :attr:`writes_memory_rows_in_sql`. Defaults to the class attribute, so a
+        single-store extension needs no override. A store that keeps different banks in different
+        backends (some in SQL, some not) overrides this to answer PER BANK; every *bank-scoped* call
+        site consults this instead of the class attribute, so mixed banks each take the correct path.
+        (The few process-level gates — e.g. "is cross-store txn recovery relevant at all" — keep
+        reading the class attribute.)"""
+        return self.writes_memory_rows_in_sql
+
+    def owns_document_store_for(self, bank_id: str) -> bool:
+        """Per-bank form of :attr:`owns_document_store`. Defaults to the class attribute; a store
+        that keeps some banks in a separate backend overrides it. See :meth:`writes_memory_rows_in_sql_for`."""
+        return self.owns_document_store
+
+    async def assert_writable(self, bank_id: str) -> None:
+        """Refuse the operation if the store cannot take writes for this bank right now.
+
+        Called at the entry to a *multi-store* operation — retain, which writes documents, chunks
+        and entities through paths that are not this interface at all. Every write that does go
+        through a store method is already covered by the method itself; this exists for the ones
+        that are not, so a store can close a bank completely rather than only partly.
+
+        The default is a no-op, so no existing store needs a change. A store that migrates banks
+        between backends raises :class:`StoreWriteUnavailable` while a bank is mid-cutover: the
+        window is seconds, and a retain that started before it and writes after it would land in
+        the store that is about to stop being authoritative.
+        """
+        return None
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -606,10 +694,10 @@ class MemoriesExtension(Extension, ABC):
         """Apply partial updates. Only the fields set on each patch change."""
         raise NotImplementedError
 
-    # ------------------------------------------------------------------ recall arms
+    # ------------------------------------------------------------------ recall
 
     @abstractmethod
-    async def search(
+    async def recall_unified(
         self,
         *,
         conn,
@@ -618,6 +706,8 @@ class MemoriesExtension(Extension, ABC):
         query_embedding: str,
         query_text: str,
         limit: int,
+        temporal_window: "tuple[datetime, datetime] | None" = None,
+        temporal_semantic_threshold: float = 0.1,
         tags: list[str] | None = None,
         tags_match: str = "any",
         tag_groups: list | None = None,
@@ -625,40 +715,24 @@ class MemoriesExtension(Extension, ABC):
         created_before: datetime | None = None,
         min_semantic: float | None = None,
         min_keyword: float | None = None,
-        graph_seed_min_similarity: float | None = None,
-    ) -> "dict[str, SemanticBm25Result]":
-        """Run the semantic + BM25 arms.
+        enable_graph: bool = True,
+    ) -> "dict[str, RecallArms]":
+        """Run ALL retrieval arms for every fact_type — the whole recall interface, in one call.
 
-        Returns ``{fact_type: SemanticBm25Result(semantic, bm25, graph_seeds)}`` of
-        ``RetrievalResult`` — the contract ``retrieve_semantic_bm25_combined`` has.
-        ``graph_seed_min_similarity`` restricts which semantic hits seed the graph
-        arm (Postgres populates ``graph_seeds``; a store with its own graph arm
-        leaves it ``None``).
-        """
+        Returns ``{fact_type: RecallArms(semantic, bm25, graph, temporal)}`` of
+        ``RetrievalResult``: the four per-arm candidate lists, unfused (RRF/rerank happen
+        downstream, unchanged). ``temporal`` is empty unless ``temporal_window`` is given;
+        ``graph`` is empty when ``enable_graph`` is False.
 
-    @abstractmethod
-    async def temporal_search(
-        self,
-        *,
-        conn,
-        bank_id: str,
-        fact_types: list[str],
-        query_embedding: str,
-        start_date: datetime,
-        end_date: datetime,
-        limit: int,
-        semantic_threshold: float = 0.1,
-        tags: list[str] | None = None,
-        tags_match: str = "any",
-        tag_groups: list | None = None,
-        created_after: datetime | None = None,
-        created_before: datetime | None = None,
-    ) -> dict[str, list]:
-        """Run the temporal arm over ``[start_date, end_date]``.
+        This is the ONE method recall goes through — how a store answers the arms is entirely its
+        own business. Postgres runs the split per-arm SQL orchestration behind this (a dense+BM25
+        UNION query, a graph retriever per type, a temporal query); a store that owns its index
+        answers every arm from a single query with no per-arm round-trips. Either way the caller
+        sees only this method and its per-arm result.
 
-        Returns ``{fact_type: [RetrievalResult]}``: entry points whose effective
-        time — ``COALESCE(occurred_start, mentioned_at, occurred_end)`` — falls in
-        the window, spread one hop and scored by proximity to it.
+        ``conn`` is the store's connection handle for the call. Postgres treats it as the pool it
+        acquires its own connections from and runs the graph arm on; a store that reaches its index
+        another way (e.g. over the network) ignores it.
         """
 
     def graph_retriever(self) -> "GraphRetriever | None":
@@ -833,6 +907,19 @@ class MemoriesExtension(Extension, ABC):
         Like :meth:`entities_for_units` but carrying each entity's label, because
         recall shows the name on the fact. An observation with no direct postings
         inherits its source memories' entities, so a hit reads the same either way.
+        """
+
+    @abstractmethod
+    async def resolve_entity_names(self, *, conn, fq_table, bank_id: str, entity_ids: list[str]) -> dict[str, str]:
+        """``{entity_id: canonical_name}`` for the given ids, from the ``entities`` registry.
+
+        The label half of :meth:`entity_map_for_units`, split out so a backend that
+        already carries a unit's entity ids on the recalled result can turn those ids
+        into names without re-fetching the memories — recall then builds the entity map
+        from the result's ids plus this one lookup. Bank-scoped, and ids with no registry
+        row are simply absent from the result. The concrete SQL is the store's, next to
+        :meth:`entity_map_for_units`, because the query dialect belongs to the backend,
+        not this interface.
         """
 
     @abstractmethod
@@ -1118,7 +1205,15 @@ class MemoriesExtension(Extension, ABC):
     # join table to sweep, so those passes are no-ops for it.
 
     async def record_unit_entities(
-        self, *, conn, ops, fq_table, bank_id: str | None = None, unit_ids: list[Any], entity_ids: list[Any]
+        self,
+        *,
+        conn,
+        ops,
+        fq_table,
+        bank_id: str | None = None,
+        unit_ids: list[Any],
+        entity_ids: list[Any],
+        txn: "MemoryTxn | None" = None,
     ) -> None:
         """Record the unit→entity postings for a batch of memories.
 
@@ -1129,6 +1224,14 @@ class MemoriesExtension(Extension, ABC):
         the memory (rather than in a global join table) needs to know which
         namespace the units live in — the Postgres join is keyed by global unit id
         and ignores it.
+
+        ``txn`` is the caller's write-group handle. For a store that keeps the
+        posting ON the memory this call is a re-write of rows the same write-group
+        already created, so it belongs to that group: passing the handle keeps the
+        two writes atomic together and — for a store that records what its groups
+        wrote — keeps this write inside the group's accounting. Ignored by the
+        Postgres store, whose posting is an ordinary row in the caller's own
+        transaction.
         """
 
     async def enqueue_relink_victims(
@@ -1143,17 +1246,28 @@ class MemoriesExtension(Extension, ABC):
         """
         return 0
 
-    async def relink_pass(self, *, backend, fq_table, bank_id: str, config) -> dict:
-        """Top up links for queued victims. ``{}`` when there is nothing to relink."""
-        return {}
+    async def relink_pass(
+        self, *, backend, fq_table, bank_id: str, config, deadline: float | None = None
+    ) -> "RelinkPassResult":
+        """Top up links for queued victims. All-zero when there is nothing to relink."""
+        return RelinkPassResult()
 
-    async def prune_orphan_entities(self, *, conn, fq_table, bank_id: str) -> int:
-        """Delete `entities` rows no live memory references. Returns the count."""
+    async def enqueue_entity_prune_candidates(self, *, conn, fq_table, bank_id: str, affected_unit_ids: list) -> int:
+        """Queue the entities ``affected_unit_ids`` reference as prune candidates.
+
+        Zero for a store that never wrote `unit_entities`: it has no entity
+        postings to lose, so nothing can become an orphan.
+        """
         return 0
 
-    async def prune_stale_cooccurrences(self, *, conn, fq_table, bank_id: str) -> int:
-        """Delete co-occurrence rows whose witnessing memories are all gone."""
-        return 0
+    async def entity_prune_pass(
+        self, *, backend, fq_table, bank_id: str, deadline: float | None = None
+    ) -> "EntityPrunePassResult":
+        """Prune queued candidate entities and the co-occurrences they stranded.
+
+        All-zero when the store keeps no entity postings and so queues nothing.
+        """
+        return EntityPrunePassResult()
 
 
 __all__ = [
@@ -1173,10 +1287,12 @@ __all__ = [
     "META_UPDATED_AT",
     "CausalEdgeRecord",
     "DeletePredicate",
+    "EntityPrunePassResult",
     "FactRecord",
     "MemoriesExtension",
     "MemoryPatch",
     "MemoryTxn",
+    "RelinkPassResult",
     "ScanPage",
     "StoredMemory",
     "build_fact_records",

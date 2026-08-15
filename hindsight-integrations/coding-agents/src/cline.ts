@@ -185,13 +185,18 @@ export function createClineHooks(
 function createRuntime(workspaceRoot: string | undefined): RuntimeCore | undefined {
   let cfg = loadConfig({ harness: HARNESS });
   if (cfg.disabled) return undefined;
-  const resolved = applyBankConfig(cfg, deriveBankId(cfg, workspaceRoot || process.cwd(), HARNESS));
+  const resolved = applyBankConfig(
+    cfg,
+    deriveBankId(cfg, workspaceRoot || process.cwd(), HARNESS),
+    workspaceRoot || process.cwd()
+  );
   cfg = resolved.cfg;
   if (cfg.disabled) return undefined;
   const client = new HindsightClient({
     apiUrl: cfg.apiUrl,
     apiToken: cfg.apiToken,
     bank: resolved.bankId,
+    maxParallelRetains: cfg.maxParallelRetains,
   });
   return new RuntimeCore(client, resolved.bankId, cfg, HARNESS, workspaceRoot || process.cwd());
 }
