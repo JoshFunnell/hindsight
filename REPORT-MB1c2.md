@@ -12,7 +12,7 @@ Grok output is evidence. Planner decides deploy-by-COPY.
 | order | sha | subject |
 |---|---|---|
 | 1 | `fd059ba7` | `fix(engine): give each reranker worker its own CrossEncoder` (includes tests) |
-| 2 | *(this file)* | `docs: add REPORT-MB1c2` |
+| 2 | `14364386` | `docs: add REPORT-MB1c2` |
 
 ## Design chosen: A (per-executor-thread model instances)
 
