@@ -12,7 +12,7 @@ Grok output is evidence. Planner decides deploy-by-copy.
 |---|---|---|---|
 | 1 | `3d01cf48` | (d) | `chore(recall): capture 2026-08-12 track-A live overlay` |
 | 2 | `9a7c3b7f` | (d) | `test(recall): align multi-bank tests with the captured live overlay` |
-| 3 | `fa3c8fef` | (b) | `fix(engine): handle MentalModelRefreshError in execute_task` |
+| 3 | `ca2bd211` | (b) | `fix(engine): handle MentalModelRefreshError in execute_task` |
 
 ## (d) Provenance capture
 
