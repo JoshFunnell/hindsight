@@ -1,0 +1,70 @@
+diff --git a/memory_engine.py b/memory_engine.py
+index 79dac772..44952347 100644
+--- a/memory_engine.py
++++ b/memory_engine.py
+@@ -756,6 +756,24 @@ def _is_non_retryable_task_error(e: Exception) -> bool:
+     )
+ 
+ 
++def _retry_or_reraise_worker_task(e: Exception, task_dict: dict[str, Any]) -> NoReturn:
++    """Apply the non-consolidation worker retry policy to a task error.
++
++    Raises ``RetryTaskAt`` while ``_retry_count < worker_max_retries``, else
++    re-raises ``e`` so the poller marks the operation failed with the message.
++    Consolidation has its own indefinite-retry / dedup-by-bank path and must
++    not use this helper.
++    """
++    config = get_config()
++    retry_count = task_dict.get("_retry_count", 0)
++    if retry_count < config.worker_max_retries:
++        raise RetryTaskAt(
++            retry_at=datetime.now(UTC) + timedelta(seconds=config.worker_task_retry_backoff_seconds),
++            message=str(e),
++        )
++    raise e
++
++
+ class Budget(str, Enum):
+     """Budget levels for recall/reflect operations."""
+ 
+@@ -2575,6 +2593,24 @@ class MemoryEngine(MemoryEngineInterface):
+                 # would convert a legitimate defer into a 60-second RetryTaskAt
+                 # and lose the "not a failure" semantics entirely.
+                 raise
++            except MentalModelRefreshError as e:
++                # Expected fail-safe from #3112/#3182: refresh_mental_model
++                # raises MentalModelRefreshError after _preserve_and_fail leaves
++                # content and watermark untouched so a retry re-reads the same
++                # window. Delta ops are LLM-produced and non-deterministic, so
++                # this is still retryable (same policy as a generic
++                # non-consolidation error). Do not print a traceback: soak
++                # watchers and operators treat stderr tracebacks as crashes
++                # (the unhandled-in-overlay pattern).
++                logger.warning(
++                    "Mental model refresh failed (content preserved): "
++                    "task_type=%s mental_model_id=%s bank_id=%s error=%s",
++                    task_type,
++                    task_dict.get("mental_model_id"),
++                    task_dict.get("bank_id"),
++                    e,
++                )
++                _retry_or_reraise_worker_task(e, task_dict)
+             except Exception as e:
+                 logger.error(f"Task execution failed: {task_type}, error: {e}")
+                 import traceback
+@@ -2652,14 +2688,7 @@ class MemoryEngine(MemoryEngineInterface):
+                     # Retry count and backoff come from config (HINDSIGHT_API_WORKER_MAX_RETRIES and
+                     # HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS). Defaults of 3 x 60s give a
+                     # 4-minute total window; operators expecting a longer provider outage can raise them.
+-                    config = get_config()
+-                    retry_count = task_dict.get("_retry_count", 0)
+-                    if retry_count < config.worker_max_retries:
+-                        raise RetryTaskAt(
+-                            retry_at=datetime.now(UTC) + timedelta(seconds=config.worker_task_retry_backoff_seconds),
+-                            message=str(e),
+-                        )
+-                    raise
++                    _retry_or_reraise_worker_task(e, task_dict)
+ 
+     async def _fire_consolidation_webhook(
+         self,
