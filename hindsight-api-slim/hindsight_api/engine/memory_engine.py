@@ -5235,7 +5235,7 @@ class MemoryEngine(MemoryEngineInterface):
         max_tokens: int = 4096,
         enable_trace: bool = False,
         fact_type: list[str] | None = None,
-        prefer_observations: bool = False,
+        prefer_observations: bool = True,
         question_date: datetime | None = None,
         include_entities: bool = False,
         max_entity_tokens: int = 500,
@@ -5274,19 +5274,25 @@ class MemoryEngine(MemoryEngineInterface):
 
         **Attribution:** every merged result is stamped with ``bank_id``.
 
-        **Failures:** one bank erroring does not kill the call — partial results are
-        returned with per-bank status in ``metadata["multi_bank"]["banks"]``.
+        **Failures:** ordinary bank infrastructure errors do not kill the call — partial
+        results are returned with per-bank status in ``metadata["multi_bank"]["banks"]``
+        (client-visible error text is generic; details are logged server-side).
+        Precedence for hard failures re-raised from the gather: ``OperationCancelledError``
+        first (HTTP 499), then ``OperationValidationError`` (auth/validation denials —
+        same mapping as single-bank recall). Neither soft-fails into a 200.
 
         **Dedup:** none in v1 (cross-bank duplicate facts are possible). Exact-text
         dedup is a cheap v2; see module docstring on ``multi_bank_recall``.
         """
         from .multi_bank_recall import (
+            DEFAULT_PER_BANK_MERGE_CAP,
+            FALLBACK_NO_USABLE_RERANKER_SCORES,
+            MAX_MULTI_BANK_RECALL_BANKS,
             bank_rank_from_merged,
             build_multi_bank_metadata,
             cross_encoder_eligible,
-            cut_to_token_budget,
-            interleave_merge,
-            score_merge,
+            has_usable_reranker_scores,
+            merge_cap_dedup_cut,
             union_merge_dicts,
         )
 
@@ -5301,6 +5307,15 @@ class MemoryEngine(MemoryEngineInterface):
                 seen.add(bid)
                 ordered_bank_ids.append(bid)
 
+        if len(ordered_bank_ids) > MAX_MULTI_BANK_RECALL_BANKS:
+            from hindsight_api.extensions.operation_validator import OperationValidationError
+
+            raise OperationValidationError(
+                f"Too many bank_ids: {len(ordered_bank_ids)} exceeds maximum of "
+                f"{MAX_MULTI_BANK_RECALL_BANKS} parallel banks per multi-bank recall.",
+                status_code=422,
+            )
+
         if not ordered_bank_ids:
             return RecallResultModel(
                 results=[],
@@ -5309,21 +5324,31 @@ class MemoryEngine(MemoryEngineInterface):
                     merge_applied=merge,
                     merge_fallback_reason=None,
                     bank_statuses={},
+                    # No gather happened on this path, so nothing was deduped.
+                    dedup_dropped=0,
+                    per_bank_cap=DEFAULT_PER_BANK_MERGE_CAP,
                 ),
             )
 
         # Resolve per-bank enable_reranking so score-merge auto-fallback can run
         # before (or without) depending on result scores. Failed config lookups
         # are treated as "unknown / not CE-safe" → force interleave for score mode.
+        # Client-visible config_error is generic; details stay in the server log.
         enable_flags: list[bool] = []
-        config_errors: dict[str, str] = {}
+        config_lookup_failed: set[str] = set()
         for bid in ordered_bank_ids:
             try:
                 cfg = await self._config_resolver.get_bank_config(bid, request_context)
                 enable_flags.append(bool(cfg.get("enable_reranking", True)))
             except Exception as e:
                 enable_flags.append(False)
-                config_errors[bid] = f"config lookup failed: {type(e).__name__}: {e!r}"
+                config_lookup_failed.add(bid)
+                logger.warning(
+                    "[RECALL MULTI %s] bank config lookup failed: %s: %r",
+                    bid[:8] if len(bid) >= 8 else bid,
+                    type(e).__name__,
+                    e,
+                )
 
         merge_requested: MultiBankMerge = merge
         merge_applied: MultiBankMerge = merge_requested
@@ -5372,17 +5397,36 @@ class MemoryEngine(MemoryEngineInterface):
             return_exceptions=True,
         )
 
+        # Hard failures first — never soft-fail into partial 200 metadata.
+        # Precedence: cancellation (499) before auth/validation denials.
+        from hindsight_api.extensions.operation_validator import OperationValidationError
+
+        for outcome in gathered:
+            if isinstance(outcome, OperationCancelledError):
+                raise outcome
+        for outcome in gathered:
+            if isinstance(outcome, OperationValidationError):
+                raise outcome
+
         bank_statuses: dict[str, dict] = {}
         successful_facts: list[tuple[str, list[MemoryFact]]] = []
         successful_outcomes: list[tuple[str, RecallResultModel]] = []
         for bid, outcome in zip(ordered_bank_ids, gathered, strict=True):
             if isinstance(outcome, BaseException):
+                # Soft-fail ordinary infrastructure errors. Client metadata is generic
+                # (no exception class/repr oracle); details stay server-side.
+                logger.warning(
+                    "[RECALL MULTI %s] per-bank recall failed: %s: %r",
+                    bid[:8] if len(bid) >= 8 else bid,
+                    type(outcome).__name__,
+                    outcome,
+                )
                 bank_statuses[bid] = {
                     "status": "error",
-                    "error": f"{type(outcome).__name__}: {outcome!r}",
+                    "error": "recall failed for this bank",
                 }
-                if bid in config_errors:
-                    bank_statuses[bid]["config_error"] = config_errors[bid]
+                if bid in config_lookup_failed:
+                    bank_statuses[bid]["config_error"] = "bank config lookup failed"
                 continue
             # Successful RecallResultModel — keep full outcome for include_* side dicts.
             count = len(outcome.results)
@@ -5390,12 +5434,21 @@ class MemoryEngine(MemoryEngineInterface):
             successful_facts.append((bid, list(outcome.results)))
             successful_outcomes.append((bid, outcome))
 
-        if merge_applied == "score":
-            merged = score_merge(successful_facts)
-        else:
-            merged = interleave_merge(successful_facts)
+        # Post-gather evidence check: pre-flight config said CE was fine, but the
+        # returned facts may still lack scores.reranker (RRF passthrough, etc.).
+        if merge_applied == "score" and not has_usable_reranker_scores(successful_facts):
+            merge_applied = "interleave"
+            merge_fallback_reason = FALLBACK_NO_USABLE_RERANKER_SCORES
 
-        cut = cut_to_token_budget(merged, max_tokens)
+        # cap -> merge -> dedup -> token cut, ordering fixed inside
+        # merge_cap_dedup_cut. merge_applied already carries any
+        # FALLBACK_NO_USABLE_RERANKER_SCORES downgrade decided just above.
+        cut, dedup_dropped = merge_cap_dedup_cut(
+            successful_facts,
+            merge=merge_applied,
+            max_tokens=max_tokens,
+            max_per_bank=DEFAULT_PER_BANK_MERGE_CAP,
+        )
 
         # Union-merge entities/chunks/source_facts across successful banks. On key
         # collision keep the bank whose results ranked higher in the merged order
@@ -5424,6 +5477,8 @@ class MemoryEngine(MemoryEngineInterface):
                 merge_applied=merge_applied,
                 merge_fallback_reason=merge_fallback_reason,
                 bank_statuses=bank_statuses,
+                dedup_dropped=dedup_dropped,
+                per_bank_cap=DEFAULT_PER_BANK_MERGE_CAP,
             ),
         )
 
