@@ -1204,7 +1204,6 @@ async def _read_pending_refresh_tags(pool, operation_id: str) -> set[str]:
     return set(payload.get("pending_refresh_tags") or [])
 
 
-
 async def run_consolidation_job(
     memory_engine: "MemoryEngine",
     bank_id: str,
