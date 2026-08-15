@@ -5307,8 +5307,11 @@ class MemoryEngine(MemoryEngineInterface):
         results are returned with per-bank status in ``metadata["multi_bank"]["banks"]``
         (client-visible error text is generic; details are logged server-side).
         Precedence for hard failures re-raised from the gather: ``OperationCancelledError``
-        first (HTTP 499), then ``OperationValidationError`` (auth/validation denials —
-        same mapping as single-bank recall). Neither soft-fails into a 200.
+        first (HTTP 499), then tenant ``AuthenticationError`` (HTTP 401; auth is
+        per-request, not per-bank), then ``OperationValidationError`` (bank-scoped
+        403/422 denials — same mapping as single-bank recall). None of those
+        soft-fail into a 200. The tenant is also authenticated once before fan-out
+        so an unauthenticated request fails before N parallel recalls start.
 
         **Dedup:** none in v1 (cross-bank duplicate facts are possible). Exact-text
         dedup is a cheap v2; see module docstring on ``multi_bank_recall``.
@@ -5358,6 +5361,13 @@ class MemoryEngine(MemoryEngineInterface):
                     per_bank_cap=DEFAULT_PER_BANK_MERGE_CAP,
                 ),
             )
+
+        # Tenant auth is request-scoped, not per-bank. Authenticate once before
+        # fan-out so an unauthenticated multi-recall fails the whole request
+        # instead of starting N recalls. Each recall_async still authenticates
+        # (single-bank contract / schema ContextVar); we do not skip that.
+        # Per-bank OperationValidator precheck stays inside recall_async.
+        await self._authenticate_tenant(request_context)
 
         # Resolve per-bank enable_reranking so score-merge auto-fallback can run
         # before (or without) depending on result scores. Failed config lookups
@@ -5427,11 +5437,18 @@ class MemoryEngine(MemoryEngineInterface):
         )
 
         # Hard failures first — never soft-fail into partial 200 metadata.
-        # Precedence: cancellation (499) before auth/validation denials.
+        # Precedence: cancellation (499), then tenant AuthenticationError (401),
+        # then OperationValidationError (403/422). 2026-08-10 P1#(3) re-raised
+        # OVE only; AuthenticationError still fell into the generic per-bank
+        # soft-fail (live-measured 2026-08-15: multi POST -> 200).
+        from hindsight_api.extensions import AuthenticationError
         from hindsight_api.extensions.operation_validator import OperationValidationError
 
         for outcome in gathered:
             if isinstance(outcome, OperationCancelledError):
+                raise outcome
+        for outcome in gathered:
+            if isinstance(outcome, AuthenticationError):
                 raise outcome
         for outcome in gathered:
             if isinstance(outcome, OperationValidationError):
