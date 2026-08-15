@@ -134,7 +134,7 @@ class MemoryEngineInterface(ABC):
         max_tokens: int = 4096,
         enable_trace: bool = False,
         fact_type: list[str] | None = None,
-        prefer_observations: bool = False,
+        prefer_observations: bool = True,
         question_date: datetime | None = None,
         include_entities: bool = False,
         max_entity_tokens: int = 500,
@@ -161,8 +161,9 @@ class MemoryEngineInterface(ABC):
         - ``interleave``: round-robin by per-bank rank.
 
         Ordinary partial bank failures do not fail the call; see response metadata.
-        ``OperationCancelledError`` is re-raised (not soft-failed). Cap: 10 banks.
-        v1 does not dedup across banks.
+        ``OperationCancelledError`` and tenant ``AuthenticationError`` are re-raised
+        (not soft-failed). Cap: 10 banks. Cross-bank dedup is exact/normalized text;
+        each bank's contribution is capped at 50 before merge.
 
         Returns:
             RecallResult with bank_id stamped on each result and multi_bank metadata.

@@ -4745,7 +4745,8 @@ def _register_routes(app: FastAPI):
             "(recorded in `metadata.multi_bank`).\n"
             "- `interleave`: round-robin by per-bank rank.\n\n"
             "Partial bank failures return successful banks' results plus per-bank status in metadata. "
-            "v1 does not dedup across banks. Each result includes `bank_id` attribution."
+            "Cross-bank dedup is exact/normalized text; each bank is capped at 50 results "
+            "before merge. Each result includes `bank_id` attribution."
         ),
         operation_id="recall_memories_multi",
         tags=["Memory"],

@@ -843,7 +843,8 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
             "a single bank_ids entry selects that bank; omit to use bank_id/session. "
             "merge='score' (default) orders by cross-encoder score and auto-falls back to "
             "interleave when CE scores are not usable; merge='interleave' round-robins by rank. "
-            "Results include bank_id; metadata.multi_bank reports per-bank status and fallback."
+            "Results include bank_id; metadata.multi_bank reports per-bank status, fallback, "
+            "exact_normalized dedup, and the per-bank cap."
         )
     else:
         description = base_description

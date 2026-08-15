@@ -19,7 +19,7 @@ from hindsight_api.engine.response_models import (
     RecallResult,
     RecallScores,
 )
-from hindsight_api.extensions import OperationValidationError
+from hindsight_api.extensions import AuthenticationError, OperationValidationError
 
 
 def _fact(id: str, text: str, *, bank_id: str | None = None, reranker: float = 0.5) -> MemoryFact:
@@ -56,7 +56,9 @@ def mock_memory():
                         "bank-a": {"status": "ok", "count": 1},
                         "bank-b": {"status": "ok", "count": 1},
                     },
-                    "dedup": "none",
+                    "dedup": "exact_normalized",
+                    "dedup_dropped": 0,
+                    "per_bank_cap": 50,
                 }
             },
         )
@@ -147,9 +149,7 @@ async def test_multi_bank_recall_rejects_empty_query(api_client, mock_memory):
 
 @pytest.mark.asyncio
 async def test_multi_bank_recall_maps_operation_validation_error(mock_memory):
-    mock_memory.recall_multi_async = AsyncMock(
-        side_effect=OperationValidationError("nope", status_code=403)
-    )
+    mock_memory.recall_multi_async = AsyncMock(side_effect=OperationValidationError("nope", status_code=403))
     app = create_app(mock_memory, initialize_memory=False)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -159,6 +159,28 @@ async def test_multi_bank_recall_maps_operation_validation_error(mock_memory):
         )
     assert resp.status_code == 403
     assert "nope" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_multi_bank_recall_maps_authentication_error(mock_memory):
+    """Same AuthenticationError mapping as single-bank: global handler -> 401."""
+    mock_memory.recall_multi_async = AsyncMock(side_effect=AuthenticationError("Invalid API key"))
+    mock_memory.recall_async = AsyncMock(side_effect=AuthenticationError("Invalid API key"))
+    app = create_app(mock_memory, initialize_memory=False)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        multi = await client.post(
+            "/v1/default/memories/recall",
+            json={"bank_ids": ["a", "b"], "query": "hello world"},
+        )
+        single = await client.post(
+            "/v1/default/banks/a/memories/recall",
+            json={"query": "hello world"},
+        )
+    assert multi.status_code == 401
+    assert single.status_code == 401
+    assert multi.json() == single.json()
+    assert multi.json()["detail"] == "Authentication failed: Invalid API key"
 
 
 @pytest.mark.asyncio
@@ -214,9 +236,7 @@ async def test_multi_bank_precheck_denies_non_primary_bank(mock_memory):
 @pytest.mark.asyncio
 async def test_single_bank_recall_path_unchanged(api_client, mock_memory):
     """Existing single-bank endpoint still calls recall_async, not multi."""
-    mock_memory.recall_async = AsyncMock(
-        return_value=RecallResult(results=[_fact("s1", "solo", bank_id=None)])
-    )
+    mock_memory.recall_async = AsyncMock(return_value=RecallResult(results=[_fact("s1", "solo", bank_id=None)]))
     resp = await api_client.post(
         "/v1/default/banks/solo-bank/memories/recall",
         json={"query": "hello world"},

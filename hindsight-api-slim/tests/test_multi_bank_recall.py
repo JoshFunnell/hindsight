@@ -25,21 +25,29 @@ import pytest
 from hindsight_api.cancellation import OperationCancelledError
 from hindsight_api.engine.memory_engine import MemoryEngine, _bind_bank_id, get_current_bank_id
 from hindsight_api.engine.multi_bank_recall import (
+    DEFAULT_PER_BANK_MERGE_CAP,
     FALLBACK_NO_USABLE_RERANKER_SCORES,
     MAX_MULTI_BANK_RECALL_BANKS,
     META_BANKS,
     META_DEDUP,
+    META_DEDUP_DROPPED,
     META_DEDUP_V1,
     META_MERGE_APPLIED,
     META_MERGE_FALLBACK_REASON,
     META_MERGE_REQUESTED,
     META_MULTI_BANK,
+    META_PER_BANK_CAP,
+    MULTI_BANK_PREFER_OBSERVATIONS,
     bank_rank_from_merged,
     build_multi_bank_metadata,
+    cap_per_bank_results,
     cross_encoder_eligible,
     cut_to_token_budget,
+    dedup_exact_normalized,
     has_usable_reranker_scores,
     interleave_merge,
+    merge_cap_dedup_cut,
+    normalize_dedup_key,
     score_merge,
     stamp_bank_id,
     union_merge_dicts,
@@ -52,6 +60,7 @@ from hindsight_api.engine.response_models import (
     RecallScores,
 )
 from hindsight_api.extensions.operation_validator import OperationValidationError
+from hindsight_api.extensions.tenant import AuthenticationError
 from hindsight_api.models import RequestContext
 
 RC = RequestContext(tenant_id="default")
@@ -203,6 +212,9 @@ def test_build_multi_bank_metadata_shape():
     assert block[META_MERGE_FALLBACK_REASON] == "test reason"
     assert block[META_BANKS]["a"]["status"] == "ok"
     assert block[META_DEDUP] == META_DEDUP_V1
+    assert block[META_DEDUP] == "exact_normalized"
+    assert block[META_DEDUP_DROPPED] == 0
+    assert block[META_PER_BANK_CAP] == DEFAULT_PER_BANK_MERGE_CAP
 
 
 def test_union_merge_dicts_union_and_collision_by_rank():
@@ -259,6 +271,11 @@ def _harness(
         return RecallResult(results=list(outcome))
 
     engine.recall_async = fake_recall  # type: ignore[method-assign]
+
+    async def fake_auth(request_context: RequestContext) -> str:
+        return "public"
+
+    engine._authenticate_tenant = fake_auth  # type: ignore[method-assign]
 
     enable_reranking = enable_reranking or {
         bid: True for bid in bank_results if not isinstance(bank_results[bid], Exception)
@@ -508,6 +525,11 @@ async def test_orchestrator_contextvar_isolation_across_parallel_subcalls():
         return RecallResult(results=[_fact(f"{bank_id}-1", bank_id, reranker=0.5)])
 
     engine.recall_async = bound_recall  # type: ignore[method-assign]
+
+    async def fake_auth(request_context: RequestContext) -> str:
+        return "public"
+
+    engine._authenticate_tenant = fake_auth  # type: ignore[method-assign]
     engine._config_resolver = SimpleNamespace(  # type: ignore[attr-defined]
         get_bank_config=AsyncMock(return_value={"enable_reranking": True})
     )
@@ -549,6 +571,11 @@ async def test_orchestrator_passes_full_max_tokens_to_each_subcall():
         return RecallResult(results=[_fact(f"{bank_id}-1", "x" * 50, reranker=0.5)])
 
     engine.recall_async = tracking_recall  # type: ignore[method-assign]
+
+    async def fake_auth(request_context: RequestContext) -> str:
+        return "public"
+
+    engine._authenticate_tenant = fake_auth  # type: ignore[method-assign]
     engine._config_resolver = SimpleNamespace(  # type: ignore[attr-defined]
         get_bank_config=AsyncMock(return_value={"enable_reranking": True})
     )
@@ -843,3 +870,265 @@ async def test_orchestrator_client_metadata_has_no_exception_oracle():
     blob = json.dumps(result.metadata[META_MULTI_BANK])
     assert "RuntimeError" not in blob
     assert "secret internal detail" not in blob
+
+
+# --- Track-A: cap / exact_normalized dedup / prefer_observations / metadata ---
+
+
+def test_normalize_dedup_key_casefold_and_whitespace():
+    assert normalize_dedup_key("  The Sky\nIs  BLUE  ") == "the sky is blue"
+    assert normalize_dedup_key(None) == ""
+    assert normalize_dedup_key("already clean") == "already clean"
+
+
+def test_dedup_exact_normalized_drops_later_duplicate_keeps_first():
+    """Higher-ranked (earlier) copy wins; later exact-normalized twin is dropped."""
+    facts = [
+        _fact("keep", "The sky is blue", reranker=0.9),
+        _fact("drop", "  the   SKY is\tBLUE ", reranker=0.1),
+        _fact("other", "grass is green", reranker=0.5),
+    ]
+    result = dedup_exact_normalized(facts)
+    assert [f.id for f in result.facts] == ["keep", "other"]
+    assert result.dropped == 1
+
+
+def test_cap_per_bank_results_trims_head_and_never_starves():
+    bank_a = [_fact(f"a{i}", f"A{i}", reranker=1.0 - i * 0.01) for i in range(8)]
+    bank_b = [_fact("b0", "only B", reranker=0.5)]
+    capped = cap_per_bank_results([("bank-a", bank_a), ("bank-b", bank_b)], max_per_bank=3)
+    assert [f.id for f in capped[0][1]] == ["a0", "a1", "a2"]
+    assert [f.id for f in capped[1][1]] == ["b0"]
+    # Clamp to >= 1 so a bank with results is never starved by the cap alone.
+    clamped = cap_per_bank_results([("bank-a", bank_a)], max_per_bank=0)
+    assert len(clamped[0][1]) == 1
+
+
+def test_merge_cap_dedup_cut_drops_duplicate_before_token_budget():
+    """A later duplicate must not consume token budget that a unique fact needs."""
+    from hindsight_api.engine.memory_engine import count_tokens
+
+    keep = _fact("keep", "unique-head", reranker=0.9)
+    twin = _fact("twin", "UNIQUE-HEAD", reranker=0.8)
+    tail = _fact("tail", "unique-tail", reranker=0.7)
+    budget = count_tokens(keep.text) + count_tokens(tail.text)
+    pipeline = merge_cap_dedup_cut(
+        [("bank-a", [keep]), ("bank-b", [twin, tail])],
+        merge="score",
+        max_tokens=budget,
+    )
+    assert [f.id for f in pipeline.facts] == ["keep", "tail"]
+    assert pipeline.dropped == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_dedup_drops_exact_normalized_duplicate_across_banks():
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "The sky is blue", reranker=0.95)],
+            "bank-b": [_fact("b1", "  the SKY   is blue", reranker=0.40)],
+        }
+    )
+    result = await MemoryEngine.recall_multi_async(
+        engine,
+        ["bank-a", "bank-b"],
+        "query",
+        merge="score",
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    assert [f.id for f in result.results] == ["a1"]
+    mb = result.metadata[META_MULTI_BANK]
+    assert mb[META_DEDUP] == "exact_normalized"
+    assert mb[META_DEDUP_DROPPED] == 1
+    assert mb[META_PER_BANK_CAP] == DEFAULT_PER_BANK_MERGE_CAP
+    assert mb[META_BANKS]["bank-a"]["status"] == "ok"
+    assert mb[META_BANKS]["bank-b"]["status"] == "ok"
+    # banks.count is the pre-dedup per-bank contribution.
+    assert mb[META_BANKS]["bank-b"]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_per_bank_cap_trims_before_merge():
+    bank_a = [_fact(f"a{i}", f"A fact {i}", reranker=0.9 - i * 0.001) for i in range(60)]
+    bank_b = [_fact("b0", "B only", reranker=0.5)]
+    engine = _harness(bank_results={"bank-a": bank_a, "bank-b": bank_b})
+    result = await MemoryEngine.recall_multi_async(
+        engine,
+        ["bank-a", "bank-b"],
+        "query",
+        merge="score",
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    ids = [f.id for f in result.results]
+    assert "a49" in ids
+    assert "a50" not in ids
+    assert "b0" in ids
+    assert result.metadata[META_MULTI_BANK][META_PER_BANK_CAP] == 50
+    assert result.metadata[META_MULTI_BANK][META_BANKS]["bank-a"]["count"] == 60
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_prefer_observations_default_true_on_fanout_only():
+    """Default True is passed to each recall_async; HTTP/MCP still default False."""
+    import inspect
+
+    seen: dict[str, bool] = {}
+    engine = object.__new__(MemoryEngine)
+
+    async def tracking_recall(bank_id: str, query: str, **kwargs) -> RecallResult:
+        seen[bank_id] = kwargs.get("prefer_observations")
+        return RecallResult(results=[_fact(f"{bank_id}-1", "x", reranker=0.5)])
+
+    engine.recall_async = tracking_recall  # type: ignore[method-assign]
+
+    async def fake_auth(request_context: RequestContext) -> str:
+        return "public"
+
+    engine._authenticate_tenant = fake_auth  # type: ignore[method-assign]
+    engine._config_resolver = SimpleNamespace(  # type: ignore[attr-defined]
+        get_bank_config=AsyncMock(return_value={"enable_reranking": True})
+    )
+
+    await MemoryEngine.recall_multi_async(
+        engine,
+        ["b1", "b2"],
+        "query",
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    assert seen == {"b1": True, "b2": True}
+    assert MULTI_BANK_PREFER_OBSERVATIONS is True
+
+    single_default = inspect.signature(MemoryEngine.recall_async).parameters["prefer_observations"].default
+    multi_default = inspect.signature(MemoryEngine.recall_multi_async).parameters["prefer_observations"].default
+    assert single_default is False
+    assert multi_default is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_prefer_observations_false_is_passed_through():
+    """Caller False must reach fan-out; merge/dedup still run independently."""
+    seen: dict[str, bool] = {}
+    engine = object.__new__(MemoryEngine)
+
+    async def tracking_recall(bank_id: str, query: str, **kwargs) -> RecallResult:
+        seen[bank_id] = kwargs.get("prefer_observations")
+        text = "Same sentence in both banks" if bank_id == "bank-a" else "same sentence in both banks"
+        return RecallResult(results=[_fact(f"{bank_id}-1", text, reranker=0.9 if bank_id == "bank-a" else 0.4)])
+
+    engine.recall_async = tracking_recall  # type: ignore[method-assign]
+
+    async def fake_auth(request_context: RequestContext) -> str:
+        return "public"
+
+    engine._authenticate_tenant = fake_auth  # type: ignore[method-assign]
+    engine._config_resolver = SimpleNamespace(  # type: ignore[attr-defined]
+        get_bank_config=AsyncMock(return_value={"enable_reranking": True})
+    )
+
+    result = await MemoryEngine.recall_multi_async(
+        engine,
+        ["bank-a", "bank-b"],
+        "query",
+        prefer_observations=False,
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    assert seen == {"bank-a": False, "bank-b": False}
+    # Dedup is independent of prefer_observations (fan-out flag only).
+    assert [f.id for f in result.results] == ["bank-a-1"]
+    assert result.metadata[META_MULTI_BANK][META_DEDUP_DROPPED] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_metadata_keys_present_on_success():
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "ok", reranker=0.5)],
+            "bank-b": [_fact("b1", "also", reranker=0.4)],
+        }
+    )
+    result = await MemoryEngine.recall_multi_async(
+        engine,
+        ["bank-a", "bank-b"],
+        "query",
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    mb = result.metadata[META_MULTI_BANK]
+    assert set(mb) >= {
+        META_MERGE_REQUESTED,
+        META_MERGE_APPLIED,
+        META_MERGE_FALLBACK_REASON,
+        META_BANKS,
+        META_DEDUP,
+        META_DEDUP_DROPPED,
+        META_PER_BANK_CAP,
+    }
+    assert mb[META_DEDUP] == "exact_normalized"
+    assert mb[META_DEDUP_DROPPED] == 0
+    assert mb[META_PER_BANK_CAP] == 50
+    assert mb[META_BANKS]["bank-a"] == {"status": "ok", "count": 1}
+    assert mb[META_BANKS]["bank-b"] == {"status": "ok", "count": 1}
+
+
+# --- AuthenticationError hard-fail (94b831d3; not covered by e0a56d80) ---
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_authentication_error_propagates_not_soft_fail():
+    """Tenant AuthenticationError from any sub-call must re-raise, not enter bank metadata.
+
+    Auth is per-request (tenant), not per-bank. e0a56d80 re-raised
+    OperationValidationError only; AuthenticationError fell into the generic
+    soft-fail (live-measured 2026-08-15: multi POST -> 200).
+    """
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "ok", reranker=0.5)],
+            "bank-b": AuthenticationError("Invalid API key"),
+        }
+    )
+    with pytest.raises(AuthenticationError, match="Invalid API key"):
+        await MemoryEngine.recall_multi_async(
+            engine,
+            ["bank-a", "bank-b"],
+            "query",
+            request_context=RC,
+            max_tokens=10_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_upfront_tenant_auth_failure_skips_fanout():
+    """Unauthenticated multi-recall fails before any per-bank recall_async starts."""
+    engine = _harness(
+        bank_results={
+            "bank-a": [_fact("a1", "ok", reranker=0.5)],
+            "bank-b": [_fact("b1", "ok", reranker=0.4)],
+        }
+    )
+    called: list[str] = []
+    original = engine.recall_async
+
+    async def tracking_recall(bank_id: str, query: str, **kwargs):
+        called.append(bank_id)
+        return await original(bank_id, query, **kwargs)
+
+    engine.recall_async = tracking_recall  # type: ignore[method-assign]
+
+    async def reject_auth(request_context: RequestContext) -> str:
+        raise AuthenticationError("Invalid API key")
+
+    engine._authenticate_tenant = reject_auth  # type: ignore[method-assign]
+    with pytest.raises(AuthenticationError, match="Invalid API key"):
+        await MemoryEngine.recall_multi_async(
+            engine,
+            ["bank-a", "bank-b"],
+            "query",
+            request_context=RC,
+            max_tokens=10_000,
+        )
+    assert called == []

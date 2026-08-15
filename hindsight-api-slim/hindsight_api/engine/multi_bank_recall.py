@@ -3,16 +3,33 @@
 The orchestrator (``MemoryEngine.recall_multi_async``) fans out one ``recall_async``
 per bank and then uses these helpers to order and truncate the union.
 
-v1 limitations (documented for callers / PR):
-- No cross-bank dedup — identical or near-identical facts from different banks can
-  both appear in the merged list. Exact-text dedup is a cheap v2.
+Pipeline order (orchestrator must compose in this order):
+
+1. Per-bank contribution cap (``cap_per_bank_results``) - anti-flood into the merge pool.
+2. Merge (``score_merge`` or ``interleave_merge`` fallback).
+3. Exact / normalized-text dedup (``dedup_exact_normalized``) - BEFORE token cut.
+4. Token budget cut (``cut_to_token_budget``).
+
+Multi-bank fan-out defaults (orchestrator only; single-bank defaults unchanged):
+
+- ``prefer_observations=True`` via :data:`MULTI_BANK_PREFER_OBSERVATIONS` (narrow
+  semantics - see constant docstring).
+- Full caller ``max_tokens`` per bank (no shared pool; no ``max_tokens / n_banks``).
+
+Limitations still open:
+
 - Score-merge uses each result's existing normalized cross-encoder score
   (``scores.reranker``); it does not run a second cross-encoder pass over the union.
+- No embedding / near-duplicate collapse (would silently merge distinct facts such
+  as "invalidate" vs "supersede").
+- No cross-bank supersession: a stale fact in bank A can outrank its correction in
+  bank B. Dedup / caps / prefer_observations do not fix that.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Literal, TypeVar
 
 from .response_models import MemoryFact
@@ -23,6 +40,36 @@ MultiBankMerge = Literal["score", "interleave"]
 # Hard cap on parallel bank fan-out (engine + HTTP request model).
 MAX_MULTI_BANK_RECALL_BANKS = 10
 
+# ---------------------------------------------------------------------------
+# Per-bank contribution cap (anti-flood into the merge pool)
+# ---------------------------------------------------------------------------
+#
+# Default rationale:
+# - Stock per-bank ``recall_async`` already ranks/CE-reranks; the multi-bank pool
+#   only needs each bank's *best* head, not its entire returned list.
+# - Typical CE top windows and single-bank result heads sit around ~50 items; keeping
+#   that head per bank preserves ranking quality without letting a large bank
+#   (thousands of facts) dump a long CE-ranked tail into the union.
+# - Worst-case pool before merge/dedup/cut is ``MAX_MULTI_BANK_RECALL_BANKS * M``
+#   (10 * 50 = 500) - large enough not to starve score-merge, small enough to be
+#   an anti-flood measure rather than "pass everything through".
+# - Bank-size asymmetry already OVER-represents small banks (they contribute all
+#   their results while the large bank is ranking/budget-limited). This cap trims
+#   the large bank's flood; it must never starve a bank that has results to zero
+#   (``max_per_bank`` is clamped to >= 1).
+# - Rejected alternatives: ``interleave`` as the anti-flood fix (forces parity and
+#   makes small-bank over-representation worse); ``max_tokens / n_banks`` (starves
+#   both banks' cross-encoder windows).
+DEFAULT_PER_BANK_MERGE_CAP = 50
+
+# Multi-bank fan-out only. Single-bank ``recall_async`` default is unchanged.
+#
+# Real semantics are narrower than the name: when True, the engine drops raw facts
+# whose ids appear in a returned observation's ``source_memory_ids``. It does NOT
+# catch unlinked "same sentence, different fact_type" twins - that is what
+# :func:`dedup_exact_normalized` is for.
+MULTI_BANK_PREFER_OBSERVATIONS = True
+
 # Metadata keys written into ``RecallResult.metadata`` by the orchestrator.
 META_MULTI_BANK = "multi_bank"
 META_MERGE_REQUESTED = "merge_requested"
@@ -30,7 +77,11 @@ META_MERGE_APPLIED = "merge_applied"
 META_MERGE_FALLBACK_REASON = "merge_fallback_reason"
 META_BANKS = "banks"
 META_DEDUP = "dedup"
-META_DEDUP_V1 = "none"  # v1: no cross-bank dedup
+META_DEDUP_DROPPED = "dedup_dropped"
+META_PER_BANK_CAP = "per_bank_cap"
+# Was hard-coded ``"none"`` in v1 (no cross-bank dedup). Now exact/normalized text.
+META_DEDUP_V1 = "exact_normalized"
+META_DEDUP_MODE = META_DEDUP_V1  # alias; value is the active mode string
 
 # Distinct post-gather fallback reason when returned facts lack usable CE scores
 # (e.g. RRF passthrough cross-encoder sets scores.reranker=None for every result).
@@ -44,6 +95,18 @@ _T = TypeVar("_T")
 # Banks with no facts in the merged list still may contribute side dicts
 # (e.g. chunks fetched independently of max_tokens); rank them after all others.
 _SIDE_DICT_UNRANKED = 10**9
+
+
+@dataclass(frozen=True)
+class DedupedFacts:
+    """Facts kept after exact/normalized dedup, plus how many copies were dropped.
+
+    Named type instead of a (facts, dropped) tuple: the project bar forbids
+    multi-item tuple returns even for internal helpers.
+    """
+
+    facts: list[MemoryFact]
+    dropped: int
 
 
 def stamp_bank_id(fact: MemoryFact, bank_id: str) -> MemoryFact:
@@ -98,6 +161,23 @@ def _reranker_score(fact: MemoryFact) -> float:
     return float(fact.scores.reranker)
 
 
+def cap_per_bank_results(
+    bank_results: Sequence[tuple[str, Sequence[MemoryFact]]],
+    *,
+    max_per_bank: int = DEFAULT_PER_BANK_MERGE_CAP,
+) -> list[tuple[str, list[MemoryFact]]]:
+    """Take ``outcome.results[:M]`` per bank before merging (anti-flood).
+
+    ``max_per_bank`` is clamped to at least 1 so a bank that returned results is
+    never starved to zero by the cap alone (an empty bank still contributes nothing).
+
+    Does not re-rank; preserves each bank's existing within-bank order. Apply this
+    *before* :func:`score_merge` / :func:`interleave_merge`.
+    """
+    m = max(1, int(max_per_bank))
+    return [(bank_id, list(facts[:m])) for bank_id, facts in bank_results]
+
+
 def score_merge(bank_results: Sequence[tuple[str, Sequence[MemoryFact]]]) -> list[MemoryFact]:
     """Sort the union of per-bank results by normalized cross-encoder score descending.
 
@@ -123,6 +203,11 @@ def interleave_merge(bank_results: Sequence[tuple[str, Sequence[MemoryFact]]]) -
     Banks appear in the order of ``bank_results``. Empty banks contribute no slots.
     Each result is stamped with its source ``bank_id``. Guarantees per-bank
     representation when banks have results (unlike pure score sort).
+
+    Note: interleave is the score-merge *fallback* when CE scores are unusable. It
+    is NOT the anti-flood measure for bank-size asymmetry (that is
+    :func:`cap_per_bank_results`); using interleave as parity-forcing anti-flood
+    was considered and rejected.
     """
     stamped_lists: list[list[MemoryFact]] = [
         [stamp_bank_id(fact, bank_id) for fact in facts] for bank_id, facts in bank_results
@@ -134,6 +219,39 @@ def interleave_merge(bank_results: Sequence[tuple[str, Sequence[MemoryFact]]]) -
             if rank < len(lst):
                 merged.append(lst[rank])
     return merged
+
+
+def normalize_dedup_key(text: str | None) -> str:
+    """Normalize fact text for exact cross-bank dedup: casefold + whitespace collapse.
+
+    Whitespace is any Unicode whitespace (``str.split`` with no args). Case uses
+    ``str.casefold`` (stronger than lower for some locales). Punctuation and
+    near-paraphrase differences are intentionally preserved so genuinely distinct
+    facts are not collapsed.
+    """
+    return " ".join((text or "").casefold().split())
+
+
+def dedup_exact_normalized(facts: Sequence[MemoryFact]) -> DedupedFacts:
+    """Drop later duplicates of the same normalized text; keep the higher-ranked copy.
+
+    Higher-ranked = earlier in ``facts`` (call after score/interleave merge so the
+    list is already ordered). Must run *before* :func:`cut_to_token_budget` so
+    dropped duplicates do not consume token budget.
+
+    Exact / normalized only - no embedding or near-duplicate collapse.
+    """
+    seen: set[str] = set()
+    kept: list[MemoryFact] = []
+    dropped = 0
+    for fact in facts:
+        key = normalize_dedup_key(fact.text)
+        if key in seen:
+            dropped += 1
+            continue
+        seen.add(key)
+        kept.append(fact)
+    return DedupedFacts(facts=kept, dropped=dropped)
 
 
 def cut_to_token_budget(facts: Sequence[MemoryFact], max_tokens: int) -> list[MemoryFact]:
@@ -155,6 +273,31 @@ def cut_to_token_budget(facts: Sequence[MemoryFact], max_tokens: int) -> list[Me
         else:
             break
     return filtered
+
+
+def merge_cap_dedup_cut(
+    bank_results: Sequence[tuple[str, Sequence[MemoryFact]]],
+    *,
+    merge: MultiBankMerge,
+    max_tokens: int,
+    max_per_bank: int = DEFAULT_PER_BANK_MERGE_CAP,
+) -> DedupedFacts:
+    """Compose the multi-bank post-gather pipeline: cap -> merge -> dedup -> token cut.
+
+    ``DedupedFacts.facts`` is the token-cut list. ``DedupedFacts.dropped`` is how
+    many facts ``dedup_exact_normalized`` removed (counted before the cut).
+    Orchestrators may call the steps individually; this helper encodes the order.
+    """
+    capped = cap_per_bank_results(bank_results, max_per_bank=max_per_bank)
+    if merge == "score":
+        merged = score_merge(capped)
+    else:
+        merged = interleave_merge(capped)
+    deduped = dedup_exact_normalized(merged)
+    return DedupedFacts(
+        facts=cut_to_token_budget(deduped.facts, max_tokens),
+        dropped=deduped.dropped,
+    )
 
 
 def cross_encoder_eligible(
@@ -211,14 +354,25 @@ def build_multi_bank_metadata(
     merge_applied: MultiBankMerge,
     merge_fallback_reason: str | None,
     bank_statuses: dict[str, dict],
+    dedup: str = META_DEDUP_MODE,
+    dedup_dropped: int = 0,
+    per_bank_cap: int = DEFAULT_PER_BANK_MERGE_CAP,
 ) -> dict:
-    """Assemble the multi-bank block stored on ``RecallResult.metadata``."""
+    """Assemble the multi-bank block stored on ``RecallResult.metadata``.
+
+    ``dedup`` is the mode string (default :data:`META_DEDUP_MODE` /
+    ``exact_normalized``). ``dedup_dropped`` is how many facts were removed by
+    :func:`dedup_exact_normalized`. ``per_bank_cap`` records the M used for
+    :func:`cap_per_bank_results`.
+    """
     return {
         META_MULTI_BANK: {
             META_MERGE_REQUESTED: merge_requested,
             META_MERGE_APPLIED: merge_applied,
             META_MERGE_FALLBACK_REASON: merge_fallback_reason,
             META_BANKS: bank_statuses,
-            META_DEDUP: META_DEDUP_V1,
+            META_DEDUP: dedup,
+            META_DEDUP_DROPPED: int(dedup_dropped),
+            META_PER_BANK_CAP: int(per_bank_cap),
         }
     }

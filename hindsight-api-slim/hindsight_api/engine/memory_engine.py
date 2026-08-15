@@ -904,6 +904,26 @@ def _is_non_retryable_task_error(e: Exception) -> bool:
     )
 
 
+def _retry_or_reraise_worker_task(e: Exception, task_dict: dict[str, Any]) -> NoReturn:
+    """Apply the non-consolidation worker retry policy to a task error.
+
+    Raises ``RetryTaskAt`` while ``_retry_count < worker_max_retries``, else
+    re-raises ``e`` so the poller marks the operation failed with the message.
+    Consolidation has its own indefinite-retry / dedup-by-bank path and must
+    not use this helper.
+
+    Retry message uses ``format_task_error`` (main/#3218), not ``str(e)``.
+    """
+    config = get_config()
+    retry_count = task_dict.get("_retry_count", 0)
+    if retry_count < config.worker_max_retries:
+        raise RetryTaskAt(
+            retry_at=datetime.now(UTC) + timedelta(seconds=config.worker_task_retry_backoff_seconds),
+            message=format_task_error(e),
+        )
+    raise e
+
+
 class Budget(str, Enum):
     """Budget levels for recall/reflect operations."""
 
@@ -2619,6 +2639,30 @@ class MemoryEngine(MemoryEngineInterface):
                 # would convert a legitimate defer into a 60-second RetryTaskAt
                 # and lose the "not a failure" semantics entirely.
                 raise
+            except MentalModelRefreshError as e:
+                # Expected fail-safe from #3112/#3182: refresh_mental_model
+                # raises MentalModelRefreshError after _preserve_and_fail leaves
+                # content and watermark untouched so a retry re-reads the same
+                # window. Delta ops are LLM-produced and non-deterministic, so
+                # this is still retryable (same policy as a generic
+                # non-consolidation error).
+                #
+                # Log via logger.error without exc_info: main/#3218 replaced
+                # print_exc() with logger.error(..., exc_info=True) on the
+                # generic path. This designed skip must not emit a traceback
+                # (soak watchers treat Traceback / MentalModelRefreshError as
+                # unhandled). Overlay used logger.warning; we use logger.error
+                # so the skip is visible at the same level as other task
+                # failures, still without a traceback.
+                logger.error(
+                    "Mental model refresh failed (content preserved): "
+                    "task_type=%s mental_model_id=%s bank_id=%s error=%s",
+                    task_type,
+                    task_dict.get("mental_model_id"),
+                    task_dict.get("bank_id"),
+                    e,
+                )
+                _retry_or_reraise_worker_task(e, task_dict)
             except Exception as e:
                 # exc_info, not a bare print_exc(): the traceback is the only pointer
                 # to the offending call site, and under production log volume the
@@ -2699,14 +2743,7 @@ class MemoryEngine(MemoryEngineInterface):
                     # Retry count and backoff come from config (HINDSIGHT_API_WORKER_MAX_RETRIES and
                     # HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS). Defaults of 3 x 60s give a
                     # 4-minute total window; operators expecting a longer provider outage can raise them.
-                    config = get_config()
-                    retry_count = task_dict.get("_retry_count", 0)
-                    if retry_count < config.worker_max_retries:
-                        raise RetryTaskAt(
-                            retry_at=datetime.now(UTC) + timedelta(seconds=config.worker_task_retry_backoff_seconds),
-                            message=error_message,
-                        )
-                    raise
+                    _retry_or_reraise_worker_task(e, task_dict)
 
     async def _fire_consolidation_webhook(
         self,
@@ -5343,7 +5380,7 @@ class MemoryEngine(MemoryEngineInterface):
         max_tokens: int = 4096,
         enable_trace: bool = False,
         fact_type: list[str] | None = None,
-        prefer_observations: bool = False,
+        prefer_observations: bool = True,
         question_date: datetime | None = None,
         include_entities: bool = False,
         max_entity_tokens: int = 500,
@@ -5386,22 +5423,26 @@ class MemoryEngine(MemoryEngineInterface):
         results are returned with per-bank status in ``metadata["multi_bank"]["banks"]``
         (client-visible error text is generic; details are logged server-side).
         Precedence for hard failures re-raised from the gather: ``OperationCancelledError``
-        first (HTTP 499), then ``OperationValidationError`` (auth/validation denials —
-        same mapping as single-bank recall). Neither soft-fails into a 200.
+        first (HTTP 499), then tenant ``AuthenticationError`` (HTTP 401; auth is
+        per-request, not per-bank), then ``OperationValidationError`` (bank-scoped
+        403/422 denials — same mapping as single-bank recall). None of those
+        soft-fail into a 200. The tenant is also authenticated once before fan-out
+        so an unauthenticated request fails before N parallel recalls start.
 
-        **Dedup:** none in v1 (cross-bank duplicate facts are possible). Exact-text
-        dedup is a cheap v2; see module docstring on ``multi_bank_recall``.
+        **Dedup:** exact/normalized text across banks (``exact_normalized``), after
+        merge and before the token cut. Per-bank contribution is capped at 50.
+        ``prefer_observations`` defaults True on this orchestrator only (HTTP/MCP
+        request models still default False and pass the caller's value through).
         """
         from .multi_bank_recall import (
+            DEFAULT_PER_BANK_MERGE_CAP,
             FALLBACK_NO_USABLE_RERANKER_SCORES,
             MAX_MULTI_BANK_RECALL_BANKS,
             bank_rank_from_merged,
             build_multi_bank_metadata,
             cross_encoder_eligible,
-            cut_to_token_budget,
             has_usable_reranker_scores,
-            interleave_merge,
-            score_merge,
+            merge_cap_dedup_cut,
             union_merge_dicts,
         )
 
@@ -5433,8 +5474,18 @@ class MemoryEngine(MemoryEngineInterface):
                     merge_applied=merge,
                     merge_fallback_reason=None,
                     bank_statuses={},
+                    # No gather happened on this path, so nothing was deduped.
+                    dedup_dropped=0,
+                    per_bank_cap=DEFAULT_PER_BANK_MERGE_CAP,
                 ),
             )
+
+        # Tenant auth is request-scoped, not per-bank. Authenticate once before
+        # fan-out so an unauthenticated multi-recall fails the whole request
+        # instead of starting N recalls. Each recall_async still authenticates
+        # (single-bank contract / schema ContextVar); we do not skip that.
+        # Per-bank OperationValidator precheck stays inside recall_async.
+        await self._authenticate_tenant(request_context)
 
         # Resolve per-bank enable_reranking so score-merge auto-fallback can run
         # before (or without) depending on result scores. Failed config lookups
@@ -5504,11 +5555,18 @@ class MemoryEngine(MemoryEngineInterface):
         )
 
         # Hard failures first — never soft-fail into partial 200 metadata.
-        # Precedence: cancellation (499) before auth/validation denials.
+        # Precedence: cancellation (499), then tenant AuthenticationError (401),
+        # then OperationValidationError (403/422). e0a56d80 re-raised OVE only;
+        # AuthenticationError still fell into the generic per-bank soft-fail
+        # (live-measured on the overlay 2026-08-15: multi POST -> 200).
+        from hindsight_api.extensions import AuthenticationError
         from hindsight_api.extensions.operation_validator import OperationValidationError
 
         for outcome in gathered:
             if isinstance(outcome, OperationCancelledError):
+                raise outcome
+        for outcome in gathered:
+            if isinstance(outcome, AuthenticationError):
                 raise outcome
         for outcome in gathered:
             if isinstance(outcome, OperationValidationError):
@@ -5546,12 +5604,16 @@ class MemoryEngine(MemoryEngineInterface):
             merge_applied = "interleave"
             merge_fallback_reason = FALLBACK_NO_USABLE_RERANKER_SCORES
 
-        if merge_applied == "score":
-            merged = score_merge(successful_facts)
-        else:
-            merged = interleave_merge(successful_facts)
-
-        cut = cut_to_token_budget(merged, max_tokens)
+        # cap -> merge -> dedup -> token cut. merge_applied already carries any
+        # FALLBACK_NO_USABLE_RERANKER_SCORES downgrade decided just above.
+        pipeline = merge_cap_dedup_cut(
+            successful_facts,
+            merge=merge_applied,
+            max_tokens=max_tokens,
+            max_per_bank=DEFAULT_PER_BANK_MERGE_CAP,
+        )
+        cut = pipeline.facts
+        dedup_dropped = pipeline.dropped
 
         # Union-merge entities/chunks/source_facts across successful banks. On key
         # collision keep the bank whose results ranked higher in the merged order
@@ -5580,6 +5642,8 @@ class MemoryEngine(MemoryEngineInterface):
                 merge_applied=merge_applied,
                 merge_fallback_reason=merge_fallback_reason,
                 bank_statuses=bank_statuses,
+                dedup_dropped=dedup_dropped,
+                per_bank_cap=DEFAULT_PER_BANK_MERGE_CAP,
             ),
         )
 
