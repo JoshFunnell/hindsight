@@ -1074,6 +1074,33 @@ async def test_orchestrator_metadata_keys_present_on_success():
     assert mb[META_BANKS]["bank-b"] == {"status": "ok", "count": 1}
 
 
+@pytest.mark.asyncio
+async def test_orchestrator_source_facts_truncated_or_across_banks():
+    """origin/main source_facts_truncated: True if any successful bank reported it."""
+    engine = _harness(
+        bank_results={
+            "bank-a": RecallResult(
+                results=[_fact("a1", "A", reranker=0.9)],
+                source_facts={"sf-a": _fact("sf-a", "src A")},
+                source_facts_truncated=False,
+            ),
+            "bank-b": RecallResult(
+                results=[_fact("b1", "B", reranker=0.4)],
+                source_facts={"sf-b": _fact("sf-b", "src B")},
+                source_facts_truncated=True,
+            ),
+        }
+    )
+    result = await MemoryEngine.recall_multi_async(
+        engine,
+        ["bank-a", "bank-b"],
+        "query",
+        request_context=RC,
+        max_tokens=10_000,
+    )
+    assert result.source_facts_truncated is True
+
+
 # --- AuthenticationError hard-fail (94b831d3; not covered by e0a56d80) ---
 
 

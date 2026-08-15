@@ -360,11 +360,19 @@ class RecallResult(BaseModel):
     source_facts: dict[str, MemoryFact] | None = Field(
         None, description="Source facts for observation-type results, keyed by fact ID"
     )
+    source_facts_truncated: bool | None = Field(
+        None,
+        description=(
+            "Whether the source_facts map was cut short by the token budget. When true, some IDs in "
+            "results[].source_fact_ids have no entry in source_facts — the budget ran out, the "
+            "references are not dangling. Only set when source facts were requested."
+        ),
+    )
     metadata: dict[str, Any] | None = Field(
         None,
         description=(
             "Optional response metadata. Multi-bank recall populates metadata['multi_bank'] with "
-            "merge mode, per-bank status, and fallback reason when score-merge cannot run."
+            "merge mode, per-bank status, fallback reason, exact_normalized dedup, and per_bank_cap."
         ),
     )
 
