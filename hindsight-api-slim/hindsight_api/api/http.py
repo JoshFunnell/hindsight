@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 
 from hindsight_api.api import page_markdown
 from hindsight_api.api.disconnect import ClientDisconnectCancellationMiddleware, get_scope_cancellation_token
+from hindsight_api.api.passthrough_headers import collect_passthrough_headers
 from hindsight_api.cancellation import OperationCancelledError
 from hindsight_api.engine.audit import (
     AuditEntry,
@@ -598,6 +599,14 @@ class RecallResponse(BaseModel):
     source_facts: dict[str, RecallResult] | None = Field(
         default=None, description="Source facts for observation-type results, keyed by fact ID"
     )
+    source_facts_truncated: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the source_facts map was cut short by the token budget. When true, some IDs in "
+            "results[].source_fact_ids have no entry in source_facts — the budget ran out, the "
+            "references are not dangling. Only set when source facts were requested."
+        ),
+    )
 
 
 class EntityInput(BaseModel):
@@ -967,17 +976,21 @@ class ReflectRequest(BaseModel):
     )
     tags: list[str] | None = Field(
         default=None,
-        description="Filter memories by tags during reflection. If not specified, all memories are considered.",
+        description="Scope raw facts, observations, mental models, and tagged directives during reflection. "
+        "With no tags, memory retrieval is unfiltered while only untagged/global directives are loaded. "
+        "Use tags=[] with tags_match='exact' to select the untagged/global scope.",
     )
     tags_match: TagsMatch = Field(
         default="any",
         description="How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), "
-        "'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged).",
+        "'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged), or "
+        "'exact' (set equality). Untagged directives remain global in every mode.",
     )
     tag_groups: list[TagGroup] | None = Field(
         default=None,
         description="Compound tag filter using boolean groups. Groups in the list are AND-ed. "
-        "Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}.",
+        "Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. "
+        "Mutually exclusive with tags.",
     )
     apply_all_directives: bool = Field(
         default=False,
@@ -1438,8 +1451,7 @@ class BankConfigUpdate(BaseModel):
         json_schema_extra={
             "example": {
                 "updates": {
-                    "llm_model": "claude-sonnet-4-5",
-                    "retain_extraction_mode": "verbose",
+                    "retain_extraction_mode": "custom",
                     "retain_custom_instructions": "Extract technical details carefully",
                 }
             }
@@ -1447,8 +1459,8 @@ class BankConfigUpdate(BaseModel):
     )
 
     updates: dict[str, Any] = Field(
-        description="Configuration overrides. Keys can be in Python field format (llm_provider) "
-        "or environment variable format (HINDSIGHT_API_LLM_PROVIDER). "
+        description="Configuration overrides. Keys can be in Python field format (retain_extraction_mode) "
+        "or environment variable format (HINDSIGHT_API_RETAIN_EXTRACTION_MODE). "
         "Only hierarchical fields can be overridden per-bank."
     )
 
@@ -1461,12 +1473,10 @@ class BankConfigResponse(BaseModel):
             "example": {
                 "bank_id": "my-bank",
                 "config": {
-                    "llm_provider": "openai",
-                    "llm_model": "gpt-4",
                     "retain_extraction_mode": "verbose",
+                    "retain_chunk_size": 3000,
                 },
                 "overrides": {
-                    "llm_model": "gpt-4",
                     "retain_extraction_mode": "verbose",
                 },
             }
@@ -1985,7 +1995,14 @@ class BankStatsResponse(BaseModel):
             "mental-model read can confirm."
         ),
     )
-    pending_consolidation: int = Field(default=0, description="Number of memories not yet processed into observations")
+    pending_consolidation: int = Field(
+        default=0,
+        description=(
+            "Number of source memories (world/experience) still queued for consolidation into "
+            "observations. Excludes memories whose consolidation permanently failed — those are "
+            "counted only in failed_consolidation — so this drains to 0 when the consolidator catches up."
+        ),
+    )
     failed_consolidation: int = Field(
         default=0,
         description="Number of source memories (world/experience) whose consolidation permanently failed and can be retried via the consolidation recovery endpoint.",
@@ -2102,7 +2119,10 @@ class CreateDirectiveRequest(BaseModel):
     content: str = Field(description="The directive text to inject into prompts")
     priority: int = Field(default=0, description="Higher priority directives are injected first")
     is_active: bool = Field(default=True, description="Whether this directive is active")
-    tags: list[str] = FieldWithDefault(list, description="Tags for filtering")
+    tags: list[str] = FieldWithDefault(
+        list,
+        description="Directive execution scope. Empty means global; non-empty requires a matching reflect scope.",
+    )
 
 
 class UpdateDirectiveRequest(BaseModel):
@@ -3235,6 +3255,7 @@ class OperationsListResponse(BaseModel):
                     {
                         "id": "550e8400-e29b-41d4-a716-446655440000",
                         "task_type": "retain",
+                        "items_count": 5,
                         "created_at": "2024-01-15T10:30:00Z",
                         "status": "pending",
                         "error_message": None,
@@ -3323,7 +3344,7 @@ class OperationStatusResponse(BaseModel):
             "example": {
                 "operation_id": "550e8400-e29b-41d4-a716-446655440000",
                 "status": "completed",
-                "operation_type": "refresh_mental_models",
+                "operation_type": "refresh_mental_model",
                 "created_at": "2024-01-15T10:30:00Z",
                 "updated_at": "2024-01-15T10:31:30Z",
                 "completed_at": "2024-01-15T10:31:30Z",
@@ -3409,15 +3430,19 @@ class VersionResponse(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "api_version": "0.4.0",
+                "api_version": "0.9.0",
                 "features": {
                     "observations": False,
                     "mcp": True,
                     "worker": True,
                     "bank_config_api": False,
+                    "bank_llm_health": True,
                     "file_upload_api": True,
                     "document_export_api": True,
                     "document_import_api": True,
+                    "audit_log": False,
+                    "llm_trace": False,
+                    "store_document_text": True,
                 },
             }
         }
@@ -3961,15 +3986,20 @@ def _register_routes(app: FastAPI):
     # Create audit decorator bound to this app's audit logger
     audited = _make_audited_http(lambda: getattr(app.state, "audit_logger", None))
 
-    def get_request_context(authorization: str | None = Header(default=None)) -> RequestContext:
+    def get_request_context(request: Request, authorization: str | None = Header(default=None)) -> RequestContext:
         """
-        Extract request context from Authorization header.
+        Extract request context from the Authorization header.
 
         Supports:
         - Bearer token: "Bearer <api_key>"
         - Direct API key: "<api_key>"
 
         Returns RequestContext with extracted API key (may be None if no auth header).
+
+        Any header named in HINDSIGHT_API_EXTENSION_PASSTHROUGH_HEADERS is also
+        copied into ``extra_headers`` for extensions to read. That allowlist is
+        empty by default, so no other header reaches extension code unless an
+        operator opts in.
         """
         api_key = None
         if authorization:
@@ -3977,7 +4007,8 @@ def _register_routes(app: FastAPI):
                 api_key = authorization[7:].strip()
             else:
                 api_key = authorization.strip()
-        return RequestContext(api_key=api_key)
+        extra_headers = collect_passthrough_headers(request.headers.raw, get_config().extension_passthrough_headers)
+        return RequestContext(api_key=api_key, extra_headers=extra_headers)
 
     def precheck_for(operation: PrecheckOperation):
         """
@@ -4047,6 +4078,19 @@ def _register_routes(app: FastAPI):
         return JSONResponse(
             status_code=401,
             content={"detail": str(exc)},
+        )
+
+    # A bank briefly closed to writes — a store migrating it between backends holds it for a few
+    # seconds. 503 + Retry-After rather than a 500: nothing is broken, and the difference decides
+    # whether a client retries or reports a failure to the user.
+    from ..engine.memories.base import StoreWriteUnavailable
+
+    @app.exception_handler(StoreWriteUnavailable)
+    async def store_write_unavailable_handler(request, exc: StoreWriteUnavailable):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(exc)},
+            headers={"Retry-After": str(getattr(exc, "retry_after", 30))},
         )
 
     async def _readiness_response() -> JSONResponse:
@@ -4644,6 +4688,7 @@ def _register_routes(app: FastAPI):
                 entities=entities_response,
                 chunks=chunks_response,
                 source_facts=source_facts_response,
+                source_facts_truncated=core_result.source_facts_truncated,
             )
 
             handler_duration = time.time() - handler_start
@@ -5868,14 +5913,21 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/directives",
         response_model=DirectiveListResponse,
         summary="List directives",
-        description="List hard rules that are injected into prompts.",
+        description="List directive definitions. Unlike reflect, an omitted tag filter returns all directives.",
         operation_id="list_directives",
         tags=["Directives"],
     )
     async def api_list_directives(
         bank_id: str,
-        tags_filter: list[str] | None = Query(None, alias="tags", description="Filter by tags"),
-        tags_match: Literal["any", "all", "exact"] = Query("any", description="How to match tags"),
+        tags_filter: list[str] | None = Query(
+            None,
+            alias="tags",
+            description="Filter directives by execution scope. Omit or pass [] to list all directives.",
+        ),
+        tags_match: Literal["any", "all", "exact"] = Query(
+            "any",
+            description="How tagged directives match the requested scope. Untagged/global directives are included.",
+        ),
         active_only: bool = Query(True, description="Only return active directives"),
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
@@ -5942,7 +5994,7 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/directives",
         response_model=DirectiveResponse,
         summary="Create directive",
-        description="Create a hard rule that will be injected into prompts.",
+        description="Create a global or tag-scoped hard rule for reflect prompts.",
         operation_id="create_directive",
         tags=["Directives"],
     )
@@ -7413,8 +7465,9 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/config",
         response_model=BankConfigResponse,
         summary="Update bank configuration",
-        description="Update configuration overrides for a bank. Only hierarchical fields can be overridden (LLM settings, retention parameters, etc.). "
-        "Keys can be provided in Python field format (llm_provider) or environment variable format (HINDSIGHT_API_LLM_PROVIDER).",
+        description="Update configuration overrides for a bank. Only hierarchical behavioral settings can be "
+        "overridden (retention parameters, recall settings, etc.). Keys can be provided in Python field format "
+        "(retain_extraction_mode) or environment variable format (HINDSIGHT_API_RETAIN_EXTRACTION_MODE).",
         operation_id="update_bank_config",
         tags=["Banks"],
     )
