@@ -13066,9 +13066,7 @@ class MemoryEngine(MemoryEngineInterface):
         # Capture whether THIS reflect used any facts BEFORE the delta-mode
         # merge below folds in facts from previous refreshes. Post-merge
         # emptiness is fail-open under carry-over (#2894).
-        fresh_retrieval_empty = not any(
-            payload for payload in based_on_serialized_payload.values() if payload
-        )
+        fresh_retrieval_empty = not any(payload for payload in based_on_serialized_payload.values() if payload)
 
         # In delta mode, based_on must accumulate: the mental model is
         # grounded on ALL facts ever used, not just the latest delta's new

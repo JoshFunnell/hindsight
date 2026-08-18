@@ -18,9 +18,7 @@ def test_no_answer_text_is_a_placeholder():
 
 
 def test_iteration_limit_render_is_a_placeholder():
-    assert is_placeholder_refresh_candidate(
-        "I was unable to formulate a complete answer after 10 iterations."
-    )
+    assert is_placeholder_refresh_candidate("I was unable to formulate a complete answer after 10 iterations.")
 
 
 def test_real_document_is_not_a_placeholder():
