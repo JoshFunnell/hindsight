@@ -134,6 +134,26 @@ def _authorize_nested_operations() -> "Iterator[None]":
 
 MENTAL_MODEL_PENDING_CONTENT = "Generating content..."
 
+_ITERATION_LIMIT_PREFIX = "I was unable to formulate a complete answer"
+
+
+def is_placeholder_refresh_candidate(text: str) -> bool:
+    """True when the reflect candidate is a known failure placeholder, not a document."""
+    from .reflect.agent import NO_ANSWER_TEXT
+
+    candidate = text.strip()
+    return candidate == NO_ANSWER_TEXT.strip() or candidate.startswith(_ITERATION_LIMIT_PREFIX)
+
+
+def should_refuse_failed_refresh_overwrite(
+    *,
+    has_delta_baseline: bool,
+    is_placeholder: bool,
+    fresh_retrieval_empty: bool,
+) -> bool:
+    """Refuse a failed render only when it would overwrite existing real content."""
+    return has_delta_baseline and (is_placeholder or fresh_retrieval_empty)
+
 
 def get_current_schema() -> str:
     """Get the current schema from context (falls back to config default)."""
@@ -13043,6 +13063,13 @@ class MemoryEngine(MemoryEngineInterface):
         for _facts in based_on_serialized_payload.values():
             delta_supporting_facts.extend(_facts)
 
+        # Capture whether THIS reflect used any facts BEFORE the delta-mode
+        # merge below folds in facts from previous refreshes. Post-merge
+        # emptiness is fail-open under carry-over (#2894).
+        fresh_retrieval_empty = not any(
+            payload for payload in based_on_serialized_payload.values() if payload
+        )
+
         # In delta mode, based_on must accumulate: the mental model is
         # grounded on ALL facts ever used, not just the latest delta's new
         # ones. Merge previous based_on with current, deduplicating by id.
@@ -13311,6 +13338,31 @@ class MemoryEngine(MemoryEngineInterface):
             warnings.append(
                 "The refresh produced empty content, which usually means an upstream LLM failure. "
                 "A real refresh would preserve the existing content and fail."
+            )
+            return _finish(
+                effective_mode=effective_mode,
+                mode_fallback_reason=mode_fallback_reason,
+                final_content=final_content,
+                final_structured=None,
+                delta_operations=delta_operations,
+                outcome="refresh_failed_empty_candidate",
+            )
+
+        # Refuse to overwrite EXISTING REAL content with a failure placeholder
+        # (#2959: NO_ANSWER_TEXT / iteration-limit fallback — non-empty, so the
+        # emptiness guard above lets it through) or when this run retrieved
+        # nothing fresh (#2894). Both legs require a real baseline so a
+        # bootstrap write onto empty/PENDING content still lands.
+        is_placeholder = is_placeholder_refresh_candidate(final_content)
+        if should_refuse_failed_refresh_overwrite(
+            has_delta_baseline=has_delta_baseline,
+            is_placeholder=is_placeholder,
+            fresh_retrieval_empty=fresh_retrieval_empty,
+        ):
+            reason = "placeholder_candidate" if is_placeholder else "empty_fresh_retrieval"
+            warnings.append(
+                f"Refresh produced a {reason} render over existing real content; "
+                "preserving previous content and failing the refresh."
             )
             return _finish(
                 effective_mode=effective_mode,
