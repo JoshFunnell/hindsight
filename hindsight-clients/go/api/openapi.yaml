@@ -6871,6 +6871,7 @@ components:
             tags:
             - tags
             - tags
+          delta_fast_path: true
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
@@ -7112,6 +7113,7 @@ components:
               tags:
               - tags
               - tags
+            delta_fast_path: true
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
@@ -7154,6 +7156,7 @@ components:
               tags:
               - tags
               - tags
+            delta_fast_path: true
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
@@ -10148,6 +10151,7 @@ components:
             tags:
             - tags
             - tags
+          delta_fast_path: true
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
