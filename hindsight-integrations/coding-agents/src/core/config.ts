@@ -15,6 +15,9 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_SEED_LIMIT } from "./seed";
+import { isOptedIn } from "./bank";
+import { log } from "./log";
+import { DEFAULT_OBSERVATION_SCOPES, type ObservationScopes } from "./hindsight";
 
 /** Default config-file path: ~/.hindsight/coding-agent.json */
 export // HINDSIGHT_CONFIG joins the two env exceptions (diag/log files): it points at THE config file,
@@ -25,7 +28,6 @@ const CONFIG_PATH =
 /** Daemon-mode defaults. The port matches the old per-agent Claude Code plugin so a machine that
  *  already ran that daemon keeps using the same one. */
 export const DEFAULT_DAEMON_PORT = 9077;
-export const DEFAULT_DAEMON_IDLE_TIMEOUT = 300;
 export const DEFAULT_DAEMON_PROFILE = "coding-agent";
 
 /** Incremental git-sync settings (see core/sync.ts). */
@@ -45,10 +47,12 @@ export interface RawConfig {
    *  NOT 8888 — that is the conventional port for a server you run yourself, and a daemon must
    *  never squat on it. A healthy server already on this port is adopted rather than restarted. */
   apiPort?: number;
-  /** Daemon mode: seconds of inactivity before the daemon exits (default 300).
-   *  This is how the daemon shuts down. There is deliberately no stop-on-session-end: one daemon
-   *  is shared by every agent and repo on the machine, so ending one session must not cut memory
-   *  out from under another. */
+  /** Daemon mode: seconds of inactivity before the daemon exits. Unset means it never exits on
+   *  its own — `hindsight-embed`'s own default, which every other Hindsight integration also
+   *  ships. This used to default to 300 here, which made the plugin the only thing on the machine
+   *  opting a shared daemon into an auto-exit nobody asked for. There is deliberately no
+   *  stop-on-session-end either: one daemon is shared by every agent and repo on the machine, so
+   *  ending one session must not cut memory out from under another. */
   daemonIdleTimeout?: number;
   /** Daemon mode: `hindsight-embed` profile name, i.e. which local database is used (default
    *  "coding-agent"). Separate profiles keep unrelated setups from sharing memory. */
@@ -63,13 +67,36 @@ export interface RawConfig {
   //   placeholders: {gitProject} {project} {harness} {channel} {user} (see core/bank.ts)
   mapPathToBank?: Record<string, string>; // absolute path -> bank; longest prefix wins; overrides everything
   resolveWorktrees?: boolean; // {gitProject}: worktrees share the main repo's bank (default true)
+  /** Run memory ONLY in projects that were opted in (default false: every project gets memory,
+   *  which is what makes the plugin zero-setup). With it on, an unlisted project is inert — no
+   *  bank is created, nothing is retained, no seed runs — so unrelated work leaves no trace. */
+  optInOnly?: boolean;
+  /** Directories opted in, matched as PREFIXES with `~` expanded: approving a directory approves
+   *  the repos beneath it, and each still gets its own dynamic bank. A `mapPathToBank` entry counts
+   *  as opted in too, since routing a path to a named bank already declares that project. */
+  optInPaths?: string[];
   harness?: string; // runtime adapter (default "opencode")
   disabled?: boolean; // hard off-switch — inert plugin, for a no-memory baseline (default false)
   retainSessions?: boolean; // opencode plugin write-back (default true; set false to opt out). Hook harnesses always write back on Stop and ignore this flag.
-  retainEveryTurns?: number; // write-back cadence in user turns (default 1: async upsert every turn)
+  /** Cap on concurrent retain-related requests the client sends to the API (default 10):
+   *  drain()'s per-operation polls and deepen's chat/git retain pools. A single request returning
+   *  200 while bursts get 429s means the server is rate-limiting concurrency, not total volume —
+   *  lower this rather than raising it. */
+  maxParallelRetains?: number;
   reflectTimeoutMs?: number; // session-start reflect timeout (default 120000; hooks cap lower internally)
   autoReflect?: boolean; // inject a one-time reflect synthesis on the session's first prompt (default true; false = the agent reflects only via the hindsight_reflect tool, and the tool guide tells it to do so on new goals)
   pageRefreshEveryTurns?: number; // knowledge-page refresh cadence in user turns (default 10)
+  /** What it COSTS to keep this project's knowledge pages current — the trigger stamped on every
+   *  page this plugin creates (the seeded taxonomy and each captured initiative):
+   *    "auto-refresh" (default) — refresh after every consolidation that produced new material
+   *    "cron"                   — refresh on `pageTriggerCron` only, and only when actually stale
+   *    "manual"                 — never refresh on its own; the tools and control plane still can
+   *  Auto-refresh is both the most current and the most expensive: one LLM synthesis per page per
+   *  consolidation, which adds up fast across auto-surveyed repos (#3506). Existing pages keep the
+   *  trigger they were created with — this changes what NEW pages get. */
+  pageTriggerType?: "auto-refresh" | "cron" | "manual";
+  /** Schedule for `pageTriggerType: "cron"` — UTC, standard 5-field cron, e.g. "0 3 * * *". */
+  pageTriggerCron?: string;
   autoSeed?: boolean; // SessionStart: auto-seed a cold repo's bank from git history (default true)
   seedLimit?: number; // SessionStart auto-seed: most-recent-N-commits cap (default 300)
   codebaseSurvey?: boolean; // SessionStart: spawn a headless claude to survey a cold repo's structure (default true)
@@ -92,6 +119,12 @@ export interface RawConfig {
   /** Extra metadata stamped on every session write-back, e.g. {"repo": "{gitProject}"}. Same
    *  placeholders as retainTags; built-in metadata (harness attribution) wins on conflict. */
   retainMetadata?: Record<string, string>;
+  /** How consolidation groups the observations this plugin's memories feed (default "shared" — one
+   *  global scope per bank, so every agent working a repo builds ONE set of beliefs; see
+   *  DEFAULT_OBSERVATION_SCOPES). "combined" restores the server default of one scope per distinct
+   *  tag set, "per_tag" one per tag, "all_combinations" one per subset; a string[][] declares the
+   *  scopes literally. Anything else falls back to the default. */
+  observationScopes?: ObservationScopes;
   /** Per-harness overrides of any of the fields above, keyed by harness name ("opencode",
    *  "claude-code", ...). Lets one config file give each agent its own bank/settings. */
   harnesses?: Record<string, Omit<RawConfig, "harnesses">>;
@@ -114,7 +147,8 @@ export interface Config {
   apiUrl: string;
   apiToken?: string;
   apiPort: number;
-  daemonIdleTimeout: number;
+  /** Undefined = never told the daemon to auto-exit; see RawConfig above. */
+  daemonIdleTimeout?: number;
   daemonProfile: string;
   embedVersion?: string;
   embedPackagePath?: string;
@@ -123,13 +157,17 @@ export interface Config {
   bankIdTemplate?: string;
   mapPathToBank?: Record<string, string>;
   resolveWorktrees?: boolean;
+  optInOnly: boolean;
+  optInPaths: string[];
   harness: string;
   disabled: boolean;
   retainSessions: boolean;
-  retainEveryTurns: number;
+  maxParallelRetains: number;
   reflectTimeoutMs: number;
   autoReflect: boolean;
   pageRefreshEveryTurns: number;
+  pageTriggerType: "auto-refresh" | "cron" | "manual";
+  pageTriggerCron?: string;
   autoSeed: boolean;
   seedLimit: number;
   codebaseSurvey: boolean;
@@ -139,8 +177,58 @@ export interface Config {
   gitIngest: "message" | "full" | "none";
   retainTags: string[];
   retainMetadata: Record<string, string>;
+  observationScopes: ObservationScopes;
   banks: Record<string, Omit<RawConfig, "banks" | "harnesses"> & { bank?: string }>;
   logLevel: "debug" | "info" | "warn" | "error";
+}
+
+/**
+ * Which page-refresh trigger a raw config asks for.
+ *
+ * `"cron"` without a `pageTriggerCron` is a broken config, not a request to stop refreshing: the
+ * API rejects a cron trigger with no expression, which would fail page creation outright. Fall
+ * back to the default and say so — a user who wants pages to stop refreshing writes "manual".
+ */
+function resolvePageTriggerType(raw: RawConfig): "auto-refresh" | "cron" | "manual" {
+  if (raw.pageTriggerType === "manual") return "manual";
+  if (raw.pageTriggerType === "cron") {
+    if (raw.pageTriggerCron?.trim()) return "cron";
+    log.warn(
+      "config",
+      'pageTriggerType "cron" needs pageTriggerCron (UTC 5-field, e.g. "0 3 * * *") — ' +
+        'falling back to "auto-refresh"'
+    );
+  }
+  return "auto-refresh";
+}
+
+/** The server's scalar scoping modes; anything else in this field has to be an explicit scope list. */
+const OBSERVATION_SCOPE_MODES = ["shared", "combined", "per_tag", "all_combinations"] as const;
+
+/**
+ * Validate `observationScopes`, falling back to the default on anything unrecognized.
+ *
+ * A typo here would otherwise reach the API as an unknown scoping mode and change how a whole
+ * bank's observations are grouped, so an unusable value takes the default rather than travelling.
+ * An empty list is unusable too, and specifically so: `[]` declares ZERO scopes, which the server
+ * reads as "no spec" and silently treats as `combined` — the opposite of what writing this field
+ * at all was meant to express.
+ */
+function resolveObservationScopes(raw: RawConfig["observationScopes"]): ObservationScopes {
+  // Widened deliberately: this arrives from a hand-edited JSON file, so the declared type says what
+  // is meant, not what is there.
+  const value: unknown = raw;
+  if (typeof value === "string")
+    return (OBSERVATION_SCOPE_MODES as readonly string[]).includes(value)
+      ? (value as ObservationScopes)
+      : DEFAULT_OBSERVATION_SCOPES;
+  if (Array.isArray(value)) {
+    const scopes = (value as unknown[])
+      .filter((scope): scope is unknown[] => Array.isArray(scope))
+      .map((scope) => scope.filter((t): t is string => typeof t === "string" && t.trim() !== ""));
+    if (scopes.length) return scopes;
+  }
+  return DEFAULT_OBSERVATION_SCOPES;
 }
 
 /** Apply defaults to a raw (file) config. Pure — the single place the defaults live. */
@@ -160,7 +248,7 @@ export function resolveConfig(raw: RawConfig = {}): Config {
         : (raw.apiUrl ?? "https://api.hindsight.vectorize.io"),
     apiToken: raw.apiToken || undefined,
     apiPort,
-    daemonIdleTimeout: raw.daemonIdleTimeout ?? DEFAULT_DAEMON_IDLE_TIMEOUT,
+    daemonIdleTimeout: raw.daemonIdleTimeout,
     daemonProfile: raw.daemonProfile || DEFAULT_DAEMON_PROFILE,
     embedVersion: raw.embedVersion || undefined,
     embedPackagePath: raw.embedPackagePath || undefined,
@@ -169,13 +257,20 @@ export function resolveConfig(raw: RawConfig = {}): Config {
     bankIdTemplate: raw.bankIdTemplate,
     mapPathToBank: raw.mapPathToBank,
     resolveWorktrees: raw.resolveWorktrees,
+    optInOnly: raw.optInOnly ?? false,
+    // Same shape as retainTags: a config typo must not become a path that silently approves nothing.
+    optInPaths: Array.isArray(raw.optInPaths)
+      ? raw.optInPaths.filter((p): p is string => typeof p === "string" && p.trim() !== "")
+      : [],
     harness: raw.harness ?? "opencode",
     disabled: raw.disabled ?? false,
     retainSessions: raw.retainSessions ?? true, // opencode: write back by default (parity with hook-harness Stop)
-    retainEveryTurns: raw.retainEveryTurns || 1,
+    maxParallelRetains: raw.maxParallelRetains || 10,
     reflectTimeoutMs: raw.reflectTimeoutMs || 120000,
     autoReflect: raw.autoReflect ?? true,
     pageRefreshEveryTurns: raw.pageRefreshEveryTurns || 10,
+    pageTriggerType: resolvePageTriggerType(raw),
+    pageTriggerCron: raw.pageTriggerCron?.trim() || undefined,
     autoSeed: raw.autoSeed ?? true,
     seedLimit: raw.seedLimit || DEFAULT_SEED_LIMIT,
     codebaseSurvey: raw.codebaseSurvey ?? true,
@@ -196,6 +291,7 @@ export function resolveConfig(raw: RawConfig = {}): Config {
             Object.entries(raw.retainMetadata).filter(([, v]) => typeof v === "string")
           )
         : {},
+    observationScopes: resolveObservationScopes(raw.observationScopes),
     banks: raw.banks && typeof raw.banks === "object" ? raw.banks : {},
     logLevel: ["debug", "info", "warn", "error"].includes(raw.logLevel as string)
       ? (raw.logLevel as "debug" | "info" | "warn" | "error")
@@ -269,13 +365,17 @@ const ENV_KEYS = {
   dynamicBankId: "HINDSIGHT_DYNAMIC_BANK_ID",
   bankIdTemplate: "HINDSIGHT_BANK_ID_TEMPLATE",
   resolveWorktrees: "HINDSIGHT_RESOLVE_WORKTREES",
+  optInOnly: "HINDSIGHT_OPT_IN_ONLY",
+  optInPaths: "HINDSIGHT_OPT_IN_PATHS",
   harness: "HINDSIGHT_HARNESS",
   disabled: "HINDSIGHT_DISABLED",
   retainSessions: "HINDSIGHT_RETAIN_SESSIONS",
-  retainEveryTurns: "HINDSIGHT_RETAIN_EVERY_TURNS",
+  maxParallelRetains: "HINDSIGHT_MAX_PARALLEL_RETAINS",
   reflectTimeoutMs: "HINDSIGHT_REFLECT_TIMEOUT_MS",
   autoReflect: "HINDSIGHT_AUTO_REFLECT",
   pageRefreshEveryTurns: "HINDSIGHT_PAGE_REFRESH_EVERY_TURNS",
+  pageTriggerType: "HINDSIGHT_PAGE_TRIGGER_TYPE",
+  pageTriggerCron: "HINDSIGHT_PAGE_TRIGGER_CRON",
   autoSeed: "HINDSIGHT_AUTO_SEED",
   seedLimit: "HINDSIGHT_SEED_LIMIT",
   codebaseSurvey: "HINDSIGHT_CODEBASE_SURVEY",
@@ -284,6 +384,9 @@ const ENV_KEYS = {
   surveyRefreshCommits: "HINDSIGHT_SURVEY_REFRESH_COMMITS",
   logLevel: "HINDSIGHT_LOG_LEVEL",
   gitIngest: "HINDSIGHT_GIT_INGEST",
+  // Scalar modes only ("shared", "combined", "per_tag", "all_combinations"). An explicit scope
+  // list is a list OF lists, which does not survive flattening into one variable — file-only.
+  observationScopes: "HINDSIGHT_OBSERVATION_SCOPES",
   // Comma-separated, e.g. HINDSIGHT_RETAIN_TAGS="project:{gitProject},env:work". A LIST rather than
   // a map, so it flattens cleanly; its sibling retainMetadata stays file-only for the reason above.
   retainTags: "HINDSIGHT_RETAIN_TAGS",
@@ -293,17 +396,18 @@ const ENV_KEYS = {
 const ENV_BOOLEANS = new Set<keyof RawConfig>([
   "dynamicBankId",
   "resolveWorktrees",
+  "optInOnly",
   "disabled",
   "retainSessions",
   "autoReflect",
   "autoSeed",
   "codebaseSurvey",
 ]);
-const ENV_LISTS = new Set<keyof RawConfig>(["retainTags"]);
+const ENV_LISTS = new Set<keyof RawConfig>(["retainTags", "optInPaths"]);
 const ENV_NUMBERS = new Set<keyof RawConfig>([
   "apiPort",
   "daemonIdleTimeout",
-  "retainEveryTurns",
+  "maxParallelRetains",
   "reflectTimeoutMs",
   "pageRefreshEveryTurns",
   "seedLimit",
@@ -362,6 +466,10 @@ const BANK_OVERRIDE_EXCLUDED = [
   "mapPathToBank",
   "dynamicBankId",
   "resolveWorktrees",
+  // Approval is decided BEFORE the bank is resolved, so a `banks.<id>` section naming these could
+  // only ever arrive too late to matter — strip them rather than let them read as effective.
+  "optInOnly",
+  "optInPaths",
   "harness",
 ] as const;
 
@@ -370,7 +478,18 @@ const BANK_OVERRIDE_EXCLUDED = [
  * that runs AFTER bank resolution, giving per-repo opt-in/out (disable, retainSessions, gitIngest,
  * survey settings, ...) from the ONE global config file.
  */
-export function applyBankConfig(cfg: Config, resolvedId: string): { cfg: Config; bankId: string } {
+export function applyBankConfig(
+  cfg: Config,
+  resolvedId: string,
+  /** The directory the bank was resolved FROM. Supplying it enforces `optInOnly`; every entry
+   *  point already has it to hand, having just passed it to `deriveBankId`. */
+  directory?: string
+): { cfg: Config; bankId: string } {
+  // Rides the `disabled` gate every entry point already checks after bank resolution, rather than
+  // adding a second thing eight call sites must remember — and that gate is known to stop the run
+  // before anything creates a bank.
+  if (directory !== undefined && !isOptedIn(cfg, directory))
+    return { cfg: { ...cfg, disabled: true }, bankId: resolvedId };
   const section = cfg.banks[resolvedId];
   if (!section) return { cfg, bankId: resolvedId };
   const safe: Record<string, unknown> = { ...section };

@@ -6,13 +6,15 @@
  * creates knowledge pages. Nothing here knows about opencode/claude-code/etc.
  */
 import {
+  buildPageTrigger,
   CODING_BANK_STRUCTURE,
   CODING_BANK_TEMPLATE,
   PAGE_MAX_TOKENS,
-  PAGE_TRIGGER,
-  PAGES,
+  pagesFor,
+  type PageTrigger,
 } from "./missions";
-import { semverGte, sleep } from "./util";
+import { pool, semverGte, sleep } from "./util";
+import type { RetainStamp } from "./retain-stamp";
 
 /** One node of GET /knowledge-base/tree. Only the fields this client reads. */
 export interface KnowledgeNode {
@@ -24,11 +26,40 @@ export interface KnowledgeNode {
   children?: KnowledgeNode[];
 }
 
+/**
+ * How consolidation scopes the observations a retained memory feeds (`observation_scopes` on the
+ * retain API). The scalar modes are the server's; a `string[][]` declares the scopes explicitly.
+ */
+export type ObservationScopes = "shared" | "combined" | "per_tag" | "all_combinations" | string[][];
+
+/**
+ * One global scope for everything this plugin writes.
+ *
+ * The server default (`combined`) scopes an observation to the memory's WHOLE tag set, and every
+ * document we write carries provenance tags — `source:chat`, `harness:<id>`, `knowledge:<kind>`,
+ * anything from `retainTags`. That splits one repository's knowledge into a separate observation
+ * set per tag combination: work the same repo with two agents and the harness tag alone gives two
+ * parallel sets of beliefs that never merge, each blind to the other, at double the consolidation
+ * cost (#3564). Those tags are provenance — they say who wrote a memory, not which project the
+ * belief is about — so they belong on the facts (where they still filter recall) and not on the
+ * consolidation boundary. `shared` keeps them on the facts and consolidates into ONE untagged
+ * scope per bank, which is what a bank already is: one project's memory.
+ */
+export const DEFAULT_OBSERVATION_SCOPES: ObservationScopes = "shared";
+
 export interface ClientOpts {
   apiUrl: string;
   apiToken?: string;
   bank: string;
+  /** Repository this bank is about, named in every seeded page's query (`pageScopeRule`). Only
+   *  `seedPages()` reads it; it falls back to the bank id, which carries the repo name in the
+   *  default `coding-agent::{gitProject}` template. */
+  project?: string;
   log?: (msg: string) => void;
+  /** Cap on concurrent retain-related requests (drain op polls, deepen pools). Default 10. */
+  maxParallelRetains?: number;
+  /** Observation scoping for every retain this client sends. Default `DEFAULT_OBSERVATION_SCOPES`. */
+  observationScopes?: ObservationScopes;
 }
 
 export interface RetainOpts {
@@ -47,6 +78,31 @@ export interface RetainOpts {
  *  could be applied twice without us ever knowing. Hence: no idempotency, no append. */
 export const MIN_IDEMPOTENT_RETAIN_VERSION = "0.8.6";
 
+/**
+ * Raised when the API rate-limits a request (HTTP 429), carrying how long it asked us to wait.
+ *
+ * A plain Error would be indistinguishable from a 500 or a network fault, and those want opposite
+ * treatment: a rate limit is a "not now, ask again" that the caller can honour, while a server
+ * error is not worth hammering. Callers that have somewhere safe to wait retry; the rest fail as
+ * before.
+ */
+export class RateLimitedError extends Error {
+  readonly code = "rate_limited";
+  constructor(readonly retryAfterMs: number) {
+    super(`rate limited; retry after ${Math.round(retryAfterMs / 1000)}s`);
+    this.name = "RateLimitedError";
+  }
+}
+
+/** Parse a `Retry-After` header (delta-seconds or HTTP-date) into ms; 0 when absent or unusable. */
+export function retryAfterMs(header: string | null | undefined): number {
+  if (!header) return 0;
+  const secs = Number(header.trim());
+  if (Number.isFinite(secs) && secs >= 0) return secs * 1000;
+  const at = Date.parse(header);
+  return Number.isNaN(at) ? 0 : Math.max(0, at - Date.now());
+}
+
 /** Raised when the target server predates the knowledge-pages API surface. */
 export class KnowledgePagesUnavailableError extends Error {
   readonly code = "knowledge_pages_unavailable";
@@ -58,6 +114,26 @@ export class KnowledgePagesUnavailableError extends Error {
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "error"]);
 
+/** Default cap on concurrent retain-related requests; configurable via `maxParallelRetains`. */
+export const DEFAULT_MAX_PARALLEL_RETAINS = 10;
+
+/** How long drain() pauses between poll cycles when the API did not rate-limit (429). */
+const POLL_CYCLE_MS = 5000;
+
+/** Minimum backoff after a 429 that carried no (or a shorter) Retry-After. */
+const RETRY_AFTER_FLOOR_MS = 10 * 1000;
+
+/**
+ * Ceiling on a single backoff, however long `Retry-After` asks for.
+ *
+ * The header is a server's hint, not a budget we owe it: a large value (an incident, a
+ * misconfigured limiter, a proxy inventing one) would otherwise park a drain for as long as it
+ * says — up to the whole `maxMs`, with the background seed frozen behind it. Capping keeps the
+ * signal without handing over the schedule; if the limit still applies, the next poll simply gets
+ * another 429 and backs off again.
+ */
+const RETRY_AFTER_CEILING_MS = 60 * 1000;
+
 /** Bank-level missions the template seeds once and then leaves alone (#2492). */
 const MISSION_FIELDS = ["reflect_mission", "retain_mission", "observations_mission"] as const;
 
@@ -65,18 +141,24 @@ export class HindsightClient {
   readonly apiUrl: string;
   readonly apiToken?: string;
   readonly bank: string;
+  readonly project?: string;
   readonly opIds: string[] = []; // async operation ids collected by retain(), for drain()
   /** Tri-state capability probe: unknown until the first page request, then cached. */
   knowledgePagesSupported: boolean | undefined;
   /** Tri-state capability probe: unknown until the first append-mode retain, then cached. */
   private idempotentRetain: boolean | undefined;
   private readonly log: (msg: string) => void;
+  readonly maxParallelRetains: number;
+  readonly observationScopes: ObservationScopes;
 
   constructor(o: ClientOpts) {
     this.apiUrl = o.apiUrl.replace(/\/$/, "");
     this.apiToken = o.apiToken;
     this.bank = o.bank;
+    this.project = o.project;
     this.log = o.log ?? (() => {});
+    this.maxParallelRetains = o.maxParallelRetains || DEFAULT_MAX_PARALLEL_RETAINS;
+    this.observationScopes = o.observationScopes ?? DEFAULT_OBSERVATION_SCOPES;
   }
 
   private headers(): Record<string, string> {
@@ -104,6 +186,8 @@ export class HindsightClient {
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(15_000),
     });
+    if (r.status === 429 && !tolerate.includes(429))
+      throw new RateLimitedError(retryAfterMs(r.headers.get("retry-after")));
     if (!r.ok && r.status !== 404 && !tolerate.includes(r.status))
       throw new Error(`${method} ${url} -> ${r.status} ${await r.text()}`);
     return r;
@@ -125,6 +209,10 @@ export class HindsightClient {
       document_id: documentId,
       tags,
       strategy,
+      // Sent on EVERY retain, including the server default `combined`, so the scoping a bank's
+      // observations were built under is a property of the write rather than of whichever server
+      // version happened to process it. Servers older than 0.4.15 ignore the field.
+      observation_scopes: this.observationScopes,
     };
     if (opts.timestamp) item.timestamp = opts.timestamp;
     if (opts.metadata) item.metadata = opts.metadata;
@@ -194,7 +282,7 @@ export class HindsightClient {
    *  strategies, entity labels), then seed knowledge pages when the server supports them. Both
    *  halves are idempotent, so the deepen engine can re-run this every pass. Creates the bank if
    *  missing; legacy servers continue with the template-only path. */
-  async configureBank(opts: { reset?: boolean } = {}): Promise<void> {
+  async configureBank(opts: { reset?: boolean; pageTrigger?: PageTrigger } = {}): Promise<void> {
     if (opts.reset) {
       await this.req("DELETE", this.bankUrl());
       this.log(`[bank] reset ${this.bank}`);
@@ -213,7 +301,7 @@ export class HindsightClient {
         : `[bank] template applied to ${this.bank}: missions, entity_labels {knowledge}, ` +
             `strategies {git, gitlog, conversation, document}`
     );
-    await this.seedPages();
+    await this.seedPages(opts.pageTrigger);
   }
 
   /**
@@ -260,7 +348,14 @@ export class HindsightClient {
     }
   }
 
-  /** Poll each enqueued operation by id until terminal. LIST only shows active ops, so per-id GET is reliable. */
+  /**
+   * Poll each enqueued operation by id until terminal. LIST only shows active ops, so per-id GET is reliable.
+   *
+   * Concurrency is capped at `maxParallelRetains` (the API rate-limits bursts, not single
+   * requests — a 200 to a lone GET with 429s under `Promise.all` over every pending op). A 429
+   * leaves the op pending and backs the next cycle off by its `Retry-After` (10s floor) instead
+   * of hammering the next cycle 5s later.
+   */
   async drain(ids: string[], label: string, maxMs = 60 * 60 * 1000): Promise<void> {
     if (!ids.length) return;
     this.log(`[wait] draining ${ids.length} ${label} operations …`);
@@ -268,24 +363,32 @@ export class HindsightClient {
     const pending = new Set(ids);
     let failed = 0;
     while (pending.size && Date.now() - start < maxMs) {
-      await Promise.all(
-        [...pending].map(async (id) => {
-          try {
-            const r = await fetch(this.bankUrl(`/operations/${id}`), { headers: this.headers() });
-            if (!r.ok) return;
-            const st = (((await r.json()) as { status?: string }).status || "").toLowerCase();
-            if (TERMINAL.has(st)) {
-              pending.delete(id);
-              if (st !== "completed") failed++;
-            }
-          } catch {
-            /* transient — retry next cycle */
+      // Cycle backoff: default 5s; any 429 in the cycle raises it to the longest Retry-After seen
+      // (floor 10s) so a rate-limited API gets room to recover before the next poll round.
+      let backoffMs = POLL_CYCLE_MS;
+      await pool([...pending], this.maxParallelRetains, async (id) => {
+        try {
+          const r = await fetch(this.bankUrl(`/operations/${id}`), { headers: this.headers() });
+          if (r.status === 429) {
+            backoffMs = Math.min(
+              RETRY_AFTER_CEILING_MS,
+              Math.max(backoffMs, RETRY_AFTER_FLOOR_MS, retryAfterMs(r.headers.get("retry-after")))
+            );
+            return; // op stays pending — retried after the backoff
           }
-        })
-      );
+          if (!r.ok) return;
+          const st = (((await r.json()) as { status?: string }).status || "").toLowerCase();
+          if (TERMINAL.has(st)) {
+            pending.delete(id);
+            if (st !== "completed") failed++;
+          }
+        } catch {
+          /* transient — retry next cycle */
+        }
+      });
       if (pending.size) {
         this.log(`  … ${pending.size}/${ids.length} ${label} ops pending`);
-        await sleep(5000);
+        await sleep(backoffMs);
       }
     }
     this.log(
@@ -402,16 +505,18 @@ export class HindsightClient {
   }
 
   /**
-   * Seed the fixed `PAGES` taxonomy as knowledge-base pages at the tree root, idempotently.
+   * Seed the fixed page taxonomy as knowledge-base pages at the tree root, idempotently.
    *
    * Matched by NAME, not id: `/knowledge-base/pages` mints its own `kp-…` id, so a stable
    * client-chosen id isn't available to match on (unlike the old mental-model path, which keyed
    * off a slug). Names are unique per folder server-side, which makes them a sound key.
    *
    * An existing page is PATCHed rather than recreated so a plugin upgrade that rewords a
-   * `source_query` re-syncs onto the live page instead of orphaning its synthesized content.
+   * `source_query` re-syncs onto the live page instead of orphaning its synthesized content —
+   * which is how `pageScopeRule`'s repo name reaches banks seeded by an earlier version.
    */
-  async seedPages(): Promise<void> {
+  async seedPages(pageTrigger: PageTrigger = buildPageTrigger()): Promise<void> {
+    const pages = pagesFor(this.project ?? this.bank);
     const existing = new Map<string, KnowledgeNode>();
     let roots: KnowledgeNode[];
     try {
@@ -428,14 +533,14 @@ export class HindsightClient {
     }
     let created = 0;
     let updated = 0;
-    for (const page of PAGES) {
+    for (const page of pages) {
       const hit = existing.get(page.name.toLowerCase());
       const body = {
         name: page.name,
         source_query: page.source_query,
         tags: page.tags,
         max_tokens: PAGE_MAX_TOKENS,
-        trigger: PAGE_TRIGGER,
+        trigger: pageTrigger,
       };
       if (!hit) {
         // 409 = another deepen run seeded this name between our tree read and this POST. That is
@@ -468,7 +573,7 @@ export class HindsightClient {
     }
     this.log(
       `[bank] knowledge pages seeded on ${this.bank}: ${created} created, ${updated} re-synced, ` +
-        `${PAGES.length - created - updated} unchanged`
+        `${pages.length - created - updated} unchanged`
     );
   }
 
@@ -492,6 +597,10 @@ export class HindsightClient {
     title: string;
     summary: string;
     relatesToPageId?: string;
+    stamp?: RetainStamp;
+    /** Same refresh policy as the seeded pages — an initiative page is one of them, and used to
+     *  carry its own hardcoded copy of this trigger. */
+    pageTrigger?: PageTrigger;
   }): Promise<{ page_id: string }> {
     // `/knowledge-base/pages` mints its OWN page id (kp-…); we can't set it. So for a new initiative
     // we create the page first and adopt the server-assigned id — that id is what the return value
@@ -505,10 +614,7 @@ export class HindsightClient {
         source_query: `Summarize the "${args.title}" initiative: what is being built or changed and why, and its current state — drawn from the project's memory.`,
         parent_id: folderId,
         tags: ["knowledge:feature-work"],
-        trigger: {
-          fact_types: ["world", "experience", "observation"],
-          refresh_after_consolidation: true,
-        },
+        trigger: args.pageTrigger ?? buildPageTrigger(),
       });
       try {
         const j = (await r.json()) as { page_id?: string; id?: string };
@@ -522,13 +628,20 @@ export class HindsightClient {
     const content = `${verb}: ${args.title}. ${args.summary}`;
     // Unique marker document id (NOT pageId) so repeated captures accrue instead of replacing.
     const markerId = `initiative-marker-${this.slugify(args.title)}-${Date.now()}`;
-    await this.retain(
-      content,
-      "initiative marker",
-      markerId,
-      ["knowledge:feature-work", `relatedPageId:${pageId}`],
-      "document"
-    );
+    const tags = [
+      ...new Set([
+        ...(args.stamp?.tags ?? []),
+        "knowledge:feature-work",
+        `relatedPageId:${pageId}`,
+      ]),
+    ];
+    if (Object.keys(args.stamp?.metadata ?? {}).length) {
+      await this.retain(content, "initiative marker", markerId, tags, "document", {
+        metadata: args.stamp?.metadata,
+      });
+    } else {
+      await this.retain(content, "initiative marker", markerId, tags, "document");
+    }
     return { page_id: pageId };
   }
 

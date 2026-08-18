@@ -80,6 +80,35 @@ describe("loadConfig layering", () => {
   });
 });
 
+describe("maxParallelRetains", () => {
+  it("defaults to 10 when unset", () => {
+    expect(loadConfig({ harness: "claude-code" }).maxParallelRetains).toBe(10);
+  });
+
+  it("config file value wins over the default", () => {
+    writeJson(globalCfg, { maxParallelRetains: 3 });
+    expect(loadConfig({ path: globalCfg }).maxParallelRetains).toBe(3);
+  });
+
+  const ENV = { ...process.env };
+  afterEach(() => {
+    process.env = { ...ENV };
+  });
+
+  it("reads HINDSIGHT_MAX_PARALLEL_RETAINS as a number", () => {
+    writeJson(globalCfg, {});
+    process.env.HINDSIGHT_MAX_PARALLEL_RETAINS = "6";
+    expect(loadConfig({ path: globalCfg }).maxParallelRetains).toBe(6);
+  });
+
+  it("ignores a malformed env value and falls back to the default", () => {
+    writeJson(globalCfg, {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    process.env.HINDSIGHT_MAX_PARALLEL_RETAINS = "lots";
+    expect(loadConfig({ path: globalCfg }).maxParallelRetains).toBe(10);
+  });
+});
+
 // A project-local .hindsight/coding-agent.json comes from the (untrusted) opened repo. It must not be
 // able to redirect the API endpoint/token or the global bank map — otherwise a malicious repo could
 // exfiltrate the user's token + prompts to its own server just by being opened.
@@ -188,11 +217,11 @@ describe("environment fallback", () => {
     writeJson(globalCfg, {});
     process.env.HINDSIGHT_AUTO_REFLECT = "false";
     process.env.HINDSIGHT_DISABLED = "1";
-    process.env.HINDSIGHT_RETAIN_EVERY_TURNS = "5";
+    process.env.HINDSIGHT_SEED_LIMIT = "5";
     const cfg = loadConfig({ path: globalCfg });
     expect(cfg.autoReflect).toBe(false);
     expect(cfg.disabled).toBe(true);
-    expect(cfg.retainEveryTurns).toBe(5);
+    expect(cfg.seedLimit).toBe(5);
   });
 
   it("ignores a malformed number instead of resolving it to NaN", () => {
@@ -259,5 +288,52 @@ describe("HINDSIGHT_RETAIN_TAGS", () => {
 
   it("has no retainMetadata counterpart — map-valued settings stay file-only", () => {
     expect(readEnvConfig({ HINDSIGHT_RETAIN_METADATA: "repo=x" }).retainMetadata).toBeUndefined();
+  });
+});
+
+describe("observationScopes", () => {
+  it("defaults to one global scope per bank, so two agents on one repo share its beliefs (#3564)", () => {
+    expect(loadConfig({ path: join(root, "nope.json") }).observationScopes).toBe("shared");
+  });
+
+  it("takes any of the server's scalar modes verbatim", () => {
+    for (const mode of ["shared", "combined", "per_tag", "all_combinations"] as const) {
+      writeJson(globalCfg, { observationScopes: mode });
+      expect(loadConfig({ path: globalCfg }).observationScopes).toBe(mode);
+    }
+  });
+
+  it("takes an explicit scope list, dropping non-string entries", () => {
+    expect(
+      resolveConfig({ observationScopes: [["project:demo"], ["team:eng", "x"]] }).observationScopes
+    ).toEqual([["project:demo"], ["team:eng", "x"]]);
+    expect(
+      resolveConfig({ observationScopes: [["a", 7, ""], "nope"] as never }).observationScopes
+    ).toEqual([["a"]]);
+  });
+
+  it("falls back to the default on an unusable value rather than sending it to the API", () => {
+    // `[]` in particular: the API reads zero scopes as no spec and silently applies `combined`,
+    // which is the opposite of what writing the field was meant to say.
+    expect(resolveConfig({ observationScopes: [] }).observationScopes).toBe("shared");
+    expect(resolveConfig({ observationScopes: "per-tag" as never }).observationScopes).toBe(
+      "shared"
+    );
+    expect(resolveConfig({ observationScopes: 3 as never }).observationScopes).toBe("shared");
+  });
+
+  it("is overridable per bank, since whether agents should share beliefs is a per-repo call", () => {
+    const cfg = resolveConfig({
+      banks: { "coding-agent::mono": { observationScopes: "combined" } },
+    });
+    expect(applyBankConfig(cfg, "coding-agent::mono").cfg.observationScopes).toBe("combined");
+    expect(applyBankConfig(cfg, "coding-agent::other").cfg.observationScopes).toBe("shared");
+  });
+
+  it("reads HINDSIGHT_OBSERVATION_SCOPES for the scalar modes; a scope LIST stays file-only", () => {
+    expect(readEnvConfig({ HINDSIGHT_OBSERVATION_SCOPES: "per_tag" }).observationScopes).toBe(
+      "per_tag"
+    );
+    expect(readEnvConfig({}).observationScopes).toBeUndefined();
   });
 });
