@@ -28,6 +28,7 @@ from hindsight_api.engine.reflect.delta_ops import (
     RenameSectionOp,
     ReplaceBlockOp,
     ReplaceSectionBlocksOp,
+    _block_content_text,
     apply_operations,
     serialize_document_for_delta_prompt,
 )
@@ -408,6 +409,50 @@ class TestApplyOperations:
         assert isinstance(cadence.blocks[0], ParagraphBlock)
         assert cadence.blocks[0].text.endswith("10am.")
 
+    def test_replace_table_block_anchor_uses_cell_text(self):
+        doc = StructuredDocument(
+            sections=[
+                Section(
+                    id="layers",
+                    heading="Layers",
+                    blocks=[
+                        TableBlock(headers=["Layer", "Role"], rows=[["API", "HTTP"], ["Engine", "Memory"]]),
+                    ],
+                )
+            ]
+        )
+        op = ReplaceBlockOp(
+            section_id="layers",
+            index=0,
+            anchor="Layer Role API HTTP",
+            block=ParagraphBlock(text="replaced"),
+        )
+        result = apply_operations(doc, [op])
+        assert result.applied
+        assert isinstance(result.document.section_by_id("layers").blocks[0], ParagraphBlock)
+
+    def test_table_block_wrong_anchor_is_skipped_not_raised(self):
+        """A table used to raise TypeError in _block_content_text and abort the refresh."""
+        doc = StructuredDocument(
+            sections=[
+                Section(
+                    id="layers",
+                    heading="Layers",
+                    blocks=[TableBlock(headers=["Layer", "Role"], rows=[["API", "HTTP"]])],
+                )
+            ]
+        )
+        op = ReplaceBlockOp(
+            section_id="layers",
+            index=0,
+            anchor="this text is not in the table",
+            block=ParagraphBlock(text="x"),
+        )
+        result = apply_operations(doc, [op])
+        assert result.applied == []
+        assert "anchor" in result.skipped[0]["reason"]
+        assert isinstance(result.document.section_by_id("layers").blocks[0], TableBlock)
+
     def test_replace_block_missing_anchor_skipped(self):
         doc = _team_overview_doc()
         op = ReplaceBlockOp(section_id="cadence", index=0, block=ParagraphBlock(text="new text"))
@@ -614,6 +659,28 @@ class TestSerializeDocumentForDeltaPrompt:
         annotated_payload = json.loads(serialize_document_for_delta_prompt(doc))
         with pytest.raises(Exception):  # pydantic ValidationError
             StructuredDocument.model_validate(annotated_payload)
+
+
+class TestBlockContentText:
+    """Anchor extraction must tolerate every block type, including ones the
+    union grew after the first delta-ops commit, and must never raise."""
+
+    def test_table_joins_headers_and_rows(self):
+        text = _block_content_text(TableBlock(headers=["Layer", "Role"], rows=[["API", "HTTP"], ["Engine", "Memory"]]))
+        assert text == "Layer Role API HTTP Engine Memory"
+
+    def test_unknown_block_with_table_shape_does_not_raise(self):
+        class _FutureTable:
+            headers = ["a"]
+            rows = [["b", "c"]]
+
+        assert _block_content_text(_FutureTable()) == "a b c"
+
+    def test_opaque_unknown_block_is_empty_not_raised(self):
+        class _Opaque:
+            pass
+
+        assert _block_content_text(_Opaque()) == ""
 
 
 class TestDeltaOperationListSchema:

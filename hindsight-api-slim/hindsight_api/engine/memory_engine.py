@@ -354,16 +354,30 @@ class RetainOperationConflictError(ValueError):
     """
 
 
+# refresh_skipped reasons that will fail identically on a worker retry of the
+# same payload (temperature 0, same document, same rejected ops). Transient
+# LLM/provider failures stay retryable.
+_NON_RETRYABLE_REFRESH_SKIP_REASONS = frozenset({"delta_ops_all_skipped"})
+
+
 class MentalModelRefreshError(Exception):
     """Raised when refresh_mental_model cannot produce new content.
 
     The previous content (if any) is preserved in the DB and the reflect_response
     audit trail is persisted before this is raised, so the failure is recoverable
     and auditable. Callers (worker queue, integration tests) should treat this
-    as a retryable condition.
+    as a retryable condition unless ``retryable`` is False.
+
+    ``retryable`` is False for deterministic skips (currently
+    ``delta_ops_all_skipped``): the same document and the same rejected ops
+    will fail identically on a worker retry, so retrying only burns a slot.
+    The next consolidation- or cron-triggered refresh still re-reads the
+    unadvanced watermark.
     """
 
-    pass
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def validate_sql_schema(sql: str) -> None:
@@ -991,6 +1005,7 @@ def _is_non_retryable_task_error(e: Exception) -> bool:
         isinstance(e, asyncpg.exceptions.IntegrityConstraintViolationError)
         or _is_oracledb_integrity_error(e)
         or _is_invalid_embedding_dimension_error(e)
+        or (isinstance(e, MentalModelRefreshError) and not e.retryable)
     )
 
 
@@ -14035,6 +14050,11 @@ class MemoryEngine(MemoryEngineInterface):
                 this run failed on, and leaving ``last_refreshed_at`` where it was,
                 because no refresh finished. Then raise, because a caller that is
                 told nothing assumes the document was refreshed.
+
+                Deterministic skips (``delta_ops_all_skipped``) set
+                ``retryable=False`` so the worker marks the op failed instead of
+                re-running the same rejected ops. The watermark is still
+                unadvanced, so the next scheduled refresh re-reads the window.
                 """
                 logger.warning(f"[MENTAL_MODELS] Refresh for {mental_model_id} failed ({reason}); {detail}")
                 reflect_response_payload["refresh_skipped"] = reason
@@ -14047,7 +14067,8 @@ class MemoryEngine(MemoryEngineInterface):
                 )
                 raise MentalModelRefreshError(
                     f"Refresh failed for mental_model_id={mental_model_id}: {detail} "
-                    f"Previous content preserved in DB; reflect_response.refresh_skipped == '{reason}' for audit."
+                    f"Previous content preserved in DB; reflect_response.refresh_skipped == '{reason}' for audit.",
+                    retryable=reason not in _NON_RETRYABLE_REFRESH_SKIP_REASONS,
                 )
 
             if run.outcome == "refresh_failed_empty_candidate":
