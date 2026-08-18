@@ -49,6 +49,8 @@ export interface KnowledgeNode {
   tags: string[];
   timestamp: string | null;
   is_stale: boolean | null;
+  /** Pages only: when the page rebuilds itself and over which facts. Null on folders. */
+  trigger: MentalModel["trigger"] | null;
   children: KnowledgeNode[];
 }
 
@@ -215,6 +217,8 @@ export interface MentalModel {
     keep_trace?: boolean;
   };
   last_refreshed_at: string;
+  /** Newest in-scope memory this model has seen. Staleness compares against this. */
+  last_memory_seen_at: string | null;
   created_at: string;
   reflect_response?: any;
   is_stale?: boolean | null;
@@ -824,6 +828,15 @@ export class ControlPlaneClient {
       source_query?: string;
       tags?: string[];
       max_tokens?: number;
+      /** Refresh settings to change. Applied as a patch: the fields sent are updated and the
+       *  rest keep the page's current values, so setting a schedule doesn't reset the rest. */
+      trigger?: {
+        mode?: "full" | "delta";
+        refresh_after_consolidation?: boolean;
+        refresh_cron?: string | null;
+        fact_types?: Array<"world" | "experience" | "observation">;
+        exclude_mental_models?: boolean;
+      };
     }
   ) {
     return this.fetchApi<KnowledgeNode>(
@@ -1178,13 +1191,24 @@ export class ControlPlaneClient {
   /**
    * List directives for a bank
    */
-  async listDirectives(bankId: string, tags?: string[], tagsMatch?: string) {
+  async listDirectives(
+    bankId: string,
+    tags?: string[],
+    tagsMatch?: string,
+    options: { limit?: number; offset?: number } = {}
+  ) {
     const params = new URLSearchParams();
     if (tags && tags.length > 0) {
       tags.forEach((t) => params.append("tags", t));
     }
     if (tagsMatch) {
       params.append("tags_match", tagsMatch);
+    }
+    if (options.limit !== undefined) {
+      params.append("limit", String(options.limit));
+    }
+    if (options.offset !== undefined) {
+      params.append("offset", String(options.offset));
     }
     const query = params.toString();
     return this.fetchApi<{
@@ -1199,7 +1223,25 @@ export class ControlPlaneClient {
         created_at: string;
         updated_at: string;
       }>;
+      /** Every directive matching the filter, not just this page. */
+      total: number;
+      limit: number;
+      offset: number;
     }>(bankApi(bankId, `/directives${query ? `?${query}` : ""}`));
+  }
+
+  /**
+   * List every directive for a bank, paging until `total` is reached.
+   */
+  async listAllDirectives(bankId: string, tags?: string[], tagsMatch?: string) {
+    const PAGE_SIZE = 1000;
+    const items: Awaited<ReturnType<typeof this.listDirectives>>["items"] = [];
+    for (let offset = 0; ; offset += PAGE_SIZE) {
+      const page = await this.listDirectives(bankId, tags, tagsMatch, { limit: PAGE_SIZE, offset });
+      items.push(...(page.items || []));
+      if (items.length >= page.total || !page.items?.length) break;
+    }
+    return items;
   }
 
   /**
@@ -1463,13 +1505,38 @@ export class ControlPlaneClient {
           keep_trace?: boolean;
         };
         last_refreshed_at: string;
+        last_memory_seen_at: string | null;
         created_at: string;
         reflect_response?: {
           text: string;
           based_on: Record<string, Array<{ id: string; text: string; type: string }>>;
         };
       }>;
+      /** Every mental model matching the filter, not just this page. */
+      total: number;
+      limit: number;
+      offset: number;
     }>(bankApi(bankId, `/mental-models${query ? `?${query}` : ""}`));
+  }
+
+  /**
+   * List every mental model for a bank, paging until `total` is reached.
+   *
+   * The endpoint caps a response at 1000 models, so anything that needs the
+   * whole set (the list view, the freshness card) has to page.
+   */
+  async listAllMentalModels(
+    bankId: string,
+    options: { tags?: string[]; tagsMatch?: string; detail?: "metadata" | "content" | "full" } = {}
+  ) {
+    const PAGE_SIZE = 1000;
+    const items: Awaited<ReturnType<typeof this.listMentalModels>>["items"] = [];
+    for (let offset = 0; ; offset += PAGE_SIZE) {
+      const page = await this.listMentalModels(bankId, { ...options, limit: PAGE_SIZE, offset });
+      items.push(...(page.items || []));
+      if (items.length >= page.total || !page.items?.length) break;
+    }
+    return items;
   }
 
   /**
@@ -1572,6 +1639,7 @@ export class ControlPlaneClient {
         keep_trace?: boolean;
       };
       last_refreshed_at: string;
+      last_memory_seen_at: string | null;
       created_at: string;
       reflect_response?: {
         text: string;
