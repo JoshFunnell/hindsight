@@ -491,7 +491,7 @@ class TestDryRunReportsRetrievalHealth:
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
-    async def test_empty_fresh_retrieval_over_real_content_fails(
+    async def test_retrieval_empty_over_real_content_fails(
         self, memory: MemoryEngine, request_context: RequestContext, patch_reflect
     ):
         """A generic non-empty render with no facts this run must not clobber."""
@@ -511,7 +511,38 @@ class TestDryRunReportsRetrievalHealth:
         assert result.outcome == "refresh_failed_empty_candidate"
         assert result.would_persist is False
         assert result.preview_content == "# Team\n\nStill here."
-        assert any("empty_fresh_retrieval" in w for w in result.warnings)
+        assert any("retrieval_empty" in w for w in result.warnings)
+        assert not any("no_grounded_facts" in w for w in result.warnings)
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_no_grounded_facts_with_nonzero_retrieval_over_real_content_fails(
+        self, memory: MemoryEngine, request_context: RequestContext, patch_reflect
+    ):
+        """Recall can return facts while based_on is empty; still refuse, name the state."""
+        bank_id = await _make_bank(memory, request_context, "test-dryrun-ungrounded")
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Team Info",
+            source_query="Tell me about the team",
+            content="# Team\n\nStill here.",
+            trigger={"mode": "full"},
+            request_context=request_context,
+        )
+
+        patch_reflect(
+            memory,
+            text="# Team\n\nNothing relevant was found.",
+            facts=[],
+            retrieved=[{"id": "f1", "text": "off topic", "fact_type": "observation"}],
+        )
+        result = await memory.dry_run_refresh_mental_model(bank_id, mm["id"], request_context=request_context)
+
+        assert result.outcome == "refresh_failed_empty_candidate"
+        assert result.would_persist is False
+        assert result.preview_content == "# Team\n\nStill here."
+        assert any("no_grounded_facts" in w for w in result.warnings)
+        assert not any("retrieval_empty" in w for w in result.warnings)
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
