@@ -311,6 +311,26 @@ class _LlmProbeOutcome:
     latency_ms: float | None
 
 
+@dataclass(frozen=True)
+class MentalModelPage:
+    """One page of mental models plus the number of models the filter matches.
+
+    ``total`` counts every match, not the page — callers page until they have it
+    (the list endpoints for documents, memories and tags return the same shape).
+    """
+
+    items: list[dict[str, Any]]
+    total: int
+
+
+@dataclass(frozen=True)
+class DirectivePage:
+    """One page of directives plus the number of directives the filter matches."""
+
+    items: list[dict[str, Any]]
+    total: int
+
+
 def _consolidation_retry_backoff_seconds(retry_count: int) -> int:
     """Capped exponential backoff: 5, 10, 20, 40, 80, 160, 320, 640, 1280, 1800, 1800, …"""
     return min(
@@ -334,16 +354,30 @@ class RetainOperationConflictError(ValueError):
     """
 
 
+# refresh_skipped reasons that will fail identically on a worker retry of the
+# same payload (temperature 0, same document, same rejected ops). Transient
+# LLM/provider failures stay retryable.
+_NON_RETRYABLE_REFRESH_SKIP_REASONS = frozenset({"delta_ops_all_skipped"})
+
+
 class MentalModelRefreshError(Exception):
     """Raised when refresh_mental_model cannot produce new content.
 
     The previous content (if any) is preserved in the DB and the reflect_response
     audit trail is persisted before this is raised, so the failure is recoverable
     and auditable. Callers (worker queue, integration tests) should treat this
-    as a retryable condition.
+    as a retryable condition unless ``retryable`` is False.
+
+    ``retryable`` is False for deterministic skips (currently
+    ``delta_ops_all_skipped``): the same document and the same rejected ops
+    will fail identically on a worker retry, so retrying only burns a slot.
+    The next consolidation- or cron-triggered refresh still re-reads the
+    unadvanced watermark.
     """
 
-    pass
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def validate_sql_schema(sql: str) -> None:
@@ -971,6 +1005,7 @@ def _is_non_retryable_task_error(e: Exception) -> bool:
         isinstance(e, asyncpg.exceptions.IntegrityConstraintViolationError)
         or _is_oracledb_integrity_error(e)
         or _is_invalid_embedding_dimension_error(e)
+        or (isinstance(e, MentalModelRefreshError) and not e.retryable)
     )
 
 
@@ -2394,21 +2429,34 @@ class MemoryEngine(MemoryEngineInterface):
         except Exception:
             logger.warning("Failed to delete export archive %s", storage_key, exc_info=True)
 
-    async def purge_expired_export_archives(self, conn: Any, table: str, cutoff: Any) -> int:
+    async def purge_expired_export_archives(self, conn: Any, table: str, cutoff: Any, *, batch_size: int) -> int:
         """Delete stored archives of export operations retention is about to prune.
 
         Mirrors ``prune_terminal_operations``' predicate (terminal status +
-        ``updated_at < cutoff``) so an export's archive is removed in step with its
-        operation row, instead of being orphaned in file storage when the row is
-        pruned. Called by the maintenance sweep before the row prune, on the same
-        (schema-scoped) connection. Returns the number of archives deleted.
+        ``updated_at < cutoff``), ordering and batch bound, so an export's archive
+        is removed in step with its operation row instead of being orphaned in file
+        storage when the row is pruned. Called by the maintenance sweep before the
+        row prune, on the same (schema-scoped) connection. Returns the number of
+        archives deleted.
+
+        The bound is what keeps this proportionate. The prune deletes at most
+        ``batch_size`` rows per run, but an unbounded purge re-selects *every*
+        expired export on every run and re-issues a file-storage delete for each —
+        ``storage_key`` stays in ``result_metadata`` until the row itself is pruned,
+        so there is nothing to mark the blob as already gone. With a backlog that
+        is one redundant round-trip to the blob store per expired export per cycle,
+        per process. Sharing the prune's ``ORDER BY updated_at, operation_id``
+        window makes the two advance together instead.
         """
         rows = await conn.fetch(
             f"""SELECT result_metadata FROM {table}
                 WHERE operation_type = 'export_documents'
                   AND status IN ('completed', 'failed', 'cancelled')
-                  AND updated_at < $1""",
+                  AND updated_at < $1
+                ORDER BY updated_at, operation_id
+                LIMIT $2""",
             cutoff,
+            batch_size,
         )
         purged = 0
         for row in rows:
@@ -5652,6 +5700,11 @@ class MemoryEngine(MemoryEngineInterface):
                              This handles varying chunk sizes across documents.
             tags: Optional list of tags for visibility filtering (OR matching - returns
                   memories that have at least one matching tag)
+            created_after: Lower bound on the window, exclusive. Despite the name it bounds
+                  ``updated_at``, not ``created_at``: the window is "memories that changed in
+                  it", so an edited memory re-enters it. That is what the mental-model delta
+                  refresh chases from its watermark (see META_UPDATED_AT in memories/base.py).
+            created_before: Upper bound on the same window, exclusive.
 
         Returns:
             RecallResultModel containing:
@@ -5958,6 +6011,9 @@ class MemoryEngine(MemoryEngineInterface):
     ) -> RecallResultModel:
         """
         Search implementation with modular retrieval and reranking.
+
+        ``created_after`` / ``created_before`` bound ``updated_at``, not ``created_at`` —
+        see the note on :meth:`recall`.
 
         Architecture:
         1. Retrieval: 4-way parallel (semantic, keyword, graph, temporal graph)
@@ -7660,7 +7716,8 @@ class MemoryEngine(MemoryEngineInterface):
                     unit_ids = [str(row["id"]) for row in unit_rows]
 
                     await conn.execute(
-                        f"UPDATE {fq_table('memory_units')} SET tags = $1 WHERE document_id = $2 AND bank_id = $3",
+                        f"UPDATE {fq_table('memory_units')} SET tags = $1, updated_at = now() "
+                        f"WHERE document_id = $2 AND bank_id = $3",
                         tags,
                         document_id,
                         bank_id,
@@ -7715,6 +7772,9 @@ class MemoryEngine(MemoryEngineInterface):
                                 f"DELETE FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[])",
                                 obs_ids,
                             )
+                            # Requeue the sources: bookkeeping only, so `updated_at`
+                            # stays put (see META_UPDATED_AT). The tag change above is
+                            # what stamped these rows.
                             await conn.execute(
                                 f"""
                                 UPDATE {fq_table("memory_units")}
@@ -8379,7 +8439,8 @@ class MemoryEngine(MemoryEngineInterface):
                         bank_id,
                     )
 
-                    # Reset consolidated_at on source memories so they get re-consolidated
+                    # Reset consolidated_at on source memories so they get re-consolidated.
+                    # Bookkeeping only: `updated_at` stays put (see META_UPDATED_AT).
                     await conn.execute(
                         f"UPDATE {fq_table('memory_units')} SET consolidated_at = NULL WHERE bank_id = $1 AND fact_type IN ('experience', 'world')",
                         bank_id,
@@ -8509,6 +8570,7 @@ class MemoryEngine(MemoryEngineInterface):
                     """,
                     bank_id,
                 )
+                # Bookkeeping only: `updated_at` stays put (see META_UPDATED_AT).
                 await conn.execute(
                     f"""
                     UPDATE {fq_table("memory_units")}
@@ -8574,7 +8636,8 @@ class MemoryEngine(MemoryEngineInterface):
                 deleted_count = await self._delete_stale_observations_for_memories(conn, bank_id, [memory_id])
 
                 # Also reset this memory's own consolidated_at so it gets re-consolidated
-                # (the memory was a source for the deleted observations, so it needs new ones)
+                # (the memory was a source for the deleted observations, so it needs new ones).
+                # Bookkeeping only: `updated_at` stays put (see META_UPDATED_AT).
                 if deleted_count > 0:
                     from .memories import get_memories
 
@@ -11598,7 +11661,7 @@ class MemoryEngine(MemoryEngineInterface):
                 request_context=request_context,
                 isolation_mode=True,
             )
-        directives = directives_raw
+        directives = directives_raw.items
         if directives:
             logger.info(f"[REFLECT {reflect_id}] Loaded {len(directives)} directives")
 
@@ -11796,7 +11859,7 @@ class MemoryEngine(MemoryEngineInterface):
 
             # Add directives to based_on["directives"]
             # Store raw directive dicts (with id, name, content) for http.py to convert to ReflectDirective
-            for directive_raw in directives_raw:
+            for directive_raw in directives:
                 based_on["directives"].append(
                     {
                         "id": directive_raw["id"],
@@ -12621,10 +12684,10 @@ class MemoryEngine(MemoryEngineInterface):
         tags: list[str] | None = None,
         tags_match: str = "any",
         detail: str = "full",
-        limit: int = 100,
+        limit: int | None = 100,
         offset: int = 0,
         request_context: "RequestContext",
-    ) -> list[dict[str, Any]]:
+    ) -> MentalModelPage:
         """List pinned mental models for a bank.
 
         Args:
@@ -12632,12 +12695,15 @@ class MemoryEngine(MemoryEngineInterface):
             tags: Optional tags to filter by
             tags_match: How to match tags - 'any', 'all', or 'exact'
             detail: Detail level - 'metadata', 'content', or 'full'
-            limit: Maximum number of results
+            limit: Maximum number of results, or None for every match. The HTTP
+                endpoint always caps it; None is for internal callers that must
+                see the whole set (bank-template export/import), which used to
+                silently take the first page and treat the rest as absent.
             offset: Offset for pagination
             request_context: Request context for authentication
 
         Returns:
-            List of pinned mental model dicts
+            The requested page and the total number of matching models
         """
         await self._authenticate_tenant(request_context)
         if self._operation_validator:
@@ -12652,30 +12718,55 @@ class MemoryEngine(MemoryEngineInterface):
         async with acquire_with_retry(backend) as conn:
             # Build tag filter
             tag_filter = ""
-            params: list[Any] = [bank_id, limit, offset]
+            filter_params: list[Any] = [bank_id]
             if tags:
                 if tags_match == "all":
-                    tag_filter = " AND tags @> $4::varchar[]"
+                    tag_filter = " AND tags @> $2::varchar[]"
                 elif tags_match == "exact":
-                    tag_filter = " AND tags = $4::varchar[]"
+                    tag_filter = " AND tags = $2::varchar[]"
                 else:  # any
-                    tag_filter = " AND tags && $4::varchar[]"
-                params.append(tags)
+                    tag_filter = " AND tags && $2::varchar[]"
+                filter_params.append(tags)
 
+            total = await conn.fetchval(
+                f"""
+                SELECT COUNT(*)
+                FROM {fq_table("mental_models")}
+                WHERE bank_id = $1 {tag_filter}
+                """,
+                *filter_params,
+            )
+
+            page_params = list(filter_params)
+            pagination = ""
+            if limit is not None:
+                pagination = f"LIMIT ${len(page_params) + 1} OFFSET ${len(page_params) + 2}"
+                page_params.extend([limit, offset])
+            elif offset:
+                pagination = f"OFFSET ${len(page_params) + 1}"
+                page_params.append(offset)
+
+            # Tie-break on id: last_refreshed_at is not unique (a bank-template
+            # import stamps a whole batch at once), and rows that tie can swap
+            # order between two queries, so a paging caller would see one model
+            # twice and never see another.
             rows = await conn.fetch(
                 f"""
                 SELECT id, bank_id, name, source_query, content, tags,
-                       last_refreshed_at, created_at, reflect_response,
+                       last_refreshed_at, last_memory_seen_at, created_at, reflect_response,
                        max_tokens, trigger, structured_content
                 FROM {fq_table("mental_models")}
                 WHERE bank_id = $1 {tag_filter}
-                ORDER BY last_refreshed_at DESC
-                LIMIT $2 OFFSET $3
+                ORDER BY last_refreshed_at DESC, id DESC
+                {pagination}
                 """,
-                *params,
+                *page_params,
             )
 
-            return [self._row_to_mental_model(row, detail=detail) for row in rows]
+            return MentalModelPage(
+                items=[self._row_to_mental_model(row, detail=detail) for row in rows],
+                total=int(total or 0),
+            )
 
     async def get_mental_model(
         self,
@@ -12721,7 +12812,7 @@ class MemoryEngine(MemoryEngineInterface):
             row = await conn.fetchrow(
                 f"""
                 SELECT id, bank_id, name, source_query, content, tags,
-                       last_refreshed_at, created_at, reflect_response,
+                       last_refreshed_at, last_memory_seen_at, created_at, reflect_response,
                        max_tokens, trigger, structured_content
                 FROM {fq_table("mental_models")}
                 WHERE bank_id = $1 AND id = $2
@@ -12839,7 +12930,7 @@ class MemoryEngine(MemoryEngineInterface):
             (id, bank_id, subtype, name, description, source_query, content, embedding, tags, max_tokens, trigger{sv_col})
             VALUES ($1, $2, 'pinned', $3, ' ', $4, $5, $6, $7, COALESCE($8, 2048), COALESCE($9, '{{"refresh_after_consolidation": false}}'::jsonb){sv_val})
             RETURNING id, bank_id, name, source_query, content, tags,
-                      last_refreshed_at, created_at, reflect_response,
+                      last_refreshed_at, last_memory_seen_at, created_at, reflect_response,
                       max_tokens, trigger, structured_content
             """,
             mental_model_id,
@@ -12965,11 +13056,13 @@ class MemoryEngine(MemoryEngineInterface):
         refresh_cutoff: datetime,
     ) -> datetime | None:
         """Watermark to persist after a refresh: the newest in-scope memory visible at
-        the snapshot, clamped so it never regresses below the current ``last_refreshed_at``.
+        the snapshot, clamped so it never regresses below the model's current
+        ``last_memory_seen_at`` (falling back to ``last_refreshed_at`` for a row no
+        refresh has stamped since the migration backfill).
 
         A still-uncommitted straddling row is excluded from this max, so when it commits
         it stays newer than the watermark and is caught next time. Returns ``None`` when
-        no in-scope memory is visible (leave ``last_refreshed_at`` untouched, so an
+        no in-scope memory is visible (leave ``last_memory_seen_at`` untouched, so an
         in-flight first row is not skipped). Kept as its own method — like
         ``_mental_model_refresh_cutoff`` — so mock unit tests of the refresh wiring can
         stub it instead of reaching a real pool.
@@ -12979,8 +13072,9 @@ class MemoryEngine(MemoryEngineInterface):
         watermark_params = [*scope_filter.params, refresh_cutoff]
         watermark_where = [*scope_filter.where, f"updated_at <= ${len(watermark_params)}"]
         async with acquire_with_retry(backend) as conn:
-            current_last_refreshed_at = await conn.fetchval(
-                f"SELECT last_refreshed_at FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
+            current_memory_seen_at = await conn.fetchval(
+                f"SELECT COALESCE(last_memory_seen_at, last_refreshed_at) "
+                f"FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
                 bank_id,
                 mental_model_id,
             )
@@ -12990,8 +13084,8 @@ class MemoryEngine(MemoryEngineInterface):
             )
         if newest_in_scope is None:
             return None
-        if current_last_refreshed_at is not None:
-            return max(newest_in_scope, current_last_refreshed_at)
+        if current_memory_seen_at is not None:
+            return max(newest_in_scope, current_memory_seen_at)
         return newest_in_scope
 
     async def _try_delta_fast_path(
@@ -13445,12 +13539,15 @@ class MemoryEngine(MemoryEngineInterface):
         # so the agentic loop only retrieves genuinely new information.
         created_after: datetime | None = None
         if use_delta:
-            last_refreshed_at_raw = mental_model.get("last_refreshed_at")
-            if last_refreshed_at_raw is not None:
-                if isinstance(last_refreshed_at_raw, str):
-                    created_after = datetime.fromisoformat(last_refreshed_at_raw)
+            # The delta window opens at the newest memory the last refresh saw, not at
+            # the wall-clock time it finished — anything written between the two is
+            # new information this document has never been shown.
+            seen_at_raw = mental_model.get("last_memory_seen_at") or mental_model.get("last_refreshed_at")
+            if seen_at_raw is not None:
+                if isinstance(seen_at_raw, str):
+                    created_after = datetime.fromisoformat(seen_at_raw)
                 else:
-                    created_after = last_refreshed_at_raw
+                    created_after = seen_at_raw
                 reflect_kwargs["created_after"] = created_after
 
         window = MentalModelRefreshWindow(
@@ -13977,6 +14074,9 @@ class MemoryEngine(MemoryEngineInterface):
                     reflect_response=reflect_response_payload,
                     last_refreshed_source_query=run.source_query,
                     refresh_watermark=run.processed_watermark,
+                    # This refresh ran and succeeded; it just had nothing to change.
+                    # A caller polling "did my refresh happen?" must see that.
+                    refresh_completed=True,
                     request_context=request_context,
                 )
 
@@ -13986,10 +14086,16 @@ class MemoryEngine(MemoryEngineInterface):
                 Every failure mode is handled the same way: persist the
                 reflect_response (so the failure is auditable under
                 ``refresh_skipped``) but write no content, no structured document
-                and no watermark — leaving ``last_refreshed_at`` where it was, so a
+                and no watermark — leaving ``last_memory_seen_at`` where it was, so a
                 retry re-reads the same window instead of skipping past the facts
-                this run failed on. Then raise, because a caller that is told
-                nothing assumes the document was refreshed.
+                this run failed on, and leaving ``last_refreshed_at`` where it was,
+                because no refresh finished. Then raise, because a caller that is
+                told nothing assumes the document was refreshed.
+
+                Deterministic skips (``delta_ops_all_skipped``) set
+                ``retryable=False`` so the worker marks the op failed instead of
+                re-running the same rejected ops. The watermark is still
+                unadvanced, so the next scheduled refresh re-reads the window.
                 """
                 logger.warning(f"[MENTAL_MODELS] Refresh for {mental_model_id} failed ({reason}); {detail}")
                 reflect_response_payload["refresh_skipped"] = reason
@@ -14002,7 +14108,8 @@ class MemoryEngine(MemoryEngineInterface):
                 )
                 raise MentalModelRefreshError(
                     f"Refresh failed for mental_model_id={mental_model_id}: {detail} "
-                    f"Previous content preserved in DB; reflect_response.refresh_skipped == '{reason}' for audit."
+                    f"Previous content preserved in DB; reflect_response.refresh_skipped == '{reason}' for audit.",
+                    retryable=reason not in _NON_RETRYABLE_REFRESH_SKIP_REASONS,
                 )
 
             if run.outcome == "refresh_failed_empty_candidate":
@@ -14058,6 +14165,7 @@ class MemoryEngine(MemoryEngineInterface):
                 reflect_response=reflect_response_payload,
                 last_refreshed_source_query=run.source_query,
                 refresh_watermark=run.processed_watermark,
+                refresh_completed=True,
                 structured_content=(run.final_structured.model_dump() if run.final_structured is not None else None),
                 request_context=request_context,
             )
@@ -14171,6 +14279,7 @@ class MemoryEngine(MemoryEngineInterface):
         reflect_response: dict[str, Any] | None = None,
         last_refreshed_source_query: str | None = None,
         refresh_watermark: datetime | None = None,
+        refresh_completed: bool = False,
         structured_content: dict[str, Any] | None = None,
         request_context: "RequestContext",
     ) -> dict[str, Any] | None:
@@ -14189,10 +14298,14 @@ class MemoryEngine(MemoryEngineInterface):
             refresh_watermark: Watermark persisted by a successful refresh — the newest
                 ``updated_at`` among the in-scope memories visible at the refresh
                 snapshot (not ``now()``), so a row that commits after the snapshot stays
-                newer than the watermark and is not silently dropped. None means "no
-                in-scope memory was visible": on the no-op path ``last_refreshed_at`` is
-                left unchanged (so an in-flight row is not skipped); on the content path
-                it falls back to NOW().
+                newer than the watermark and is not silently dropped. Written to
+                ``last_memory_seen_at``, which is what staleness keys off. None means
+                "no in-scope memory was visible", and leaves it unchanged so an
+                in-flight first row is not skipped.
+            refresh_completed: True when this write is a refresh that ran to completion,
+                which stamps ``last_refreshed_at = NOW()`` even if the refresh preserved
+                the existing content. A refresh that failed leaves it False, so the
+                timestamp keeps pointing at the last refresh that actually finished.
             request_context: Request context for authentication
 
         Returns:
@@ -14268,12 +14381,6 @@ class MemoryEngine(MemoryEngineInterface):
                 params.append(content)
                 content_sql = f"${param_idx}"
                 param_idx += 1
-                if refresh_watermark is None:
-                    updates.append("last_refreshed_at = NOW()")
-                else:
-                    updates.append(f"last_refreshed_at = ${param_idx}")
-                    params.append(refresh_watermark)
-                    param_idx += 1
                 # Snapshot the previous version for history. The actual write goes
                 # into the dedicated mental_model_history table after the UPDATE
                 # (see _append_mental_model_history); we only store the slim slice
@@ -14299,13 +14406,25 @@ class MemoryEngine(MemoryEngineInterface):
                     updates.append(f"embedding = ${param_idx}")
                     params.append(new_embedding_str)
                     param_idx += 1
-            elif refresh_watermark is not None:
-                # A successful delta refresh can find no topic-relevant facts even though
-                # the coarse staleness query found new rows. Advance the watermark to the
-                # newest in-scope memory we saw (without re-embedding unchanged content or
-                # adding history) so this no-op window stops re-triggering, while any row
-                # that commits later stays newer than the watermark and is still caught.
-                updates.append(f"last_refreshed_at = ${param_idx}")
+
+            # The two timestamps move independently, and conflating them is what made a
+            # refresh look like it never ran (#3531): the watermark is clamped so it
+            # never regresses, so a model whose scope gained no memories had the value
+            # already in the column written straight back over itself while the document
+            # underneath was rewritten.
+            #
+            # last_refreshed_at — wall clock, "when did a refresh last finish". Advances
+            # on every completed refresh, including one that preserved the content
+            # (delta found no new facts: it ran, it just had nothing to change), and on a
+            # direct content edit. A *failed* refresh passes neither, so it stays put.
+            if content is not None or refresh_completed:
+                updates.append("last_refreshed_at = NOW()")
+            # last_memory_seen_at — data watermark, "how far through the bank's memories
+            # this document is written". Staleness keys off it. A row that commits after
+            # the refresh snapshot stays newer than the watermark and is caught next
+            # time, which is why this is the newest memory seen and not NOW().
+            if refresh_watermark is not None:
+                updates.append(f"last_memory_seen_at = ${param_idx}")
                 params.append(refresh_watermark)
                 param_idx += 1
 
@@ -14363,7 +14482,7 @@ class MemoryEngine(MemoryEngineInterface):
                 SET {", ".join(updates)}
                 WHERE bank_id = $1 AND id = $2
                 RETURNING id, bank_id, name, source_query, content, tags,
-                          last_refreshed_at, created_at, reflect_response,
+                          last_refreshed_at, last_memory_seen_at, created_at, reflect_response,
                           max_tokens, trigger, structured_content
             """
 
@@ -14475,7 +14594,7 @@ class MemoryEngine(MemoryEngineInterface):
                     last_refreshed_source_query = NULL{sv_clause}
                 WHERE bank_id = $1 AND id = $2
                 RETURNING id, bank_id, name, source_query, content, tags,
-                          last_refreshed_at, created_at, reflect_response,
+                          last_refreshed_at, last_memory_seen_at, created_at, reflect_response,
                           max_tokens, trigger, structured_content
                 """,
                 bank_id,
@@ -14571,14 +14690,54 @@ class MemoryEngine(MemoryEngineInterface):
     # Default trigger for a knowledge page: a living document synthesized from the
     # bank's consolidated **observations** (not raw facts), refreshed incrementally
     # (delta) after each consolidation, and excluding other mental models so a page
-    # never reflects on sibling pages. Applied when the client doesn't pass its own
-    # ``trigger`` on create; a client can override any of these.
+    # never reflects on sibling pages. A client's own ``trigger`` MERGES over these
+    # (see ``_merge_page_trigger``), so overriding one field keeps the rest.
     KNOWLEDGE_PAGE_DEFAULT_TRIGGER = {
         "mode": "delta",
         "fact_types": ["observation"],
         "exclude_mental_models": True,
         "refresh_after_consolidation": True,
     }
+
+    def _merge_page_trigger(self, trigger: dict[str, Any] | None, base: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Layer the fields a client actually set over ``base``, so a page trigger patches.
+
+        ``base`` is what the unstated fields keep: ``KNOWLEDGE_PAGE_DEFAULT_TRIGGER``
+        on create, the page's CURRENT trigger on update.
+
+        Both used to be all-or-nothing — a supplied trigger REPLACED whatever was
+        there. Since the API model fills every unset field with its own defaults, a
+        client that wanted one setting (a cron schedule, different fact types)
+        silently gave up ``mode: "delta"`` and ``exclude_mental_models``, and its
+        page quietly became a from-scratch rebuild that also reflected over its
+        sibling pages. That is what the coding-agents plugin had been doing to every
+        page it created (#3506). The API layer now sends only the fields the client
+        actually set (``model_dump(exclude_unset=True)``), and they merge here.
+
+        The two refresh triggers stay mutually exclusive, as ``MentalModelTrigger``
+        requires of a stated pair: setting one drops an unstated other rather than
+        producing a combination no request could have expressed. That matters in
+        both directions on update — moving a page onto a cron schedule has to clear
+        the auto-refresh it was created with, and moving it back has to clear the
+        cron.
+        """
+        supplied = trigger or {}
+        merged = {**(self.KNOWLEDGE_PAGE_DEFAULT_TRIGGER if base is None else base), **supplied}
+        if supplied.get("refresh_cron") and "refresh_after_consolidation" not in supplied:
+            merged.pop("refresh_after_consolidation", None)
+        if supplied.get("refresh_after_consolidation") and "refresh_cron" not in supplied:
+            merged.pop("refresh_cron", None)
+        return merged
+
+    @staticmethod
+    def _stored_trigger(value: Any) -> dict[str, Any]:
+        """A stored trigger as a dict. JSONB arrives as text on some drivers."""
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                return {}
+        return value if isinstance(value, dict) else {}
 
     # Knowledge pages default to a larger budget than a plain mental model (2048)
     # since they're meant to read as full documents. Applied when the client
@@ -14606,6 +14765,11 @@ class MemoryEngine(MemoryEngineInterface):
             node["tags"] = list(row["mm_tags"] or [])
             node["source_query"] = row["mm_source_query"]
             node["last_refreshed_at"] = row["mm_last_refreshed_at"].isoformat() if row["mm_last_refreshed_at"] else None
+            # Carried on the read so a client can see WHEN a page refreshes and how much that
+            # costs, and can tell whether its own settings still apply, without walking to the
+            # mental-models API for every page (the knowledge base is the only surface some
+            # clients speak). None when the page has no trigger at all.
+            node["trigger"] = MemoryEngine._stored_trigger(row["mm_trigger"]) or None
         return node
 
     # Column list for plain (non-joined) knowledge_pages reads/RETURNING.
@@ -14615,7 +14779,9 @@ class MemoryEngine(MemoryEngineInterface):
         "kp.id, kp.bank_id, kp.parent_id, kp.kind, kp.name, kp.mental_model_id, "
         "kp.sort_order, kp.managed, kp.created_at, kp.updated_at, "
         "mm.tags AS mm_tags, mm.source_query AS mm_source_query, "
-        "mm.last_refreshed_at AS mm_last_refreshed_at"
+        "mm.trigger AS mm_trigger, "
+        "mm.last_refreshed_at AS mm_last_refreshed_at, "
+        "mm.last_memory_seen_at AS mm_last_memory_seen_at"
     )
 
     def _kp_join(self) -> str:
@@ -14720,7 +14886,7 @@ class MemoryEngine(MemoryEngineInterface):
         mental_model_id = mental_model_id or f"mm-{uuid.uuid4().hex}"
         embedding = await self._generate_mental_model_embedding(name, content)
         effective_max_tokens = max_tokens if max_tokens is not None else self.KNOWLEDGE_PAGE_DEFAULT_MAX_TOKENS
-        effective_trigger = trigger if trigger is not None else dict(self.KNOWLEDGE_PAGE_DEFAULT_TRIGGER)
+        effective_trigger = self._merge_page_trigger(trigger)
         backend = await self._get_backend()
         page_id = f"kp-{uuid.uuid4().hex}"
         try:
@@ -14821,7 +14987,10 @@ class MemoryEngine(MemoryEngineInterface):
                 for r in rows:
                     if r["kind"] != "page":
                         continue
-                    by_id[r["id"]]["is_stale"] = _may_need_refresh(r["mm_last_refreshed_at"], watermark)
+                    # Staleness compares the bank's newest write against how far
+                    # through the memories the page is written, not when it last ran.
+                    seen_at = r["mm_last_memory_seen_at"] or r["mm_last_refreshed_at"]
+                    by_id[r["id"]]["is_stale"] = _may_need_refresh(seen_at, watermark)
         return nodes
 
     async def get_knowledge_page(
@@ -15051,14 +15220,23 @@ class MemoryEngine(MemoryEngineInterface):
             await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
         backend = await self._get_backend()
         async with acquire_with_retry(backend) as conn:
+            # The page's CURRENT trigger comes back with it: a supplied trigger patches
+            # that rather than replacing it (see _merge_page_trigger).
             row = await conn.fetchrow(
-                f"SELECT mental_model_id FROM {fq_table('knowledge_pages')} "
-                f"WHERE bank_id = $1 AND id = $2 AND kind = 'page'",
+                f"SELECT kp.mental_model_id, mm.trigger FROM {fq_table('knowledge_pages')} kp "
+                f"LEFT JOIN {fq_table('mental_models')} mm "
+                f"ON mm.id = kp.mental_model_id AND mm.bank_id = kp.bank_id "
+                f"WHERE kp.bank_id = $1 AND kp.id = $2 AND kp.kind = 'page'",
                 bank_id,
                 page_id,
             )
         if row is None or row["mental_model_id"] is None:
             return None
+        effective_trigger = (
+            self._merge_page_trigger(trigger, base=self._stored_trigger(row["trigger"]))
+            if trigger is not None
+            else None
+        )
         # The write is already authorized above; the backing mental-model update
         # runs without re-invoking the validator.
         with _authorize_nested_operations():
@@ -15068,7 +15246,7 @@ class MemoryEngine(MemoryEngineInterface):
                 source_query=source_query,
                 tags=tags,
                 max_tokens=max_tokens,
-                trigger=trigger,
+                trigger=effective_trigger,
                 request_context=request_context,
             )
         async with acquire_with_retry(backend) as conn:
@@ -15262,8 +15440,14 @@ class MemoryEngine(MemoryEngineInterface):
             except (KeyError, TypeError):
                 return None
 
-        last_refreshed_at = _get("last_refreshed_at")
-        if not last_refreshed_at:
+        # Staleness is a question about data, not about clocks: has a memory in scope
+        # been written since the newest one this document was built from? That is
+        # last_memory_seen_at, never the wall-clock last_refreshed_at — refreshing a
+        # model must not, by itself, make it look current. Fall back to
+        # last_refreshed_at when the watermark is absent (a row no refresh has stamped
+        # since the migration backfill, or a caller that selected neither column).
+        last_memory_seen_at = _get("last_memory_seen_at") or _get("last_refreshed_at")
+        if not last_memory_seen_at:
             return True
 
         raw_tags = _get("tags")
@@ -15288,7 +15472,7 @@ class MemoryEngine(MemoryEngineInterface):
             conn=conn,
             fq_table=fq_table,
             bank_id=bank_id,
-            since=last_refreshed_at,
+            since=last_memory_seen_at,
             fact_types=fact_types,
             tags=tag_filtering.tags,
             tags_match=tag_filtering.tags_match,
@@ -15308,6 +15492,7 @@ class MemoryEngine(MemoryEngineInterface):
             "name": row["name"],
             "tags": row["tags"] or [],
             "last_refreshed_at": row["last_refreshed_at"].isoformat() if row["last_refreshed_at"] else None,
+            "last_memory_seen_at": (row["last_memory_seen_at"].isoformat() if row["last_memory_seen_at"] else None),
             "created_at": row["created_at"].isoformat() if row["created_at"] else None,
         }
         if detail == "metadata":
@@ -15355,11 +15540,11 @@ class MemoryEngine(MemoryEngineInterface):
         tags_match: TagsMatch = "any",
         tag_groups: list[TagGroup] | None = None,
         active_only: bool = True,
-        limit: int = 100,
+        limit: int | None = 100,
         offset: int = 0,
         request_context: "RequestContext",
         isolation_mode: bool = False,
-    ) -> list[dict[str, Any]]:
+    ) -> DirectivePage:
         """List directives for a bank.
 
         Args:
@@ -15370,7 +15555,8 @@ class MemoryEngine(MemoryEngineInterface):
                 if both are provided each applies its own OR-with-untagged wrapping
                 and the two are AND-ed together)
             active_only: Only return active directives (default True)
-            limit: Maximum number of results
+            limit: Maximum number of results, or None for every match (used by
+                bank-template export/import, which must see the whole set)
             offset: Offset for pagination
             request_context: Request context for authentication
             isolation_mode: When True and both tags and tag_groups are None, only
@@ -15379,7 +15565,7 @@ class MemoryEngine(MemoryEngineInterface):
                 behavior - returns all directives when no tag filter is supplied).
 
         Returns:
-            List of directive dicts
+            The requested page and the total number of matching directives
         """
         await self._authenticate_tenant(request_context)
         if self._operation_validator:
@@ -15442,20 +15628,40 @@ class MemoryEngine(MemoryEngineInterface):
                 # This ensures tag-scoped directives don't apply to untagged operations
                 filters.append("(tags IS NULL OR tags = '{}')")
 
-            params.extend([limit, offset])
+            where_clause = " AND ".join(filters)
 
-            rows = await conn.fetch(
+            total = await conn.fetchval(
                 f"""
-                SELECT id, bank_id, name, content, priority, is_active, tags, created_at, updated_at
+                SELECT COUNT(*)
                 FROM {fq_table("directives")}
-                WHERE {" AND ".join(filters)}
-                ORDER BY priority DESC, created_at DESC
-                LIMIT ${param_idx} OFFSET ${param_idx + 1}
+                WHERE {where_clause}
                 """,
                 *params,
             )
 
-            return [self._row_to_directive(row) for row in rows]
+            pagination = ""
+            if limit is not None:
+                pagination = f"LIMIT ${param_idx} OFFSET ${param_idx + 1}"
+                params.extend([limit, offset])
+            elif offset:
+                pagination = f"OFFSET ${param_idx}"
+                params.append(offset)
+
+            # Tie-break on id so ties on (priority, created_at) keep a stable
+            # order across pages — without it a paging caller can see one
+            # directive twice and miss another.
+            rows = await conn.fetch(
+                f"""
+                SELECT id, bank_id, name, content, priority, is_active, tags, created_at, updated_at
+                FROM {fq_table("directives")}
+                WHERE {where_clause}
+                ORDER BY priority DESC, created_at DESC, id DESC
+                {pagination}
+                """,
+                *params,
+            )
+
+            return DirectivePage(items=[self._row_to_directive(row) for row in rows], total=int(total or 0))
 
     async def get_directive(
         self,
@@ -15784,6 +15990,9 @@ class MemoryEngine(MemoryEngineInterface):
                         "items_count": result_metadata.get("items_count", 0),
                         "document_id": result_metadata.get("document_id"),
                         "filename": result_metadata.get("original_filename"),
+                        # refresh_mental_model operations have no document_id, so without
+                        # this the log cannot say which model an operation refreshed.
+                        "mental_model_id": result_metadata.get("mental_model_id"),
                         "created_at": row["created_at"].isoformat(),
                         "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
                         "status": row["status"],
@@ -16585,6 +16794,7 @@ class MemoryEngine(MemoryEngineInterface):
         dedupe_by_bank_includes_processing: bool = False,
         dedupe_excludes_operation_id: str | None = None,
         dedupe_in_flight_payload_key: str | None = None,
+        dedupe_in_flight_includes_processing: bool = True,
     ) -> dict[str, Any]:
         """Generic helper to submit an async operation.
 
@@ -16602,9 +16812,15 @@ class MemoryEngine(MemoryEngineInterface):
                 own backlog to empty before finishing (see submit_async_graph_maintenance);
                 for watermark-based jobs like consolidation it would drop work that
                 arrived after the running job took its watermark.
-            dedupe_in_flight_payload_key: If set, skip creating a new task when a pending or processing
+            dedupe_in_flight_payload_key: If set, skip creating a new task when an already-queued
                 operation of this type exists whose task_payload carries the same value for this key
                 (e.g. 'mental_model_id'). Narrower than dedupe_by_bank, which dedupes per bank.
+                Must be a plain identifier — it is inlined into the JSON accessor so the Oracle
+                rewriter can turn it into JSON_VALUE.
+            dedupe_in_flight_includes_processing: Whether an operation that is already *processing*
+                counts for dedupe_in_flight_payload_key, on top of a pending one. False keeps the
+                guarantee to "at most one pending", which is all that a submit carrying new intent
+                (an explicit refresh after an edit) can safely fold into.
 
         Returns:
             Dict with operation_id and optionally deduplicated=True if an existing task was found
@@ -16745,7 +16961,64 @@ class MemoryEngine(MemoryEngineInterface):
                                 "operation_id": str(row["operation_id"]),
                                 "deduplicated": True,
                             }
-                insert_args = (
+                if dedupe_in_flight_payload_key is not None:
+                    # Sub-bank dedup: skip the INSERT when an operation of this type is
+                    # already queued (and, optionally, already running) for the same
+                    # payload subject — e.g. one mental model (#3210, #3487).
+                    #
+                    # Atomic for the same reason the bank-wide branch above is: the
+                    # bank row is held FOR NO KEY UPDATE for the rest of this
+                    # transaction, so concurrent submits for this bank serialise and
+                    # the loser sees the winner's committed row. (An earlier form
+                    # folded the check into an INSERT ... SELECT ... WHERE NOT EXISTS;
+                    # that is not valid Oracle SQL — a SELECT with no FROM — and its
+                    # bind-parameter JSON key is not rewritten to JSON_VALUE, so every
+                    # deduped submit raised there. The key is inlined below, and
+                    # rejected unless it is a plain identifier, so the rewrite applies
+                    # on both dialects.)
+                    #
+                    # Which statuses count as "already covered" is the caller's call:
+                    # a *pending* op has not started, so it still picks up whatever the
+                    # submitter just changed and folding into it loses nothing, while a
+                    # *processing* op may have read its inputs already.
+                    if not dedupe_in_flight_payload_key.isidentifier():
+                        raise ValueError(
+                            f"dedupe_in_flight_payload_key must be an identifier: {dedupe_in_flight_payload_key!r}"
+                        )
+                    status_filter = (
+                        "status IN ('pending', 'processing')"
+                        if dedupe_in_flight_includes_processing
+                        else "status = 'pending'"
+                    )
+                    subject = task_payload.get(dedupe_in_flight_payload_key)
+                    existing_id = await conn.fetchval(
+                        f"""
+                        SELECT operation_id FROM {fq_table("async_operations")}
+                        WHERE bank_id = $1 AND operation_type = $2
+                          AND {status_filter}
+                          AND task_payload->>'{dedupe_in_flight_payload_key}' = $3
+                        ORDER BY created_at
+                        LIMIT 1
+                        """,
+                        bank_id,
+                        operation_type,
+                        subject,
+                    )
+                    if existing_id is not None:
+                        logger.debug(
+                            f"{operation_type} task already in flight for bank_id={bank_id} "
+                            f"{dedupe_in_flight_payload_key}={subject}, skipping duplicate "
+                            f"(existing operation_id={existing_id})"
+                        )
+                        return {
+                            "operation_id": str(existing_id),
+                            "deduplicated": True,
+                        }
+                await conn.execute(
+                    f"""
+                    INSERT INTO {fq_table("async_operations")} (operation_id, bank_id, operation_type, result_metadata, status, task_payload)
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                    """,
                     operation_id,
                     bank_id,
                     operation_type,
@@ -16753,69 +17026,6 @@ class MemoryEngine(MemoryEngineInterface):
                     "pending",
                     json.dumps(full_payload, default=_json_default),
                 )
-                if dedupe_in_flight_payload_key is None:
-                    await conn.execute(
-                        f"""
-                        INSERT INTO {fq_table("async_operations")} (operation_id, bank_id, operation_type, result_metadata, status, task_payload)
-                        VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-                        """,
-                        *insert_args,
-                    )
-                else:
-                    # Sub-bank dedup: the INSERT itself only materialises a row when no
-                    # operation of this type is already queued or running for the same
-                    # payload subject (e.g. one mental model), so the check cannot be
-                    # separated from the write (#3210).
-                    #
-                    # 'processing' counts here, unlike the bank-wide branch above: the
-                    # only caller is the cron-scheduled refresh, whose next tick covers
-                    # anything the in-flight run misses, so a second op would just
-                    # re-check staleness and occupy a claim slot.
-                    #
-                    # PostgreSQL JSON syntax: this path is reached only from the
-                    # maintenance loop, which is PostgreSQL-only. Oracle submits take
-                    # the unconditional branch above.
-                    subject = task_payload.get(dedupe_in_flight_payload_key)
-                    inserted = await conn.fetchval(
-                        f"""
-                        INSERT INTO {fq_table("async_operations")} (operation_id, bank_id, operation_type, result_metadata, status, task_payload)
-                        SELECT $1::uuid, $2, $3, $4::jsonb, $5::text, $6::jsonb
-                        WHERE NOT EXISTS (
-                            SELECT 1 FROM {fq_table("async_operations")}
-                            WHERE bank_id = $2 AND operation_type = $3
-                              AND status IN ('pending', 'processing')
-                              AND task_payload->>$7 = $8
-                        )
-                        RETURNING operation_id
-                        """,
-                        *insert_args,
-                        dedupe_in_flight_payload_key,
-                        subject,
-                    )
-                    if inserted is None:
-                        existing = await conn.fetchval(
-                            f"""
-                            SELECT operation_id FROM {fq_table("async_operations")}
-                            WHERE bank_id = $1 AND operation_type = $2
-                              AND status IN ('pending', 'processing')
-                              AND task_payload->>$3 = $4
-                            ORDER BY created_at
-                            LIMIT 1
-                            """,
-                            bank_id,
-                            operation_type,
-                            dedupe_in_flight_payload_key,
-                            subject,
-                        )
-                        logger.debug(
-                            f"{operation_type} task already in flight for bank_id={bank_id} "
-                            f"{dedupe_in_flight_payload_key}={subject}, skipping duplicate "
-                            f"(existing operation_id={existing})"
-                        )
-                        return {
-                            "operation_id": str(existing),
-                            "deduplicated": True,
-                        }
 
         # For SyncTaskBackend: executes the task immediately.
         # For BrokerTaskBackend: no-op (submit_task's UPDATE skips rows whose
@@ -17393,15 +17603,27 @@ class MemoryEngine(MemoryEngineInterface):
             bank_id: Bank identifier
             mental_model_id: Mental model UUID to refresh
             request_context: Request context for authentication
-            skip_if_in_flight: If True, return the existing operation (with
-                ``deduplicated=True``) instead of queueing a second refresh when one is
-                already pending or processing for this model. Used by the scheduled
-                (cron) refresh, which runs in every process of the fleet and would
-                otherwise queue one wave per process (#3210). Explicit user-triggered
-                refreshes leave it False so an on-demand refresh is never swallowed.
+            skip_if_in_flight: If True, an operation that is already *processing* for this
+                model also suppresses the submit. Used by the automatic triggers — the
+                scheduled (cron) refresh, which runs in every process of the fleet and
+                would otherwise queue one wave per process (#3210), and the
+                after-consolidation flush, which fires once per round (#3411). Explicit
+                user-triggered refreshes leave it False: a refresh that is already running
+                may have read its inputs before the caller's edit, so their intent needs a
+                run of its own.
+
+                A *pending* operation for the model always suppresses the submit,
+                whatever this flag says (#3487). Refreshes carry no per-request options —
+                every queued one does exactly the same work — so a queued-but-unstarted
+                refresh already covers the caller's intent, and letting a second one
+                through only pays for the same recall + LLM call twice. Without that
+                floor, any submit path that forgets this flag piles up unbounded pending
+                copies on a bank whose refresh queue drains slower than it fills.
 
         Returns:
-            Dict with operation_id
+            Dict with operation_id — the surviving operation's when this submit was
+            suppressed, together with ``deduplicated=True``, so the caller can poll
+            that one to completion either way.
         """
         self._raise_if_mental_model_refresh_unavailable()
 
@@ -17446,7 +17668,8 @@ class MemoryEngine(MemoryEngineInterface):
             task_payload=task_payload,
             result_metadata={"mental_model_id": mental_model_id, "name": mental_model["name"]},
             dedupe_by_bank=False,
-            dedupe_in_flight_payload_key="mental_model_id" if skip_if_in_flight else None,
+            dedupe_in_flight_payload_key="mental_model_id",
+            dedupe_in_flight_includes_processing=skip_if_in_flight,
         )
 
     def _raise_if_mental_model_refresh_unavailable(self) -> None:

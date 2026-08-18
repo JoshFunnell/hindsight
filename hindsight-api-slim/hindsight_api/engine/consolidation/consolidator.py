@@ -1755,6 +1755,13 @@ async def _run_consolidation_job(
     if operation_id:
         all_refresh_tags |= await _read_pending_refresh_tags(pool, operation_id)
 
+    # A round that processed exactly max_memories_per_round and emptied the
+    # queue used to leave hit_round_limit set (remaining <= 0) and skip the
+    # refresh forever — the follow-up job saw no_new_memories and never
+    # fanned out. Treat an empty leftover as the final round.
+    if hit_round_limit and await _count_unconsolidated() == 0:
+        hit_round_limit = False
+
     if hit_round_limit:
         remaining = total_count - stats["memories_processed"]
         logger.info(
@@ -1892,7 +1899,7 @@ async def _trigger_mental_model_refreshes(
         if consolidated_tags:
             candidates = await conn.fetch(
                 f"""
-                SELECT id, name, tags, last_refreshed_at, trigger
+                SELECT id, name, tags, last_refreshed_at, last_memory_seen_at, trigger
                 FROM {fq_table("mental_models")}
                 WHERE bank_id = $1
                   AND (trigger->>'refresh_after_consolidation')::boolean = true
@@ -1907,7 +1914,7 @@ async def _trigger_mental_model_refreshes(
         else:
             candidates = await conn.fetch(
                 f"""
-                SELECT id, name, tags, last_refreshed_at, trigger
+                SELECT id, name, tags, last_refreshed_at, last_memory_seen_at, trigger
                 FROM {fq_table("mental_models")}
                 WHERE bank_id = $1
                   AND (trigger->>'refresh_after_consolidation')::boolean = true

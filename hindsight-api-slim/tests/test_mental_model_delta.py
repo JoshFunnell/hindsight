@@ -32,7 +32,6 @@ from hindsight_api.engine.maintenance import MaintenanceLoop
 from hindsight_api.engine.response_models import ReflectResult, TokenUsage
 from hindsight_api.engine.retain import embedding_utils
 
-
 #: Trigger for the tests below that pin the AGENTIC delta path — the reflect loop
 #: plus the structured-delta call they patch. The deterministic fast path is on by
 #: default and would answer these refreshes itself off the (empty) delta window,
@@ -291,15 +290,15 @@ class TestDeltaRefreshPlumbing:
         patch_llm_call,
         monkeypatch,
     ):
-        """A successful no-op refresh advances ``last_refreshed_at`` to the newest
-        in-scope memory it actually saw — not ``now()``.
+        """A successful no-op refresh advances ``last_memory_seen_at`` to the newest
+        in-scope memory it actually saw — not ``now()`` — and records that it ran by
+        stamping ``last_refreshed_at``.
 
-        The scheduled-refresh gate uses ``last_refreshed_at`` as its watermark. If a
-        no-op refresh left it unchanged, one unrelated memory would make every
-        maintenance tick submit another LLM refresh forever. Anchoring the watermark to
-        the newest processed memory stops that storm without jumping ahead of the real
-        data, so a row that commits later stays newer than the watermark (see
-        ``test_delta_refresh_watermark_survives_straddling_commit``).
+        The scheduled-refresh gate keys off the watermark. If a no-op refresh left it
+        unchanged, one unrelated memory would make every maintenance tick submit another
+        LLM refresh forever. Anchoring it to the newest processed memory stops that storm
+        without jumping ahead of the real data, so a row that commits later stays newer
+        than the watermark (see ``test_delta_refresh_watermark_survives_straddling_commit``).
         """
         bank_id = f"test-delta-watermark-{uuid.uuid4().hex[:8]}"
         await memory.get_bank_profile(bank_id, request_context=request_context)
@@ -341,7 +340,8 @@ class TestDeltaRefreshPlumbing:
                 bank_id,
             )
             stale_row = await conn.fetchrow(
-                "SELECT id, tags, trigger, last_refreshed_at FROM mental_models WHERE bank_id = $1 AND id = $2",
+                "SELECT id, tags, trigger, last_refreshed_at, last_memory_seen_at "
+                "FROM mental_models WHERE bank_id = $1 AND id = $2",
                 bank_id,
                 mm["id"],
             )
@@ -369,12 +369,14 @@ class TestDeltaRefreshPlumbing:
 
         async with memory._pool.acquire() as conn:
             mm_row = await conn.fetchrow(
-                "SELECT id, tags, trigger, last_refreshed_at FROM mental_models WHERE bank_id = $1 AND id = $2",
+                "SELECT id, tags, trigger, last_refreshed_at, last_memory_seen_at "
+                "FROM mental_models WHERE bank_id = $1 AND id = $2",
                 bank_id,
                 mm["id"],
             )
             assert mm_row is not None
-            after = mm_row["last_refreshed_at"]
+            after = mm_row["last_memory_seen_at"]
+            refreshed_at = mm_row["last_refreshed_at"]
             is_stale = await memory.compute_mental_model_is_stale(conn, bank_id, mm_row)
             history_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM mental_model_history WHERE bank_id = $1 AND mental_model_id = $2",
@@ -385,6 +387,8 @@ class TestDeltaRefreshPlumbing:
         # updated_at, not now() — so the settled window no longer re-triggers.
         assert after == fact_updated_at
         assert after > before
+        # The refresh ran, so the wall clock says so even though nothing was written.
+        assert refreshed_at > before
         assert is_stale is False
         assert history_count == 0
 
@@ -515,7 +519,8 @@ class TestDeltaRefreshPlumbing:
 
         async with memory._pool.acquire() as conn:
             mm_row = await conn.fetchrow(
-                "SELECT id, tags, trigger, last_refreshed_at FROM mental_models WHERE bank_id = $1 AND id = $2",
+                "SELECT id, tags, trigger, last_refreshed_at, last_memory_seen_at "
+                "FROM mental_models WHERE bank_id = $1 AND id = $2",
                 bank_id,
                 mm["id"],
             )
@@ -525,7 +530,7 @@ class TestDeltaRefreshPlumbing:
                 straddle_fact_id,
             )
             assert mm_row is not None
-            after = mm_row["last_refreshed_at"]
+            after = mm_row["last_memory_seen_at"]
             # Watermark advanced only to the committed baseline the refresh actually saw.
             assert after == baseline_updated_at
             # The straddler was stamped before the cutoff (an exact-cutoff/now() watermark
@@ -884,6 +889,7 @@ class TestDeltaRefreshPlumbing:
         )
         seeded_content = seeded["content"]
         seeded_refreshed_at = seeded["last_refreshed_at"]
+        seeded_memory_seen_at = seeded["last_memory_seen_at"]
 
         # Second refresh: the delta LLM call raises. The candidate is deliberately
         # a plausible-looking document — the danger is that it *is* non-empty, so
@@ -913,8 +919,9 @@ class TestDeltaRefreshPlumbing:
         assert preserved["content"] == seeded_content, (
             "Delta failure overwrote the document with the narrow-window candidate (#3112)"
         )
-        # The watermark must not move: the new fact has to stay inside the window
-        # the retry reads, or it is lost for good.
+        # Neither timestamp moves: the new fact has to stay inside the window the retry
+        # reads, or it is lost for good, and no refresh finished to record.
+        assert preserved["last_memory_seen_at"] == seeded_memory_seen_at
         assert preserved["last_refreshed_at"] == seeded_refreshed_at
         rr = preserved.get("reflect_response") or {}
         assert rr.get("refresh_skipped") == "delta_ops_failed"
@@ -972,12 +979,17 @@ class TestDeltaRefreshPlumbing:
             ],
         )
 
-        from hindsight_api.engine.memory_engine import MentalModelRefreshError
+        from hindsight_api.engine.memory_engine import (
+            MentalModelRefreshError,
+            _is_non_retryable_task_error,
+        )
 
-        with pytest.raises(MentalModelRefreshError):
+        with pytest.raises(MentalModelRefreshError) as exc_info:
             await memory.refresh_mental_model(
                 bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
             )
+        assert exc_info.value.retryable is False
+        assert _is_non_retryable_task_error(exc_info.value) is True
 
         preserved = await memory.get_mental_model(
             bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
@@ -1405,8 +1417,14 @@ async def _age_watermark_and_seed_fact(
 
     Gives the refresh a real delta window (so ``created_after`` is set and the
     persisted watermark is the fact's ``updated_at`` rather than the model's own
-    ``last_refreshed_at``), and records ``last_refreshed_source_query`` so the
-    mode decision stays in delta. Returns the fact's ``updated_at``.
+    prior watermark), and records ``last_refreshed_source_query`` so the mode
+    decision stays in delta. Returns the fact's ``updated_at``.
+
+    Both timestamps are aged: since #3538 the watermark lives in
+    ``last_memory_seen_at`` and ``last_refreshed_at`` is the wall-clock time of
+    the last refresh, and the window reads ``COALESCE(last_memory_seen_at,
+    last_refreshed_at)`` — so ageing only one of them leaves the window's origin
+    depending on which column the row happens to have stamped.
     """
     assert memory._pool is not None
     async with memory._pool.acquire() as conn:
@@ -1414,6 +1432,7 @@ async def _age_watermark_and_seed_fact(
             """
             UPDATE mental_models
             SET last_refreshed_at = NOW() - INTERVAL '1 day',
+                last_memory_seen_at = NOW() - INTERVAL '1 day',
                 last_refreshed_source_query = source_query
             WHERE bank_id = $1 AND id = $2
             """,
@@ -1524,8 +1543,9 @@ class TestDeltaFastPath:
         assert "obs-bob" in user_msg
         assert '"members"' in user_msg
 
-        # get_mental_model renders timestamps as ISO strings.
-        assert refreshed["last_refreshed_at"] == fact_updated_at.isoformat(), (
+        # get_mental_model renders timestamps as ISO strings. The watermark is
+        # last_memory_seen_at since #3538 split it out of last_refreshed_at.
+        assert refreshed["last_memory_seen_at"] == fact_updated_at.isoformat(), (
             "the watermark must advance on a tier-1 write"
         )
         history = await memory.get_mental_model_history(bank_id, mm["id"], request_context=request_context)
@@ -1624,7 +1644,7 @@ class TestDeltaFastPath:
                 "SELECT MAX(updated_at) FROM memory_units WHERE bank_id = $1", bank_id
             )
         assert newest_in_scope == fact_updated_at
-        assert refreshed["last_refreshed_at"] == newest_in_scope.isoformat()
+        assert refreshed["last_memory_seen_at"] == newest_in_scope.isoformat()
 
         history = await memory.get_mental_model_history(bank_id, mm["id"], request_context=request_context)
         assert history == [], "preserving content is not a new version"
@@ -1696,7 +1716,9 @@ class TestDeltaFastPath:
         It used to: reflect's trace context is already reset by the time the
         agentic path makes it, and a bare provider call binds none of its own, so
         every structured-delta request landed in llm_requests unattributed and
-        uncountable. Both routes now bind the refresh's own label.
+        uncountable. Both routes now bind a label of their own — the fast path
+        books its single call under the refresh operation itself, and the agentic
+        route under the ``mental_model_delta_ops`` label #3424 gave it.
         """
         bank_id = f"test-fastpath-label-{uuid.uuid4().hex[:8]}"
         mm = await self._delta_model(memory, request_context, bank_id)
@@ -1722,7 +1744,10 @@ class TestDeltaFastPath:
         await memory.refresh_mental_model(
             bank_id=agentic_bank, mental_model_id=agentic_mm["id"], request_context=request_context
         )
-        assert agentic_calls[0]["operation"] == "refresh_mental_model"
+        # #3424 binds the agentic delta-ops call under its own label so the
+        # row is countable after reflect's trace context has already reset.
+        assert agentic_calls[0]["operation"] == "mental_model_delta_ops"
+        assert agentic_calls[0]["scope"] == "mental_model_delta_ops"
 
         await memory.delete_bank(bank_id, request_context=request_context)
         await memory.delete_bank(agentic_bank, request_context=request_context)

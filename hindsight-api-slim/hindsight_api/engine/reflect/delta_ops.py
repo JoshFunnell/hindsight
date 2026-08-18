@@ -56,6 +56,7 @@ from .structured_doc import (
     ParagraphBlock,
     Section,
     StructuredDocument,
+    TableBlock,
     make_unique_id,
     slugify_heading,
 )
@@ -102,14 +103,15 @@ class ReplaceBlockOp(_OpBase):
     """Replace the block at ``index`` of an existing section.
 
     ``anchor`` must be a verbatim excerpt (~50 chars) of the block's own
-    content at ``index`` — its ``text`` field, or ``items`` joined with a
-    space for list blocks — copied from what the model was shown at that
-    index. ``apply_operations`` compares it (whitespace-normalized) against
-    the block actually there before replacing it, and skips the op on a
-    mismatch or a missing anchor instead of applying it. This is the guard
-    against a miscounted, wrong-but-in-range ``index``: without it, a wrong
-    index is indistinguishable from a correct one and silently destroys the
-    wrong block's content.
+    content at ``index`` — its ``text`` field, ``items`` joined with a space
+    for list blocks, or table ``headers``/``rows`` joined with a space —
+    copied from what the model was shown at that index. ``apply_operations``
+    compares it (whitespace-normalized) against the block actually there
+    before replacing it, and skips the op on a mismatch or a missing anchor
+    instead of applying it. This is the guard against a miscounted,
+    wrong-but-in-range ``index``: without it, a wrong index is
+    indistinguishable from a correct one and silently destroys the wrong
+    block's content.
     """
 
     op: Literal["replace_block"] = "replace_block"
@@ -403,7 +405,26 @@ def _block_content_text(block: Block) -> str:
         return block.text
     if isinstance(block, (BulletListBlock, OrderedListBlock)):
         return " ".join(block.items)
-    raise TypeError(f"Unknown block type: {type(block)!r}")  # pragma: no cover
+    if isinstance(block, TableBlock):
+        parts = [" ".join(str(h) for h in block.headers)]
+        parts.extend(" ".join(str(c) for c in row) for row in block.rows)
+        return " ".join(p for p in parts if p)
+    # Newer block types must not fail the refresh. A TypeError here used to
+    # abort apply_operations (and the whole refresh) instead of recording an
+    # anchor mismatch and skipping just that op. Render best-effort.
+    headers = getattr(block, "headers", None)
+    rows = getattr(block, "rows", None)
+    if headers is not None or rows is not None:
+        parts = [" ".join(str(h) for h in (headers or []))]
+        parts.extend(" ".join(str(c) for c in row) for row in (rows or []))
+        return " ".join(p for p in parts if p)
+    text = getattr(block, "text", None)
+    if isinstance(text, str):
+        return text
+    items = getattr(block, "items", None)
+    if isinstance(items, list):
+        return " ".join(str(i) for i in items)
+    return ""
 
 
 def _anchor_matches(block: Block, anchor: str) -> bool:
