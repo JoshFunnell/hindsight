@@ -31,9 +31,13 @@ const RESERVED_TAG_PREFIX = /^(source|harness):/;
 export interface RetainStampContext {
   /** Working directory the retain is being written from — the repo, for {project}/{gitProject}. */
   directory: string;
+  /** Where the session started, when known. {gitProject} must name the same project the bank id
+   *  does, so it falls back to this exactly as bank resolution does (see core/bank.ts). */
+  sessionRoot?: string;
   harness: string;
   bankId: string;
-  sessionId: string;
+  /** Agent session when the document comes from one; absent for non-session documents. */
+  sessionId?: string;
 }
 
 export interface RetainStamp {
@@ -50,11 +54,11 @@ function resolversFor(ctx: RetainStampContext): Resolvers {
   return {
     // Worktree-aware like the bank id, so every linked worktree of a repo stamps the SAME name —
     // otherwise a shared bank ends up with `project:app` and `project:app-wt2` for one repository.
-    gitProject: () => projectNameOf(ctx.directory),
+    gitProject: () => projectNameOf(ctx.directory, ctx.sessionRoot),
     project: () => (ctx.directory ? basename(ctx.directory) : "unknown"),
     harness: () => ctx.harness,
     bankId: () => ctx.bankId,
-    sessionId: () => ctx.sessionId,
+    sessionId: () => ctx.sessionId ?? "unknown",
     timestamp: () => new Date().toISOString(),
     channel: () => process.env.HINDSIGHT_CHANNEL_ID || "default",
     user: () => process.env.HINDSIGHT_USER_ID || "anonymous",
