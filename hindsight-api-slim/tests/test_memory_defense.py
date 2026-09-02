@@ -67,6 +67,12 @@ _BOUNDARY_REDACTION_SAMPLES = {
     "telegram_bot": "12345678:" + "A" * 35,
     "shopify_token": "shpat_" + "a" * 32,
     "jwt": "eyJ" + "A" * 10 + ".eyJ" + "A" * 10 + "." + "A" * 10,
+    # Local additions (2026-08-01, operator J5): personal-financial PII, ordered in
+    # _REDACTION_PATTERNS before credit_card so an IBAN's digit tail is not consumed
+    # by it (measured live-fire 2026-08-01: it was, and the marker was mislabelled).
+    "iban": "GB29NWBK60161331926819",
+    "uk_nino": "AB123456C",
+    "uk_sort_account": "12-34-56 12345678",
     "credit_card": "4111 1111 1111 1111",
     "ssn_us": "123-45-6789",
 }

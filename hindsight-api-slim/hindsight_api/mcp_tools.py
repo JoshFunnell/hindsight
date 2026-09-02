@@ -163,6 +163,16 @@ class MentalModelTriggerInput(BaseModel):
         default=None,
         description="Override the token budget for raw chunks from the refresh's internal recall. null = bank/global default.",
     )
+    delta_fast_path: bool | None = Field(
+        default=None,
+        description=(
+            "Override whether a delta refresh may take the deterministic fast path: fetch the memories "
+            "created since the last refresh and, if there are any, turn them into edit operations with a "
+            "single LLM call instead of running the agentic reflect loop. An empty window costs no LLM call "
+            "at all. The fast path hands back to the loop whenever a surgical edit is not obviously safe, so "
+            "every outcome is preserved either way. null = bank/global default. Ignored in full mode."
+        ),
+    )
     response_schema: dict | None = Field(
         default=None,
         description=(

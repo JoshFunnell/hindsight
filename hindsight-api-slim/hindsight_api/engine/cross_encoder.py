@@ -454,6 +454,13 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         if model is not None:
             return model
 
+        # An explicitly injected instance is a test double, not a fallback: it is set
+        # before any load has been attempted, so honouring it never hands one thread
+        # another thread's loaded model. The refusals below are about a load that
+        # FAILED -- that case must still raise rather than reach for self._model.
+        if self._model is not None:
+            return self._model
+
         thread_name = threading.current_thread().name
         with LocalSTCrossEncoder._load_lock:
             model = getattr(self._thread_models, "model", None)
@@ -611,7 +618,10 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         Returns:
             List of relevance scores (raw logits from the model)
         """
-        if not self._initialized:
+        # `self._model` set without initialize() is a test double (see __init__);
+        # _get_thread_model honours it, so refusing here would reject the one caller
+        # that legitimately has a model and no executor warm-up.
+        if not self._initialized and self._model is None:
             raise RuntimeError("Reranker not initialized. Call initialize() first.")
 
         # Use dedicated executor - limited workers naturally limits concurrency

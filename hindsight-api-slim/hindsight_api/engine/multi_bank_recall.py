@@ -45,7 +45,7 @@ from typing import Any, Literal, TypeVar
 
 from .response_models import MemoryFact, RecallScores
 from .search.types import MergedCandidate, RetrievalResult
-from .token_encoding import get_token_encoding
+from .token_encoding import count_tokens
 
 MultiBankMerge = Literal["score", "interleave"]
 
@@ -548,16 +548,17 @@ def cut_to_token_budget(
 ) -> list[MemoryFact]:
     """Keep results until ``max_tokens`` on the ``text`` field (same semantics as single-bank).
 
-    Stops before including a fact that would exceed the budget. Counts tokens with
-    the shared cl100k_base encoding. ``max_tokens <= 0`` yields an empty list.
+    Stops before including a fact that would exceed the budget. Counts tokens through
+    ``count_tokens``, the module's own interface, under whatever encoding
+    ``HINDSIGHT_API_TOKENIZER_ENCODING`` names — the same count single-bank recall
+    charges, which is the point. ``max_tokens <= 0`` yields an empty list.
     """
     if max_tokens <= 0:
         return []
-    encoding = get_token_encoding()
     filtered: list[MemoryFact] = []
     total = 0
     for fact in facts:
-        text_tokens = len(encoding.encode(fact.text or ""))
+        text_tokens = count_tokens(fact.text or "")
         if total + text_tokens <= max_tokens:
             filtered.append(fact)
             total += text_tokens
