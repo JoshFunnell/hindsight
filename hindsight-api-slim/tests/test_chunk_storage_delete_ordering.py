@@ -90,7 +90,7 @@ async def test_delete_chunks_by_ids_sweeps_links_on_both_endpoints(
     for the FK cascade to delete in executor-chosen order, reopening the #2570 deadlock.
     """
     bank_id = f"test-link-sweep-{uuid.uuid4().hex[:8]}"
-    if not get_memories().writes_memory_rows_in_sql_for(bank_id):
+    if get_memories().store_owned_for(bank_id):
         pytest.skip("memory_links reference memory_units rows, which this store keeps outside SQL")
 
     await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
@@ -164,9 +164,16 @@ async def test_delete_chunks_by_ids_sweeps_links_on_both_endpoints(
             "SELECT from_unit_id, to_unit_id FROM memory_links WHERE bank_id = $1",
             bank_id,
         )
+        queued = await conn.fetch(
+            "SELECT unit_id FROM graph_maintenance_queue WHERE bank_id = $1",
+            bank_id,
+        )
 
     assert {(str(r["from_unit_id"]), str(r["to_unit_id"])) for r in rows} == {(str(kept), str(unrelated))}, (
         "links on both endpoints of the deleted chunk's unit must go; the survivors' link must stay"
+    )
+    assert {str(r["unit_id"]) for r in queued} == {str(unrelated)}, (
+        "a surviving unit whose outgoing link targeted the deleted chunk must be queued for relinking"
     )
 
     await memory.delete_bank(bank_id, request_context=request_context)

@@ -13,6 +13,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 from json_repair import repair_json
+from pydantic import BaseModel
 
 # Vertex AI imports (conditional - for LLMProvider to pass credentials to GeminiLLM)
 try:
@@ -32,20 +33,23 @@ from ..config import (
 from .cache_affinity import parse_cache_affinity
 from .llm_interface import (
     LLM_TOOL_CHOICE_AUTO,
+    LLMInterface,
     LLMToolChoice,
     LLMToolChoiceMode,
 )
 from .llm_interface import (
     OutputTooLongError as OutputTooLongError,
 )
+from .llm_transport import configure_http_logging
 
 if TYPE_CHECKING:
     from .response_models import LLMToolCallResult
 
 logger = logging.getLogger(__name__)
 
-# Disable httpx logging
-logging.getLogger("httpx").setLevel(logging.WARNING)
+# httpx/httpcore log levels (WARNING by default; raise to DEBUG to see which phase a
+# stalled request is stuck in -- see llm_transport.py).
+configure_http_logging()
 
 # Global semaphore to limit concurrent LLM requests across all instances.
 # Set HINDSIGHT_API_LLM_MAX_CONCURRENT=1 for local LLMs (LM Studio, Ollama).
@@ -115,14 +119,28 @@ def _semaphores_for_scope(scope: str) -> list[asyncio.Semaphore]:
     return [per_op, _global_llm_semaphore]
 
 
+async def _acquire_permits(stack: AsyncExitStack, scope: str) -> None:
+    """Enter the scope's concurrency permits on ``stack``, timing the wait.
+
+    The wait is reported to the caller's queue-wait sink (when one is bound) so a
+    slow LLM call can be attributed to queueing rather than to the provider --
+    the two are otherwise indistinguishable in the reported duration (#3881).
+    """
+    from .llm_trace import record_queue_wait
+
+    queue_start = time.monotonic()
+    for sem in _semaphores_for_scope(scope):
+        await stack.enter_async_context(sem)
+    record_queue_wait(time.monotonic() - queue_start)
+
+
 @asynccontextmanager
 async def _attempt_permits(scope: str):
     """Hold configured LLM concurrency permits for one upstream attempt."""
     from ..worker.stage import get_stage, set_stage
 
     async with AsyncExitStack() as stack:
-        for sem in _semaphores_for_scope(scope):
-            await stack.enter_async_context(sem)
+        await _acquire_permits(stack, scope)
         try:
             yield
         except BaseException:
@@ -162,6 +180,9 @@ def _request_params(
     return params or None
 
 
+_UNSAFE_TEXT_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff]")
+
+
 def sanitize_text(text: str | None) -> str | None:
     """
     Sanitize text by removing characters that break downstream systems.
@@ -185,12 +206,74 @@ def sanitize_text(text: str | None) -> str | None:
         return None
     if not text:
         return text
-    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff]", "", text)
+    return _UNSAFE_TEXT_RE.sub("", text)
 
 
 # Back-compat alias: this helper was originally introduced to scrub LLM *output*;
 # it now also scrubs user *input* at ingress, hence the broader name.
 sanitize_llm_output = sanitize_text
+
+
+def sanitize_llm_value(value: Any) -> Any:
+    """
+    Recursively strip UTF-8-hostile characters from every string an LLM produced.
+
+    ``sanitize_text`` guards a single field. This guards a whole response — the
+    text a provider returned, the dict a structured call parsed, the pydantic
+    model it validated into, the ``(result, usage)`` tuple ``return_usage=True``
+    hands back — so that *every* LLM call is covered at one boundary instead of
+    each consumer remembering to scrub its own fields (see issue #3729).
+
+    It matters beyond embeddings. A lone surrogate is legal in a Python ``str``
+    but cannot be UTF-8 encoded, so it also breaks the cross-encoder's Rust
+    tokenizer at rerank time, asyncpg on the way into a ``text`` column, and
+    stdout logging. Sanitizing where the text enters the process means the
+    downstream stages never have to care which field it landed in.
+
+    Only strings are touched; ints, floats, datetimes and the like pass through
+    as-is. Every container returns the *same object* when nothing inside it
+    changed, so the overwhelmingly common clean response is not copied and
+    object identity (a validated response model, an enum member) survives
+    untouched.
+    """
+    if isinstance(value, str):
+        # A str subclass (a StrEnum member, say) comes back as itself unless it
+        # actually carries a hostile character — at which point a plain str is the
+        # only safe answer, and the alternative was a crash.
+        cleaned = _UNSAFE_TEXT_RE.sub("", value)
+        return cleaned if cleaned != value else value
+
+    if isinstance(value, BaseModel):
+        updates = {}
+        for name, field_value in value.__dict__.items():
+            cleaned = sanitize_llm_value(field_value)
+            if cleaned is not field_value:
+                updates[name] = cleaned
+        # ``model_copy`` skips validation, which is what we want: the values are
+        # already sanitized, and re-validating could reject a model the provider
+        # built with ``model_construct``.
+        return value.model_copy(update=updates) if updates else value
+
+    if isinstance(value, dict):
+        cleaned_dict = {}
+        changed = False
+        for key, item in value.items():
+            # Keys are sanitized too: a surrogate in a key is just as fatal once
+            # the dict is rendered to text or bound to a query parameter.
+            cleaned_key = sanitize_llm_value(key)
+            cleaned_item = sanitize_llm_value(item)
+            changed = changed or cleaned_key is not key or cleaned_item is not item
+            cleaned_dict[cleaned_key] = cleaned_item
+        return cleaned_dict if changed else value
+
+    # ``tuple`` is here for the ``return_usage=True`` shape, ``(result, TokenUsage)``.
+    if isinstance(value, (list, tuple)):
+        cleaned_items = [sanitize_llm_value(item) for item in value]
+        if all(cleaned is original for cleaned, original in zip(cleaned_items, value)):
+            return value
+        return cleaned_items if isinstance(value, list) else tuple(cleaned_items)
+
+    return value
 
 
 # ``OutputTooLongError`` is re-exported from ``llm_interface`` (the canonical
@@ -200,14 +283,60 @@ sanitize_llm_output = sanitize_text
 # real provider path (see issue #3172).
 
 
+_JSON_CONTROL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f"}
+
+
+def _escape_control_chars_in_json(text: str) -> str:
+    """Make raw control characters inside JSON string values parseable.
+
+    ``json.loads`` rejects an unescaped control character in a string. Models
+    hit this whenever they write a multi-line value (a markdown table, a list,
+    a code fence) without escaping the line breaks.
+
+    A line break, tab or form feed inside a string is *content*: it is escaped
+    so it survives. Blanking it out instead welds a markdown table onto one
+    line, and the damage is invisible downstream (#3361). Every other control
+    character carries no meaning in text, so it keeps the historical treatment
+    of becoming a space.
+
+    The scan tracks string state because only characters inside a string need
+    escaping; the same byte between tokens is junk either way.
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string and escape:
+            escape = False
+            out.append(ch)
+            continue
+        if in_string and ch == "\\":
+            escape = True
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        if in_string and ch in _JSON_CONTROL_ESCAPES:
+            out.append(_JSON_CONTROL_ESCAPES[ch])
+            continue
+        if ch <= "\x1f" or ch == "\x7f":
+            out.append(" ")
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def parse_llm_json(raw: str) -> Any:
     """
     Robustly parse JSON returned by an LLM.
 
     Handles common LLM output quirks:
     1. Markdown code fences (```json ... ```) — strip them before parsing.
-    2. Embedded control characters (\\x00-\\x1f, \\x7f) — replace with space
-       and retry if the initial parse fails.
+    2. Embedded control characters (\\x00-\\x1f, \\x7f) — escape the ones inside
+       string values (so a raw newline stays a line break), drop the ones
+       between tokens, and retry if the initial parse fails.
     3. Structural malformation (trailing commas, unterminated strings, single
        quotes, invalid ``\\escape`` sequences) — repaired as a last resort via
        ``json_repair`` (#2547/#2544).
@@ -217,11 +346,18 @@ def parse_llm_json(raw: str) -> Any:
     degenerate-but-valid JSON (repetition loops or leaked scaffolding inside
     string values) parses fine here and is out of scope for this helper.
 
+    Every successful parse is passed through ``sanitize_llm_value``. Decoding is
+    where an un-encodable surrogate is *born*: a model that writes ``"\\ud83d"``
+    emits six harmless ASCII characters, and only ``json.loads`` turns them into a
+    lone surrogate no downstream stage can UTF-8 encode (#3729). Scrubbing the raw
+    text beforehand cannot see it; scrubbing the parsed object can.
+
     Args:
         raw: Raw text returned by the LLM.
 
     Returns:
-        Parsed Python object (dict, list, etc.).
+        Parsed Python object (dict, list, etc.), with model-authored strings
+        scrubbed of surrogates and control characters.
 
     Raises:
         json.JSONDecodeError: If the text cannot be parsed even after cleanup
@@ -237,14 +373,18 @@ def parse_llm_json(raw: str) -> Any:
         text = text.strip()
 
     try:
-        return json.loads(text)
+        return sanitize_llm_value(json.loads(text))
     except json.JSONDecodeError:
         # Some models (e.g. Gemini) embed raw control characters inside JSON
-        # string values. Replacing them with a space usually produces valid JSON.
-        cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+        # string values. Escape them rather than blank them out: a raw newline
+        # in a string is the model writing a real line break, and replacing it
+        # with a space silently welds a markdown table or list onto one line
+        # (#3361). Control characters *outside* a string are noise and are
+        # dropped, since nothing meaningful can sit between JSON tokens.
+        cleaned = _escape_control_chars_in_json(text)
 
     try:
-        return json.loads(cleaned)
+        return sanitize_llm_value(json.loads(cleaned))
     except json.JSONDecodeError:
         # Last resort: structural repair of malformed JSON. ``repair_json`` never
         # raises — unrecoverable input yields an empty result ("" / {} / []). Keep
@@ -254,7 +394,7 @@ def parse_llm_json(raw: str) -> Any:
         repaired = repair_json(cleaned, return_objects=True)
         if not repaired:
             raise
-        return repaired
+        return sanitize_llm_value(repaired)
 
 
 _PROVIDERS_WITHOUT_API_KEY = frozenset(
@@ -264,6 +404,7 @@ _PROVIDERS_WITHOUT_API_KEY = frozenset(
         "llamacpp",
         "openai-codex",
         "claude-code",
+        "github-copilot",
         "mock",
         "none",
         "vertexai",
@@ -314,6 +455,11 @@ def create_llm_provider(
     ollama_num_ctx: int | None = None,
     cache_affinity: str | None = None,
     structured_output_forced_tool: bool = False,
+    # Appended rather than inserted: some callers still pass the older settings
+    # positionally (guarded by the positional-compatibility tests in
+    # tests/test_llm_wrapper.py), so a parameter added mid-list silently steals
+    # another one's slot. New parameters go at the end.
+    codex_home: str | None = None,
 ) -> Any:  # Returns LLMInterface
     """
     Factory function to create the appropriate LLM provider implementation.
@@ -362,6 +508,8 @@ def create_llm_provider(
             Nous). ``None`` lets each provider fall back to its own default
             (``HINDSIGHT_API_LLM_TIMEOUT`` / ``DEFAULT_LLM_TIMEOUT`` for those four;
             Anthropic and Gemini keep their provider-specific defaults).
+        codex_home: Codex credentials directory (for the openai-codex provider); overrides
+            the process-wide ``CODEX_HOME``.
 
     Returns:
         LLMInterface implementation for the specified provider.
@@ -374,6 +522,7 @@ def create_llm_provider(
         CodexLLM,
         FireworksLLM,
         GeminiLLM,
+        GitHubCopilotLLM,
         LiteLLMLLM,
         LiteLLMRouterLLM,
         LlamaCppLLM,
@@ -399,6 +548,8 @@ def create_llm_provider(
             model=model,
             reasoning_effort=reasoning_effort,
             extra_body=extra_body,
+            codex_home=codex_home,
+            timeout=timeout,
         )
 
     elif provider_lower == "claude-code":
@@ -408,6 +559,16 @@ def create_llm_provider(
             base_url=base_url,
             model=model,
             reasoning_effort=reasoning_effort,
+        )
+
+    elif provider_lower == "github-copilot":
+        return GitHubCopilotLLM(
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
         )
 
     elif provider_lower == "mock":
@@ -435,6 +596,7 @@ def create_llm_provider(
             base_url=base_url,
             model=model,
             reasoning_effort=reasoning_effort,
+            timeout=timeout,
             vertexai_project_id=vertexai_project_id,
             vertexai_region=vertexai_region,
             vertexai_credentials=vertexai_credentials,
@@ -453,6 +615,7 @@ def create_llm_provider(
             reasoning_effort=reasoning_effort,
             default_headers=default_headers,
             extra_body=extra_body,
+            timeout=timeout,
         )
 
     elif provider_lower == "litellm":
@@ -516,6 +679,7 @@ def create_llm_provider(
             model=model,
             reasoning_effort=reasoning_effort,
             extra_body=extra_body,
+            timeout=timeout,
             model_path=config.llamacpp_model_path,
             gpu_layers=config.llamacpp_gpu_layers,
             context_size=config.llamacpp_context_size,
@@ -537,6 +701,7 @@ def create_llm_provider(
             extra_body=extra_body,
             default_headers=default_headers,
             cache_affinity=cache_affinity,
+            timeout=timeout,
         )
 
     elif provider_lower == "nous":
@@ -659,6 +824,10 @@ class LLMProvider:
         ollama_num_ctx: int | None = None,
         cache_affinity: str | None = None,
         structured_output_forced_tool: bool = False,
+        # Appended rather than inserted — see the note on ``create_llm_provider``:
+        # callers that pass these positionally would otherwise have one argument
+        # land in the wrong slot.
+        codex_home: str | None = None,
     ):
         """
         Initialize LLM provider.
@@ -709,6 +878,11 @@ class LLMProvider:
             structured_output_forced_tool: Structured output via a forced tool call
                 instead of ``response_format``, for the LiteLLM-backed providers - from
                 config (``HINDSIGHT_API_LLM_STRUCTURED_OUTPUT_FORCED_TOOL``).
+            codex_home: Codex credentials directory for ``provider="openai-codex"`` — the
+                directory holding the ``auth.json`` this provider authenticates with. ``None``
+                uses the process-wide ``CODEX_HOME`` (else ``~/.codex``). Set it per member of a
+                multi-LLM chain to run two independently authorized ChatGPT profiles, so that
+                failover away from a rate-limited profile actually reaches a different account.
 
         This constructor uses every argument as passed and does not read global
         ``HindsightConfig``: resolving the server-level default for a ``None`` argument is the
@@ -732,6 +906,9 @@ class LLMProvider:
         self.initial_backoff = initial_backoff
         self.max_backoff = max_backoff
         self.litellmrouter_config = litellmrouter_config
+        # Codex credentials directory (openai-codex only). Used verbatim — the caller
+        # resolves the server-level default, like the fields around it.
+        self.codex_home = codex_home
         # Service tiers from hierarchical config (not env vars)
         self.groq_service_tier = groq_service_tier
         self.openai_service_tier = openai_service_tier
@@ -774,6 +951,7 @@ class LLMProvider:
             "vertexai",
             "openai-codex",
             "claude-code",
+            "github-copilot",
             "mock",
             "none",
             "minimax",
@@ -884,6 +1062,7 @@ class LLMProvider:
             openai_service_tier=self.openai_service_tier,
             bedrock_service_tier=self.bedrock_service_tier,
             gemini_service_tier=self.gemini_service_tier,
+            codex_home=self.codex_home,
             extra_body=self.extra_body,
             default_headers=self.default_headers,
             vertexai_project_id=vertexai_project_id,
@@ -944,6 +1123,31 @@ class LLMProvider:
             RuntimeError: If the connection test fails.
         """
         await self._provider_impl.verify_connection()
+
+    async def supports_batch_api(self) -> bool:
+        """Whether the underlying provider supports the OpenAI/Groq Batch API."""
+        return await self._provider_impl.supports_batch_api()
+
+    async def batch_provider_impl(self, account_key: str | None = None) -> LLMInterface | None:
+        """The implementation serving batch, or ``None`` when it cannot serve one.
+
+        Exists so the batch path (``extract_facts_from_contents_batch_api``) can
+        target the implementation through the same interface as a multi-LLM chain:
+        ``MultiLLMProvider`` returns the first batch-capable member's impl here,
+        while a single provider returns its own. Returning ``None`` rather than a
+        provider that would reject every batch call keeps the "can it serve one?"
+        answer in one place — the caller raises on ``None``.
+
+        ``account_key`` is a :attr:`LLMInterface.batch_account_key` persisted when
+        an in-flight batch was submitted. Passing it restricts the answer to the
+        account that actually owns that batch, so a same-provider lookalike is
+        rejected (``None``) instead of being handed the wrong credentials.
+        """
+        if not await self._provider_impl.supports_batch_api():
+            return None
+        if account_key is not None and self._provider_impl.batch_account_key != account_key:
+            return None
+        return self._provider_impl
 
     async def call(
         self,
@@ -1066,8 +1270,7 @@ class LLMProvider:
             attempt_gated = self._provider_impl.supports_attempt_scoped_concurrency()
             async with AsyncExitStack() as stack:
                 if not attempt_gated:
-                    for sem in _semaphores_for_scope(scope):
-                        await stack.enter_async_context(sem)
+                    await _acquire_permits(stack, scope)
                     # Permits in hand — only now leave `.queued`. Attempt-gated
                     # providers acquire permits per attempt instead, so they keep
                     # `.queued` until their first `attempt=N` stamp lands after
@@ -1128,7 +1331,11 @@ class LLMProvider:
             reset_request_context(request_token)
             reset_response_usage(usage_token)
 
-        return result
+        # Single scrub point for every structured/text LLM response in the engine:
+        # a model can emit a lone `\udXXX` escape that JSON decoding turns into an
+        # un-encodable surrogate, and the field it lands in is not knowable here
+        # (#3729). Clean output is returned unchanged, object identity included.
+        return sanitize_llm_value(result)
 
     async def call_with_tools(
         self,
@@ -1210,8 +1417,7 @@ class LLMProvider:
             attempt_gated = self._provider_impl.supports_attempt_scoped_concurrency()
             async with AsyncExitStack() as stack:
                 if not attempt_gated:
-                    for sem in _semaphores_for_scope(scope):
-                        await stack.enter_async_context(sem)
+                    await _acquire_permits(stack, scope)
                     # Permits in hand — only now leave `.queued`; attempt-gated
                     # providers stay `.queued` until their first post-acquire
                     # `attempt=N` stamp (see call() above, #3002).
@@ -1273,7 +1479,9 @@ class LLMProvider:
             reset_request_context(request_token)
             reset_response_usage(usage_token)
 
-        return result
+        # Same scrub for the tool-calling path: the agent's text content and every
+        # tool-call argument are model-authored and flow on to storage and reranking.
+        return sanitize_llm_value(result)
 
     def set_response_callback(self, fn: Any) -> None:
         """Set a callback invoked on each call() instead of the fixed mock response."""
@@ -1317,7 +1525,8 @@ class LLMProvider:
         """
         Load OAuth credentials from the Codex ``auth.json``.
 
-        Honors ``CODEX_HOME`` (falling back to ``~/.codex``).
+        Honors this provider's ``codex_home``, then ``CODEX_HOME`` (falling back
+        to ``~/.codex``).
 
         Returns:
             Tuple of (access_token, account_id).
@@ -1328,7 +1537,7 @@ class LLMProvider:
         """
         from .providers.codex_auth import default_codex_auth_file
 
-        auth_file = default_codex_auth_file()
+        auth_file = default_codex_auth_file(self.codex_home)
 
         if not auth_file.exists():
             raise FileNotFoundError(
@@ -1446,6 +1655,7 @@ class LLMProvider:
             ENV_LLM_BASE_URL,
             ENV_LLM_BEDROCK_SERVICE_TIER,
             ENV_LLM_CACHE_AFFINITY,
+            ENV_LLM_CODEX_HOME,
             ENV_LLM_DEFAULT_HEADERS,
             ENV_LLM_EXTRA_BODY,
             ENV_LLM_GEMINI_SAFETY_SETTINGS,
@@ -1476,9 +1686,7 @@ class LLMProvider:
         if not api_key and not requires_api_key(provider):
             pass  # Provider handles its own auth
         elif not api_key:
-            raise ValueError(
-                f"{ENV_LLM_API_KEY} environment variable is required (unless using openai-codex, claude-code, or litellm)"
-            )
+            raise ValueError(f"{ENV_LLM_API_KEY} environment variable is required for provider '{provider}'")
 
         base_url = os.getenv(ENV_LLM_BASE_URL, "")
         model = os.getenv(ENV_LLM_MODEL) or _get_default_model_for_provider(provider)
@@ -1517,6 +1725,7 @@ class LLMProvider:
             prompt_cache_enabled=prompt_cache_enabled,
             ollama_num_ctx=_parse_optional_positive_int(ENV_LLM_OLLAMA_NUM_CTX, os.getenv(ENV_LLM_OLLAMA_NUM_CTX)),
             litellmrouter_config=_parse_llm_router_config(ENV_LLM_LITELLMROUTER_CONFIG),
+            codex_home=os.getenv(ENV_LLM_CODEX_HOME) or None,
             vertexai_project_id=os.getenv(ENV_LLM_VERTEXAI_PROJECT_ID) or None,
             vertexai_region=os.getenv(ENV_LLM_VERTEXAI_REGION) or None,
             vertexai_service_account_key=os.getenv(ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY) or None,

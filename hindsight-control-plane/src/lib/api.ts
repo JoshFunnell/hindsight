@@ -49,6 +49,8 @@ export interface KnowledgeNode {
   tags: string[];
   timestamp: string | null;
   is_stale: boolean | null;
+  /** Pages only: when the page rebuilds itself and over which facts. Null on folders. */
+  trigger: MentalModel["trigger"] | null;
   children: KnowledgeNode[];
 }
 
@@ -184,8 +186,10 @@ export interface OperationProgress {
 
 export type TagsMatch = "any" | "all" | "any_strict" | "all_strict" | "exact";
 
+export type TagResolution = "exact" | "fuzzy";
+
 export type TagGroup =
-  | { tags: string[]; match?: TagsMatch }
+  | { tags: string[]; match?: TagsMatch; resolve?: TagResolution }
   | { and: TagGroup[] }
   | { or: TagGroup[] }
   | { not: TagGroup };
@@ -202,6 +206,7 @@ export interface MentalModel {
     mode?: "full" | "delta";
     refresh_after_consolidation: boolean;
     refresh_cron?: string | null;
+    min_refresh_interval_seconds?: number | null;
     fact_types?: Array<"world" | "experience" | "observation">;
     exclude_mental_models?: boolean;
     exclude_mental_model_ids?: string[];
@@ -214,6 +219,8 @@ export interface MentalModel {
     keep_trace?: boolean;
   };
   last_refreshed_at: string;
+  /** Newest in-scope memory this model has seen. Staleness compares against this. */
+  last_memory_seen_at: string | null;
   created_at: string;
   reflect_response?: any;
   is_stale?: boolean | null;
@@ -234,6 +241,18 @@ export type RefreshOutcome =
   | "content_preserved_no_new_facts"
   | "refresh_failed_empty_candidate"
   | "refresh_failed_delta_not_applied";
+
+/** Why a refresh refused to write, as recorded on the model's own history. */
+export type RefreshFailureReason =
+  | "empty_candidate"
+  | "structured_doc_unreadable"
+  | "delta_ops_failed"
+  | "delta_ops_all_skipped"
+  | "delta_not_applied"
+  | "structured_output_failed"
+  | "retrieval_failed"
+  | "no_answer"
+  | "unexpected_error";
 
 export interface MentalModelRefreshScope {
   tags?: string[] | null;
@@ -413,10 +432,18 @@ export class ControlPlaneClient {
   }
 
   /**
-   * List all banks
+   * List one page of banks, most recently written first.
    */
-  async listBanks() {
-    return this.fetchApi<{ banks: any[] }>("/api/banks", { cache: "no-store" as RequestCache });
+  async listBanks(params?: { q?: string; limit?: number; offset?: number }) {
+    const search = new URLSearchParams();
+    if (params?.q) search.set("q", params.q);
+    if (params?.limit !== undefined) search.set("limit", String(params.limit));
+    if (params?.offset !== undefined) search.set("offset", String(params.offset));
+    const query = search.toString();
+    return this.fetchApi<{ banks: any[]; total: number; limit: number; offset: number }>(
+      `/api/banks${query ? `?${query}` : ""}`,
+      { cache: "no-store" as RequestCache }
+    );
   }
 
   /**
@@ -466,12 +493,15 @@ export class ControlPlaneClient {
     query_timestamp?: string;
     tags?: string[];
     tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    tag_groups?: TagGroup[];
     min_scores?: {
       semantic?: number | null;
       keyword?: number | null;
       reranker?: number | null;
       final?: number | null;
     };
+    /** Window for the temporal retrieval arm, used instead of extracting dates from the query text. Ranks memories dated inside it higher; does not drop memories dated outside it. */
+    temporal_window?: { start: string; end: string };
   }) {
     return this.fetchApi("/api/recall", {
       method: "POST",
@@ -491,6 +521,7 @@ export class ControlPlaneClient {
     include_tool_calls?: boolean;
     tags?: string[];
     tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    tag_groups?: TagGroup[];
     apply_all_directives?: boolean;
     fact_types?: Array<"world" | "experience" | "observation">;
     exclude_mental_models?: boolean;
@@ -625,6 +656,10 @@ export class ControlPlaneClient {
         updated_at?: string | null;
         status: string;
         error_message: string | null;
+        /** For a pending operation, a value in the future means the worker is
+         *  holding it back until then — a mental-model refresh waiting out
+         *  min_refresh_interval_seconds, or an extension deferring the task. */
+        next_retry_at?: string | null;
         progress?: OperationProgress | null;
       }>;
     }>(`/api/operations/${encodeURIComponent(bankId)}${query ? `?${query}` : ""}`);
@@ -778,7 +813,17 @@ export class ControlPlaneClient {
    */
   async createKnowledgePage(
     bankId: string,
-    body: { name: string; source_query: string; parent_id?: string | null; tags?: string[] }
+    body: {
+      name: string;
+      source_query: string;
+      parent_id?: string | null;
+      /** Scopes which memories build the page — see `trigger.tags_match`, which defaults
+       *  to `all_strict` (every tag required, untagged memories excluded). */
+      tags?: string[];
+      /** Refresh settings. Applied as a patch over the knowledge-page defaults, so sending
+       *  one field does not reset the rest. */
+      trigger?: { tags_match?: TagsMatch };
+    }
   ) {
     return this.fetchApi<{ page_id: string; mental_model_id: string; operation_id: string | null }>(
       `/api/knowledge-base/pages?bank_id=${encodeURIComponent(bankId)}`,
@@ -799,6 +844,17 @@ export class ControlPlaneClient {
       source_query?: string;
       tags?: string[];
       max_tokens?: number;
+      /** Refresh settings to change. Applied as a patch: the fields sent are updated and the
+       *  rest keep the page's current values, so setting a schedule doesn't reset the rest. */
+      trigger?: {
+        mode?: "full" | "delta";
+        refresh_after_consolidation?: boolean;
+        refresh_cron?: string | null;
+        min_refresh_interval_seconds?: number | null;
+        fact_types?: Array<"world" | "experience" | "observation">;
+        exclude_mental_models?: boolean;
+        tags_match?: TagsMatch;
+      };
     }
   ) {
     return this.fetchApi<KnowledgeNode>(
@@ -1046,6 +1102,7 @@ export class ControlPlaneClient {
       occurredEnd?: string;
       factType?: "world" | "experience";
       entities?: string[];
+      resolveEntities?: boolean;
       state?: "valid" | "invalidated";
       reason?: string;
     }
@@ -1057,6 +1114,7 @@ export class ControlPlaneClient {
     if (update.occurredEnd !== undefined) body.occurred_end = update.occurredEnd;
     if (update.factType !== undefined) body.fact_type = update.factType;
     if (update.entities !== undefined) body.entities = update.entities;
+    if (update.resolveEntities !== undefined) body.resolve_entities = update.resolveEntities;
     if (update.state !== undefined) body.state = update.state;
     if (update.reason !== undefined) body.reason = update.reason;
     return this.fetchApi(memoryApi(memoryId, bankId), {
@@ -1153,13 +1211,24 @@ export class ControlPlaneClient {
   /**
    * List directives for a bank
    */
-  async listDirectives(bankId: string, tags?: string[], tagsMatch?: string) {
+  async listDirectives(
+    bankId: string,
+    tags?: string[],
+    tagsMatch?: string,
+    options: { limit?: number; offset?: number } = {}
+  ) {
     const params = new URLSearchParams();
     if (tags && tags.length > 0) {
       tags.forEach((t) => params.append("tags", t));
     }
     if (tagsMatch) {
       params.append("tags_match", tagsMatch);
+    }
+    if (options.limit !== undefined) {
+      params.append("limit", String(options.limit));
+    }
+    if (options.offset !== undefined) {
+      params.append("offset", String(options.offset));
     }
     const query = params.toString();
     return this.fetchApi<{
@@ -1174,7 +1243,25 @@ export class ControlPlaneClient {
         created_at: string;
         updated_at: string;
       }>;
+      /** Every directive matching the filter, not just this page. */
+      total: number;
+      limit: number;
+      offset: number;
     }>(bankApi(bankId, `/directives${query ? `?${query}` : ""}`));
+  }
+
+  /**
+   * List every directive for a bank, paging until `total` is reached.
+   */
+  async listAllDirectives(bankId: string, tags?: string[], tagsMatch?: string) {
+    const PAGE_SIZE = 1000;
+    const items: Awaited<ReturnType<typeof this.listDirectives>>["items"] = [];
+    for (let offset = 0; ; offset += PAGE_SIZE) {
+      const page = await this.listDirectives(bankId, tags, tagsMatch, { limit: PAGE_SIZE, offset });
+      items.push(...(page.items || []));
+      if (items.length >= page.total || !page.items?.length) break;
+    }
+    return items;
   }
 
   /**
@@ -1279,6 +1366,7 @@ export class ControlPlaneClient {
       updated_at: string | null;
       completed_at: string | null;
       error_message: string | null;
+      next_retry_at?: string | null;
       progress?: OperationProgress | null;
       result_metadata?: {
         items_count?: number;
@@ -1286,6 +1374,14 @@ export class ControlPlaneClient {
         num_sub_batches?: number;
         is_parent?: boolean;
         [key: string]: any;
+      } | null;
+      /** Typed, per-operation-type outcome payload, discriminated by its own
+       *  operation_type. Null for types that report none and for operations
+       *  still in flight. */
+      details?: {
+        operation_type: "refresh_mental_model";
+        outcome: string;
+        failure_reason?: string | null;
       } | null;
       child_operations?: Array<{
         operation_id: string;
@@ -1425,6 +1521,7 @@ export class ControlPlaneClient {
           mode?: "full" | "delta";
           refresh_after_consolidation: boolean;
           refresh_cron?: string | null;
+          min_refresh_interval_seconds?: number | null;
           fact_types?: Array<"world" | "experience" | "observation">;
           exclude_mental_models?: boolean;
           exclude_mental_model_ids?: string[];
@@ -1437,13 +1534,40 @@ export class ControlPlaneClient {
           keep_trace?: boolean;
         };
         last_refreshed_at: string;
+        last_memory_seen_at: string | null;
+        /** Whether a memory in this model's own scope has been written since it last read them. */
+        is_stale: boolean | null;
         created_at: string;
         reflect_response?: {
           text: string;
           based_on: Record<string, Array<{ id: string; text: string; type: string }>>;
         };
       }>;
+      /** Every mental model matching the filter, not just this page. */
+      total: number;
+      limit: number;
+      offset: number;
     }>(bankApi(bankId, `/mental-models${query ? `?${query}` : ""}`));
+  }
+
+  /**
+   * List every mental model for a bank, paging until `total` is reached.
+   *
+   * The endpoint caps a response at 1000 models, so anything that needs the
+   * whole set (the list view, the freshness card) has to page.
+   */
+  async listAllMentalModels(
+    bankId: string,
+    options: { tags?: string[]; tagsMatch?: string; detail?: "metadata" | "content" | "full" } = {}
+  ) {
+    const PAGE_SIZE = 1000;
+    const items: Awaited<ReturnType<typeof this.listMentalModels>>["items"] = [];
+    for (let offset = 0; ; offset += PAGE_SIZE) {
+      const page = await this.listMentalModels(bankId, { ...options, limit: PAGE_SIZE, offset });
+      items.push(...(page.items || []));
+      if (items.length >= page.total || !page.items?.length) break;
+    }
+    return items;
   }
 
   /**
@@ -1462,6 +1586,7 @@ export class ControlPlaneClient {
         mode?: "full" | "delta";
         refresh_after_consolidation: boolean;
         refresh_cron?: string | null;
+        min_refresh_interval_seconds?: number | null;
         fact_types?: Array<"world" | "experience" | "observation">;
         exclude_mental_models?: boolean;
         exclude_mental_model_ids?: string[];
@@ -1507,6 +1632,7 @@ export class ControlPlaneClient {
         mode?: "full" | "delta";
         refresh_after_consolidation: boolean;
         refresh_cron?: string | null;
+        min_refresh_interval_seconds?: number | null;
         fact_types?: Array<"world" | "experience" | "observation">;
         exclude_mental_models?: boolean;
         exclude_mental_model_ids?: string[];
@@ -1531,6 +1657,7 @@ export class ControlPlaneClient {
       trigger: {
         refresh_after_consolidation: boolean;
         refresh_cron?: string | null;
+        min_refresh_interval_seconds?: number | null;
         fact_types?: Array<"world" | "experience" | "observation">;
         exclude_mental_models?: boolean;
         exclude_mental_model_ids?: string[];
@@ -1543,6 +1670,7 @@ export class ControlPlaneClient {
         keep_trace?: boolean;
       };
       last_refreshed_at: string;
+      last_memory_seen_at: string | null;
       created_at: string;
       reflect_response?: {
         text: string;
@@ -1615,6 +1743,12 @@ export class ControlPlaneClient {
           mental_models?: unknown[];
         } | null;
         changed_at: string;
+        /** Present only on failure records: a refresh that refused to write.
+         *  Absent (undefined) on the version snapshots a successful refresh
+         *  writes, which is every row written before failures were recorded. */
+        kind?: "refresh_failed";
+        failure_reason?: RefreshFailureReason;
+        error_message?: string;
       }[]
     >(bankApi(bankId, `/mental-models/${encodeURIComponent(mentalModelId)}/history`));
   }
@@ -1644,17 +1778,20 @@ export class ControlPlaneClient {
   /**
    * Export documents from a bank as a transfer ZIP archive (no LLM re-extraction).
    * Pass documentIds to export specific documents, or omit to export the whole bank.
-   * Set includeObservations to also carry consolidated observations.
+   * Set includeObservations to also carry consolidated observations. Set
+   * includeKnowledgeBase to carry Mental Models and Knowledge Pages.
    * Returns the raw zip Blob so callers can trigger a download.
    */
   async exportDocuments(
     bankId: string,
     documentIds?: string[],
-    includeObservations = false
+    includeObservations = false,
+    includeKnowledgeBase = false
   ): Promise<Blob> {
     const params = new URLSearchParams({ bank_id: bankId });
     (documentIds || []).forEach((id) => params.append("document_id", id));
     if (includeObservations) params.set("include_observations", "true");
+    if (includeKnowledgeBase) params.set("include_knowledge_base", "true");
     // Direct fetch (not fetchApi) because the response is a binary zip, not JSON.
     const response = await fetch(withBasePath(`/api/documents/transfer?${params.toString()}`));
     if (!response.ok) {

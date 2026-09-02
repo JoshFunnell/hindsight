@@ -11,7 +11,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from .tokenization import count_cl100k_tokens
+from ..prompt_utils import default_language_section, escape_for_prompt, output_language_directive
+from .tokenization import count_prompt_tokens
 
 # Fraction of max_context_tokens reserved for tool results in the final synthesis prompt.
 # The remainder covers the system prompt, question, bank context, and output tokens.
@@ -108,6 +109,35 @@ def build_directives_reminder(directives: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+# The reasoning-loop language rule. Emitted only when no output language is configured
+# — see default_language_section(). Like _FINAL_LANGUAGE_RULE it defers to a directive
+# "above", and nothing ever put one there for a configured language: the rule stayed,
+# out-ranked the directive, and the done() answer came back in the question's language
+# on every run that never fell through to forced synthesis (#3776, review).
+_TOOLS_LANGUAGE_RULE = (
+    "## LANGUAGE RULE (default - directives take precedence)\n"
+    "- By default, detect the language of the user's question and respond in that SAME language.\n"
+    "- If the question is in Chinese, respond in Chinese. If in Japanese, respond in Japanese.\n"
+    "- IMPORTANT: The DIRECTIVES section above has HIGHER PRIORITY than this rule.\n"
+    "  If a directive specifies a language (e.g. 'Always respond in French'), follow the directive."
+)
+
+
+def build_agent_user_prompt(query: str, llm_output_language: str | None = None) -> str:
+    """The reasoning loop's opening user message: the question, closed by the directive.
+
+    The ``done()`` answer is written by the tool-calling model, whose system prompt is
+    :func:`build_system_prompt_for_tools`. For the same reason :func:`build_final_prompt`
+    carries the directive instead of :func:`build_final_system_prompt`, it goes on the user
+    message here rather than at the end of the system prompt: the question arrives after
+    the system prompt and out-ranks it. Tool results still follow over later turns, so
+    this is "last" for the question the model is answering, not for the whole
+    conversation — the system prompt dropping its contradicting rule is what makes the
+    directive uncontested (#3776).
+    """
+    return query + output_language_directive(llm_output_language)
+
+
 def build_system_prompt_for_tools(
     bank_profile: dict[str, Any],
     context: str | None = None,
@@ -115,6 +145,8 @@ def build_system_prompt_for_tools(
     has_mental_models: bool = False,
     include_observations: bool = True,
     budget: str | None = None,
+    answer_as_document: bool = False,
+    llm_output_language: str | None = None,
 ) -> str:
     """
     Build the system prompt for tool-calling reflect agent.
@@ -136,6 +168,9 @@ def build_system_prompt_for_tools(
         has_mental_models: Whether the bank has any mental models (skip if not)
         include_observations: Whether search_observations is in the tool list.
         budget: Search depth budget - "low", "mid", or "high". Controls exploration thoroughness.
+        answer_as_document: Whether done() takes a structured document instead of markdown.
+        llm_output_language: Configured output language; drops the default language rule
+            (the directive itself goes on the user message, see build_agent_user_prompt).
     """
     name = bank_profile.get("name", "Assistant")
     mission = bank_profile.get("mission", "")
@@ -163,14 +198,15 @@ def build_system_prompt_for_tools(
         ]
     )
 
+    # Mutually exclusive with the configured output language — the rule is dropped
+    # outright rather than left to out-rank the directive (#3776). The directive itself
+    # is not appended here: it rides on the user message, see build_agent_user_prompt().
+    tools_language_section = default_language_section(_TOOLS_LANGUAGE_RULE, llm_output_language)
+    if tools_language_section:
+        parts.extend([tools_language_section.rstrip("\n"), ""])
+
     parts.extend(
         [
-            "## LANGUAGE RULE (default - directives take precedence)",
-            "- By default, detect the language of the user's question and respond in that SAME language.",
-            "- If the question is in Chinese, respond in Chinese. If in Japanese, respond in Japanese.",
-            "- IMPORTANT: The DIRECTIVES section above has HIGHER PRIORITY than this rule.",
-            "  If a directive specifies a language (e.g. 'Always respond in French'), follow the directive.",
-            "",
             "## CRITICAL RULES",
             "- ONLY use information from tool results - no external knowledge or guessing",
             "- You SHOULD synthesize, infer, and reason from the retrieved memories",
@@ -393,19 +429,59 @@ def build_system_prompt_for_tools(
     steps.append("When ready, call done() with your answer and supporting IDs")
     parts.extend(f"{idx}. {step}" for idx, step in enumerate(steps, 1))
 
-    parts.extend(
-        [
-            "",
-            "## Output Format: Well-Formatted Markdown Answer",
-            "Call done() with a well-formatted markdown 'answer' field.",
-            "- USE markdown formatting for structure (headers, lists, bold, italic, code blocks, tables, etc.)",
-            "- CRITICAL: Add blank lines before and after block elements (tables, code blocks, lists)",
-            "- Format for clarity and readability with proper spacing and hierarchy",
-            "- NEVER include memory IDs, UUIDs, or 'Memory references' in the answer text",
-            "- Put IDs ONLY in the memory_ids/mental_model_ids/observation_ids arrays, not in the answer",
-            "- CRITICAL: This is a NON-CONVERSATIONAL system. NEVER ask follow-up questions, offer further assistance, or suggest next steps. Your answer must be complete and self-contained. The user cannot reply.",
-        ]
-    )
+    common_output_rules = [
+        "- NEVER include memory IDs, UUIDs, or 'Memory references' in the answer text",
+        "- Put IDs ONLY in the memory_ids/mental_model_ids/observation_ids arrays, not in the answer",
+        "- CRITICAL: This is a NON-CONVERSATIONAL system. NEVER ask follow-up questions, offer further assistance, or suggest next steps. Your answer must be complete and self-contained. The user cannot reply.",
+    ]
+    if answer_as_document:
+        # The document is stored as structure and the markdown is rendered from
+        # it, so asking for "a markdown answer" here would be asking for the one
+        # thing the caller does not want (see tools_schema's document tool).
+        parts.extend(
+            [
+                "",
+                "## Output Format: Structured Document",
+                "Call done() with a 'document' field. Do NOT write a markdown document — "
+                "state its structure and the markdown is generated from it.",
+                # Name the wrapper and show it. Every field of a *section* was spelled out
+                # here — heading, level, blocks — and the array holding them never was, so
+                # the prose described a section while the tool schema described a document
+                # containing sections. Models resolved that disagreement in favour of the
+                # prose and emitted the bare section, which parsed to zero sections, an
+                # empty render, and a failed refresh. A shape stated in one place and shown
+                # in another is a shape that gets filled correctly.
+                "- 'document' holds a 'sections' array — one entry per section, in order. "
+                'Shape: {"sections": [{"heading": "Overview", "level": 2, "blocks": '
+                '["First paragraph.", "- a list item\\n- another"]}]}',
+                "- Even a one-section document uses the 'sections' array; never emit a bare section",
+                "- Each section carries its heading text (no '#') and a level; the heading is NOT a block",
+                "- 'blocks' holds the section's content, ONE block per paragraph, list, table or code fence",
+                "- Never put two paragraphs in one block, and never put a heading inside a block",
+                "- Inside a block, write list items and table rows on their own lines as usual",
+                # Stating the structure is a more clerical task than writing prose, and a
+                # model doing clerical work gets terse: measured against the markdown
+                # answer it replaced, the first version of this produced noticeably
+                # shorter documents that judges liked less. Say plainly that the
+                # structure is the shape, not a budget.
+                "- The structure is how the answer is laid out, NOT a reason to say less: give each "
+                "block the same specifics, numbers, names and examples you would write in prose",
+                "- Prefer a section with several blocks over one block that summarises them away",
+                *common_output_rules,
+            ]
+        )
+    else:
+        parts.extend(
+            [
+                "",
+                "## Output Format: Well-Formatted Markdown Answer",
+                "Call done() with a well-formatted markdown 'answer' field.",
+                "- USE markdown formatting for structure (headers, lists, bold, italic, code blocks, tables, etc.)",
+                "- CRITICAL: Add blank lines before and after block elements (tables, code blocks, lists)",
+                "- Format for clarity and readability with proper spacing and hierarchy",
+                *common_output_rules,
+            ]
+        )
 
     # Volatile "now" reference goes here — after all the static instructions and
     # right before the bank-specific/custom data. Everything above is identical
@@ -494,13 +570,13 @@ def _cut_entry_to_budget(entry: dict, token_budget: int) -> dict:
         output_str = json.dumps(output, indent=2, default=str, ensure_ascii=False)
     except (TypeError, ValueError):
         output_str = str(output)
-    tokens = count_cl100k_tokens(output_str)
+    tokens = count_prompt_tokens(output_str)
     while output_str and tokens > token_budget:
         # Proportional shrink with a safety margin; the loop guards against the
         # estimate landing high, and always makes progress.
         keep = min(len(output_str) - 1, max(1, int(len(output_str) * token_budget / tokens * 0.95)))
         output_str = output_str[:keep]
-        tokens = count_cl100k_tokens(output_str)
+        tokens = count_prompt_tokens(output_str)
     return {**entry, "output": {"truncated": True, "content": output_str}}
 
 
@@ -538,7 +614,7 @@ def split_context_history(context_history: list[dict], max_context_tokens: int) 
         current_tokens += tokens
 
     for entry in context_history:
-        tokens = count_cl100k_tokens(_render_history_block(entry))
+        tokens = count_prompt_tokens(_render_history_block(entry))
         if tokens <= budget:
             _append_block(entry, tokens)
             continue
@@ -555,27 +631,27 @@ def split_context_history(context_history: list[dict], max_context_tokens: int) 
         )
         if split_key is None:
             cut = _cut_entry_to_budget(entry, budget)
-            _append_block(cut, count_cl100k_tokens(_render_history_block(cut)))
+            _append_block(cut, count_prompt_tokens(_render_history_block(cut)))
             continue
 
         items = output[split_key]
         piece: list = []
         for item in items:
             candidate = {**entry, "output": {**output, split_key: piece + [item]}}
-            if piece and count_cl100k_tokens(_render_history_block(candidate)) > budget:
+            if piece and count_prompt_tokens(_render_history_block(candidate)) > budget:
                 partial = {**entry, "output": {**output, split_key: piece}}
-                _append_block(partial, count_cl100k_tokens(_render_history_block(partial)))
+                _append_block(partial, count_prompt_tokens(_render_history_block(partial)))
                 piece = []
                 candidate = {**entry, "output": {**output, split_key: [item]}}
-            single_tokens = count_cl100k_tokens(_render_history_block(candidate))
+            single_tokens = count_prompt_tokens(_render_history_block(candidate))
             if not piece and single_tokens > budget:
                 cut = _cut_entry_to_budget({**entry, "output": {**output, split_key: [item]}}, budget)
-                _append_block(cut, count_cl100k_tokens(_render_history_block(cut)))
+                _append_block(cut, count_prompt_tokens(_render_history_block(cut)))
             else:
                 piece.append(item)
         if piece:
             partial = {**entry, "output": {**output, split_key: piece}}
-            _append_block(partial, count_cl100k_tokens(_render_history_block(partial)))
+            _append_block(partial, count_prompt_tokens(_render_history_block(partial)))
 
     _close_current()
     return chunks
@@ -636,10 +712,15 @@ def build_final_prompt(
     additional_context: str | None = None,
     max_context_tokens: int = 100_000,
     max_tokens: int | None = None,
+    llm_output_language: str | None = None,
 ) -> str:
     """Build the final prompt when forcing a text response (no tools).
 
     ``max_tokens`` is the soft visible-length target (see ``_length_directive``).
+
+    ``llm_output_language`` closes the prompt with :func:`output_language_directive`.
+    It rides on the USER message, not the system prompt, because it has to be the last
+    thing the model reads — see :func:`build_final_system_prompt` for the measurement.
 
     Callers overflow-proof this via ``split_context_history``: when the whole
     history fits one chunk this renders it directly, and the per-block budget
@@ -658,7 +739,7 @@ def build_final_prompt(
         truncated = False
         for entry in reversed(context_history):
             block = _render_history_block(entry)
-            block_tokens = count_cl100k_tokens(block)
+            block_tokens = count_prompt_tokens(block)
             if block_tokens > token_budget:
                 truncated = True
                 break
@@ -681,7 +762,7 @@ def build_final_prompt(
     if length_directive is not None:
         parts.append(length_directive)
 
-    return "\n".join(parts)
+    return "\n".join(parts) + output_language_directive(llm_output_language)
 
 
 #: System prompt for the intermediate (map) calls of split synthesis. They do
@@ -727,6 +808,7 @@ def build_reduce_prompt(
     bank_profile: dict,
     additional_context: str | None = None,
     max_tokens: int | None = None,
+    llm_output_language: str | None = None,
 ) -> str:
     """Build the final prompt that synthesizes the answer from per-chunk claims.
 
@@ -736,6 +818,9 @@ def build_reduce_prompt(
     in different sections — that is why the claims carry ``mentioned_at``: the
     supersession rule (latest statement wins) must be applied across sections,
     not within one.
+
+    Carries the output-language directive for the same reason, and in the same place, as
+    :func:`build_final_prompt` — this is the other prompt that writes a user-visible answer.
     """
     parts = _bank_identity_section(bank_profile, additional_context)
 
@@ -762,7 +847,7 @@ def build_reduce_prompt(
     if length_directive is not None:
         parts.append(length_directive)
 
-    return "\n".join(parts)
+    return "\n".join(parts) + output_language_directive(llm_output_language)
 
 
 _FINAL_SYSTEM_PROMPT_BASE = """CRITICAL: You MUST ONLY use information from retrieved tool results. NEVER make up names, people, events, or entities.
@@ -802,6 +887,12 @@ CRITICAL: This is a NON-CONVERSATIONAL system. NEVER ask follow-up questions, of
 # be repeated for the answer-writing model. Without it, weaker models drift to
 # English even when the question/facts are in another language or a directive
 # demands a specific one (the cause of flaky multilingual reflect tests).
+#
+# Emitted only when no output language is configured — see default_language_section().
+# The escape hatch below defers to a directive "above", but nothing ever put one there:
+# with a configured language the model saw this rule, phrased more forcefully, and
+# answered in the question's language instead. Retain and consolidation drop their rule
+# for exactly this reason (#3776); reflect does too.
 _FINAL_LANGUAGE_RULE = (
     "## LANGUAGE\n"
     "- Respond in the SAME language as the user's question "
@@ -821,22 +912,31 @@ def build_final_system_prompt(
     ``directives`` are re-injected here (they live in the agent/reasoning prompt,
     but the final answer is a separate call) so output-constraining rules — most
     visibly response language — are honoured by the model that actually writes
-    the answer. When ``llm_output_language`` is set it forces that language
-    regardless of the query/source/directive language (config override wins).
-    """
-    from hindsight_api.engine.prompt_utils import escape_for_prompt, output_language_directive
+    the answer.
 
+    ``llm_output_language`` drops the answer-in-the-question's-language default rather
+    than leaving it to contradict the directive. It does NOT add the directive here.
+    That is deliberate and measured: this prompt is the system message, and the question
+    and the retrieved data both arrive *after* it in the user message. Appending the
+    directive at the end of this string still leaves it out-ranked by everything the
+    model reads next — a Chinese question with the output language set to English came
+    back in Chinese 12 times out of 12 on gemini-2.5-flash-lite, and 0/5 on
+    gemini-2.5-flash, with no contradicting rule anywhere in the prompt. Moving the same
+    directive to the end of the user message is 12/12 and 5/5 English. So
+    :func:`build_final_prompt` and :func:`build_reduce_prompt` carry it instead, where it
+    is genuinely the last thing the model reads (#3776).
+    """
     role_section = escape_for_prompt(mission.strip()) if mission else _DEFAULT_FINAL_ROLE
 
     parts = [build_directives_section(directives) if directives else ""]
     parts.append(_FINAL_SYSTEM_PROMPT_BASE.format(role_section=role_section))
-    parts.append(_FINAL_LANGUAGE_RULE)
+    parts.append(default_language_section(_FINAL_LANGUAGE_RULE, llm_output_language))
     parts.append(build_directives_reminder(directives) if directives else "")
     # Volatile "now" reference last, so the static/per-bank instructions above
     # remain a cacheable prefix and only this timestamp falls outside the cache.
     parts.append(_current_datetime_section())
 
-    return "\n\n".join(p.strip() for p in parts if p.strip()) + output_language_directive(llm_output_language)
+    return "\n\n".join(p.strip() for p in parts if p.strip())
 
 
 # Backward-compatible constant for non-identity missions
@@ -848,12 +948,11 @@ STRUCTURED_DELTA_SYSTEM_PROMPT = """You are integrating *new information* into a
 You will be given:
 1. TOPIC — the question this document answers. Content that does not help
    answer this question is OFF-TOPIC and should be removed.
-2. CURRENT DOCUMENT (JSON) — the existing structured mental model. Each section
-   has a stable ``id``, a ``heading``, a ``level`` (1..6), and an ordered list
-   of ``blocks``. Blocks are typed: ``paragraph``, ``bullet_list``,
-   ``ordered_list``, ``code``, or ``table``. Each block also carries its own 0-based
-   ``index`` within the section — READ it, do not count array elements to
-   infer it; a miscounted index is a silent, destructive bug.
+2. CURRENT DOCUMENT (JSON) — the existing structured mental model. It is a list
+   of sections; each section has a stable ``id``, a ``heading``, a ``level``
+   (1..6) and an ordered list of ``blocks``. Each block has a stable ``id`` and
+   a ``text`` field holding one markdown fragment — a paragraph, a list, a
+   table, or a fenced code block.
 3. NEW INFORMATION SYNTHESIS (markdown) — a synthesis showing how the new facts
    relate to the document's topic. Use it to understand context and relevance,
    but do NOT copy its formatting or wording wholesale.
@@ -882,18 +981,11 @@ RULES
   and illustrative ✅/❌ comparisons are MORE valuable than abstract rules.
   When facts contain examples, include them. Never drop an example to make
   room for an abstract restatement of the same point.
-- Operations target sections by ``section_id`` (use the ``id`` field of the
-  section in CURRENT DOCUMENT, NOT the heading). Block operations target
-  blocks by ``index`` (0-based, against the section's current block list) AND
-  ``anchor``: a verbatim excerpt (~50 characters) of that block's own
-  ``text``/``items`` content, copied exactly from what you were shown at that
-  index. ``replace_block`` and ``remove_block`` always need one; for
-  ``insert_block`` it is the block your new block will land before, needed
-  only when ``index`` names an existing block (empty string ``""`` when
-  ``index`` equals the section's block count — you are appending, and there
-  is nothing at that position to anchor against). A wrong or missing anchor
-  causes the op to be silently skipped rather than misapplied, so a correct
-  index alone is not enough — quote it exactly.
+- Operations target sections by ``section_id`` and blocks by ``block_id``. Both
+  are the ``id`` values printed in CURRENT DOCUMENT — **copy them exactly**,
+  never invent one, never use a heading in place of an id, and never guess an
+  id for a block you cannot see. An operation naming an id that does not exist
+  is dropped, and its content never reaches the document.
 - **Add** new content with ``append_block``, ``insert_block``, or ``add_section``
   when facts introduce information not yet covered. Prefer extending an
   existing section over creating a new one.
@@ -902,6 +994,10 @@ RULES
   about topics already in the document.
 - **Remove** content with ``remove_block`` or ``remove_section`` ONLY when
   the new facts explicitly contradict or supersede it.
+- Prefer the *smallest* operation that expresses the change: appending or
+  replacing one block leaves every other block byte-identical, while
+  ``replace_section_blocks`` makes you retype the whole section and risks
+  losing detail you did not intend to change.
 - NEVER emit operations whose only effect is to reword unchanged content.
 - NEVER emit operations to "normalize" formatting (numbered → bulleted, casing
   changes, paragraph → list, etc).
@@ -910,48 +1006,52 @@ RULES
   in the document (e.g., from a concurrent update).
 
 ALLOWED OPERATIONS (each line shows the JSON shape)
-- ``{"op": "append_block", "section_id": "...", "block": {...}}``
-- ``{"op": "insert_block", "section_id": "...", "index": N, "anchor": "...", "block": {...}}``
-- ``{"op": "replace_block", "section_id": "...", "index": N, "anchor": "...", "block": {...}}``
-- ``{"op": "remove_block", "section_id": "...", "index": N, "anchor": "..."}``
-- ``{"op": "add_section", "heading": "...", "level": 2, "blocks": [...], "after_section_id": "..."}``
+- ``{"op": "append_block", "section_id": "...", "text": "..."}``
+- ``{"op": "insert_block", "section_id": "...", "after_block_id": "...", "text": "..."}``
+- ``{"op": "replace_block", "section_id": "...", "block_id": "...", "text": "..."}``
+- ``{"op": "remove_block", "section_id": "...", "block_id": "..."}``
+- ``{"op": "add_section", "heading": "...", "level": 2, "blocks": ["...", "..."], "after_section_id": "..."}``
 - ``{"op": "remove_section", "section_id": "..."}``
-- ``{"op": "replace_section_blocks", "section_id": "...", "blocks": [...]}``
+- ``{"op": "replace_section_blocks", "section_id": "...", "blocks": ["...", "..."]}``
 - ``{"op": "rename_section", "section_id": "...", "new_heading": "..."}``
 
-Block shapes
-- ``{"type": "paragraph", "text": "..."}``
-- ``{"type": "bullet_list", "items": ["...", "..."]}``
-- ``{"type": "ordered_list", "items": ["...", "..."]}``
-- ``{"type": "code", "language": "json", "text": "..."}``
-- ``{"type": "table", "headers": ["col1", "col2"], "rows": [["a", "b"], ["c", "d"]]}``
+BLOCK TEXT RULES
+- Every ``text`` (and every entry of ``blocks``) is ONE markdown fragment:
+  a single paragraph, a single list, a single table, or a single fenced code
+  block. Do not put two paragraphs in one block — emit two operations, or pass
+  two entries in ``blocks``.
+- Write real markdown inside it, with real line breaks encoded as ``\\n``:
+  a list is ``"- one\\n- two"``, a table is
+  ``"| col | col |\\n| --- | --- |\\n| a | b |"``. A table whose rows are not
+  separated by ``\\n`` is not a table.
+- To add a row to an existing table, or an item to an existing list, use
+  ``replace_block`` on that block and re-emit it *with* the addition. A lone
+  table row or bullet appended as its own block is a separate fragment, and a
+  table row on its own is not a table.
+- ``insert_block`` places the new block directly after ``after_block_id``; use
+  ``"after_block_id": null`` to place it first in the section.
 
-OUTPUT FORMAT
-Return ONLY a single JSON object on its own, with no prose before or after,
-no markdown code fences, no commentary. The object must have exactly one
-top-level key, ``operations``, whose value is an array of operation objects
-(empty array when nothing changes).
+JSON STRING RULES (critical)
+- Every string must be valid JSON: escape ``"`` as ``\\"``, backslashes as
+  ``\\\\``, and every line break as ``\\n``. Never put a raw newline inside a
+  JSON string.
+- Return ONLY a single JSON object, with no prose before or after, no markdown
+  code fences, no commentary. The object must have exactly one top-level key,
+  ``operations``, whose value is an array of operation objects (empty array
+  when nothing changes).
+- Do not append extra ``]`` or ``}`` after the closing ``}`` of the root object.
 
 Examples
 - No changes needed → ``{"operations": []}``
-- Add one bullet to an existing "Members" section →
+- Add one bullet list to an existing "Members" section →
   ``{"operations": [{"op": "append_block", "section_id": "members",
-  "block": {"type": "bullet_list", "items": ["Carol — junior engineer"]}}]}``
-- Replace a paragraph that has been corrected by new facts →
+  "text": "- Carol — junior engineer"}]}``
+- Replace a paragraph that new facts have corrected →
   ``{"operations": [{"op": "replace_block", "section_id": "overview",
-  "index": 0, "anchor": "Old summary text as shown at index 0",
-  "block": {"type": "paragraph", "text": "Updated summary."}}]}``
+  "block_id": "b3f9a1c2", "text": "Updated summary."}]}``
 - Remove an obsolete block →
-  ``{"operations": [{"op": "remove_block", "section_id": "status", "index": 2,
-  "anchor": "Text of the block currently at index 2"}]}``
-
-JSON STRING RULES (critical)
-- Every ``text`` and ``items`` string must be valid JSON: escape ``"`` as ``\\"``,
-  backslashes as ``\\\\``, and newlines as ``\\n``. Do not use raw backticks inside
-  strings unless needed; prefer plain quotes for file paths.
-- ``replace_block``, ``insert_block``, and ``remove_block`` MUST include ``index`` (0-based block position in that section, as annotated on each block) AND ``anchor`` (verbatim excerpt of the block's own content at that index; empty string ``""`` only for an ``insert_block`` appending at the end). Use ``replace_section_blocks`` only when replacing every block in a section.
-
-- Do not append extra ``]`` or ``}`` after the closing ``}`` of the root object."""
+  ``{"operations": [{"op": "remove_block", "section_id": "status",
+  "block_id": "b17c4d80"}]}``"""
 
 #: The same task, asked without a prior reflect synthesis: the delta fast path
 #: calls the model straight off the retrieved window, so SUPPORTING FACTS is the
@@ -987,16 +1087,13 @@ the ``{"operations": [...]}`` object exactly as described above."""
 _STRUCTURED_DELTA_DEFAULT_MAX_INPUT_TOKENS = 24_000
 
 
-def _truncate_cl100k(text: str, max_tokens: int) -> str:
-    """Truncate text to at most max_tokens using cl100k_base."""
+def _truncate_prompt_text(text: str, max_tokens: int) -> str:
+    """Truncate text to at most max_tokens under the configured encoding."""
     if max_tokens <= 0:
         return ""
-    from .tokenization import count_cl100k_tokens
+    from ..token_encoding import truncate_to_tokens
 
-    if count_cl100k_tokens(text) <= max_tokens:
-        return text
-    enc = __import__("tiktoken").get_encoding("cl100k_base")
-    return enc.decode(enc.encode(text)[:max_tokens])
+    return truncate_to_tokens(text, max_tokens).text
 
 
 def _fit_structured_delta_prompt_parts(
@@ -1009,12 +1106,12 @@ def _fit_structured_delta_prompt_parts(
     task_footer: str,
     max_input_tokens: int,
 ) -> tuple[str, str, str, bool]:
-    """Shrink large prompt sections to fit within max_input_tokens (cl100k estimate)."""
-    from .tokenization import count_cl100k_tokens
+    """Shrink large prompt sections to fit within max_input_tokens (tokenizer estimate)."""
+    from .tokenization import count_prompt_tokens
 
     fixed = (
         f"## Topic\n{source_query}\n\n"
-        f"## CURRENT DOCUMENT (apply ops to this; reference section ids as listed)\n"
+        f"## CURRENT DOCUMENT (apply ops to this; copy section and block ids from it verbatim)\n"
         f"```json\n\n```\n\n"
         f"## NEW INFORMATION SYNTHESIS (context for how new facts relate to the topic)\n"
         f"```markdown\n\n```\n\n"
@@ -1023,14 +1120,14 @@ def _fit_structured_delta_prompt_parts(
         f"{task_footer}"
     )
     facts_header = "## SUPPORTING FACTS (new since last refresh — integrate these)\n"
-    facts_prefix_tokens = count_cl100k_tokens(facts_header)
+    facts_prefix_tokens = count_prompt_tokens(facts_header)
     reserved_facts = min(4096, max(512, max_input_tokens // 8))
-    doc_budget = max(1024, (max_input_tokens - count_cl100k_tokens(fixed) - reserved_facts) * 55 // 100)
-    cand_budget = max(512, (max_input_tokens - count_cl100k_tokens(fixed) - reserved_facts) * 30 // 100)
+    doc_budget = max(1024, (max_input_tokens - count_prompt_tokens(fixed) - reserved_facts) * 55 // 100)
+    cand_budget = max(512, (max_input_tokens - count_prompt_tokens(fixed) - reserved_facts) * 30 // 100)
     facts_budget = max(256, reserved_facts - facts_prefix_tokens)
-    doc_json = _truncate_cl100k(current_document_json, doc_budget)
-    candidate = _truncate_cl100k(candidate_markdown, cand_budget)
-    facts_body = _truncate_cl100k(facts_block, facts_budget)
+    doc_json = _truncate_prompt_text(current_document_json, doc_budget)
+    candidate = _truncate_prompt_text(candidate_markdown, cand_budget)
+    facts_body = _truncate_prompt_text(facts_block, facts_budget)
     truncated = doc_json != current_document_json or candidate != candidate_markdown or facts_body != facts_block
     return doc_json, candidate, facts_body, truncated
 
@@ -1043,6 +1140,8 @@ def build_structured_delta_prompt(
     source_query: str,
     max_output_tokens: int | None = None,
     max_input_tokens: int | None = None,
+    document_tokens: int | None = None,
+    document_budget: int | None = None,
 ) -> str:
     """Build the user prompt for a structured-delta mental model refresh.
 
@@ -1068,10 +1167,38 @@ def build_structured_delta_prompt(
         budget_hint = (
             f"\n\n## Output budget\n"
             f"Your JSON response must fit within ~{max_output_tokens} tokens. If you "
-            "would need more than this to express every change, prefer the highest-"
-            "leverage edits first (a few ``replace_section_blocks`` ops over many "
-            "block-level ops) so the response always parses as valid JSON."
+            "would need more than this to express every change, emit the highest-"
+            "leverage edits first and drop the rest — a truncated response parses as "
+            "nothing and loses every change, while a short one keeps the ones you sent."
         )
+
+    # The *document's* budget, which is a different thing from the response budget
+    # above and was previously not mentioned to this call at all. A delta refresh
+    # only ever adds, so a long-lived page grows a little on every round and
+    # crosses its configured budget after a few hundred of them with nothing in
+    # the pipeline noticing. Enforcing it by truncation would delete knowledge
+    # nobody asked to delete, so it is stated as a constraint the model satisfies
+    # the same way it does everything else here — with operations, on the content
+    # that has actually gone stale.
+    document_hint = ""
+    if document_budget is not None and document_tokens is not None:
+        if document_tokens >= document_budget:
+            document_hint = (
+                f"\n\n## Document budget (EXCEEDED)\n"
+                f"The document is ~{document_tokens} tokens against a budget of {document_budget}. "
+                "As well as integrating the new facts, make room: remove or merge blocks that are "
+                "superseded, duplicated, or no longer help answer the TOPIC, using remove_block, "
+                "replace_block or replace_section_blocks. Reclaim space from stale content — never "
+                "by dropping the facts you are integrating, and never by summarising a section that "
+                "is still current into a sentence."
+            )
+        elif document_tokens >= int(document_budget * 0.8):
+            document_hint = (
+                f"\n\n## Document budget\n"
+                f"The document is ~{document_tokens} tokens against a budget of {document_budget}. "
+                "It is close to the limit, so prefer replacing stale blocks over appending new ones "
+                "where the new facts update something the document already covers."
+            )
 
     task_footer = (
         "## Task\n"
@@ -1098,11 +1225,163 @@ def build_structured_delta_prompt(
 
     return (
         f"## Topic\n{source_query}\n\n"
-        f"## CURRENT DOCUMENT (apply ops to this; reference section ids as listed)\n"
+        f"## CURRENT DOCUMENT (apply ops to this; copy section and block ids from it verbatim)\n"
         f"```json\n{doc_json}\n```\n\n"
         f"## NEW INFORMATION SYNTHESIS (context for how new facts relate to the topic)\n"
         f"```markdown\n{candidate}\n```\n\n"
         f"## SUPPORTING FACTS (new since last refresh — integrate these)\n{facts_body}"
+        f"{document_hint}{budget_hint}{truncation_note}\n\n"
+        f"{task_footer}"
+    )
+
+
+STRUCTURED_RETRACTION_SYSTEM_PROMPT = """You are removing *retracted information* from an existing structured document.
+
+You will be given:
+1. TOPIC — the question this document answers.
+2. CURRENT DOCUMENT (JSON) — the existing document. Each section has a stable
+   ``id``, a ``heading``, a ``level`` (1..6), and an ordered list of ``blocks``.
+   Each block has a stable ``id`` and a ``text`` field holding one markdown
+   fragment — a paragraph, a list, a table, or a fenced code block.
+3. RETRACTED FACTS — facts this document was built from that have since been
+   removed from the memory bank. They are no longer true, no longer supported,
+   or were withdrawn. The document may still state them.
+4. STILL-SUPPORTED FACTS — other facts this document is built on that remain
+   valid. They are listed so you can tell which content survives.
+
+Your task: output a JSON object ``{"operations": [...]}`` that removes from
+CURRENT DOCUMENT anything that rests on the RETRACTED FACTS, and nothing else.
+
+RULES
+- **Remove only what the retracted facts support.** If a sentence, bullet, row, or
+  section states a retracted fact, remove it (``remove_block``, ``remove_section``)
+  or rewrite it to drop just that claim (``replace_block``,
+  ``replace_section_blocks``) when the block also carries content that survives.
+- **When in doubt, keep it.** The document was written from far more facts than you
+  are shown, and blocks do not record which fact they came from. Content that merely
+  looks related to a retracted fact, or that could plausibly rest on evidence you
+  cannot see, must be left exactly as it is. Removing something still true is worse
+  than leaving something stale: the deletion is not recoverable, and no later pass
+  can restore it.
+- **A restated fact was not retracted.** If a retracted fact's content also appears
+  in STILL-SUPPORTED FACTS, the underlying information was re-ingested rather than
+  withdrawn — only its identifier changed. Keep that content.
+- **Do not add anything.** No ``append_block``, no ``insert_block``, no
+  ``add_section``. This pass only takes away.
+- **Do not tidy.** No rewording, reordering, or reformatting of surviving content.
+  Never leave a note saying something was removed — the document must read as though
+  the retracted claim was never there.
+- If removing a block would leave its section empty and the section exists only for
+  that content, remove the section instead.
+- Output ``{"operations": []}`` when nothing in the document rests on the retracted
+  facts. That is a normal, expected answer.
+
+ALLOWED OPERATIONS (each line shows the JSON shape)
+- ``{"op": "remove_block", "section_id": "...", "block_id": "..."}``
+- ``{"op": "remove_section", "section_id": "..."}``
+- ``{"op": "replace_block", "section_id": "...", "block_id": "...", "text": "..."}``
+- ``{"op": "replace_section_blocks", "section_id": "...", "blocks": ["...", "..."]}``
+
+Blocks are addressed by ``block_id`` — the ``id`` printed beside each block in
+CURRENT DOCUMENT. Copy it exactly; never invent one, and never use a position.
+An operation naming an id that does not exist is dropped, so a retraction that
+guesses removes nothing.
+
+Every ``text`` (and every entry of ``blocks``) is ONE markdown fragment, written
+as it should appear: ``"- one\\n- two"`` for a list,
+``"| col | col |\\n| --- | --- |\\n| a | b |"`` for a table.
+
+OUTPUT FORMAT
+Return ONLY a single JSON object, with no prose before or after, no markdown code
+fences, no commentary. The object must have exactly one top-level key,
+``operations``, whose value is an array of operation objects (empty array when
+nothing changes).
+
+JSON STRING RULES (critical)
+- Every string must be valid JSON: escape ``"`` as ``\\"``, backslashes as
+  ``\\\\``, and every line break as ``\\n``. Never put a raw newline inside a
+  JSON string.
+- Do not append extra ``]`` or ``}`` after the closing ``}`` of the root object."""
+
+
+def build_structured_retraction_prompt(
+    *,
+    current_document_json: str,
+    retracted_facts: list[dict[str, Any]],
+    surviving_facts: list[dict[str, Any]],
+    source_query: str,
+    max_output_tokens: int | None = None,
+    max_input_tokens: int | None = None,
+) -> str:
+    """Build the user prompt for the retraction ("unsay") pass of a delta refresh.
+
+    ``retracted_facts`` and ``surviving_facts`` are stored ``based_on`` entries —
+    ``{id, text, type, context}``. The retracted ones are quoted from the document's
+    own record because the rows themselves are gone: an observation swept away with
+    its source keeps no history, so this copy is all that is left of what it said.
+
+    ``surviving_facts`` are passed so the model can tell re-ingestion from
+    withdrawal. When a document is re-retained its facts return under fresh ids, and
+    the old ids read as retracted even though nothing was actually withdrawn; seeing
+    the same content on both lists is what stops that from deleting live content.
+    """
+
+    def _lines(facts: list[dict[str, Any]]) -> str:
+        out: list[str] = []
+        for fact in facts:
+            text = (fact.get("text") or "").strip().replace("\n", " ")
+            out.append(f"- [{fact.get('type', '')}] {text}")
+        return "\n".join(out)
+
+    retracted_block = _lines(retracted_facts) or "(none)"
+    surviving_block = _lines(surviving_facts) or "(none listed)"
+
+    budget_hint = ""
+    if max_output_tokens is not None:
+        budget_hint = (
+            f"\n\n## Output budget\n"
+            f"Your JSON response must fit within ~{max_output_tokens} tokens. If more "
+            "removals are needed than fit, prefer the highest-leverage ones first "
+            "(``replace_section_blocks`` over many block-level ops) so the response "
+            "always parses as valid JSON."
+        )
+
+    task_footer = (
+        "## Task\n"
+        "Output a JSON object matching the operations schema, removing content that "
+        "rests on the RETRACTED FACTS. Leave everything else untouched. Emit "
+        '``{"operations": []}`` if nothing in the document rests on them.'
+    )
+
+    # Reuse the delta fitter: same three oversized inputs (document, and two fact
+    # lists standing in for synthesis + facts), same budget split, so a large
+    # document cannot push the retracted list out of the window.
+    input_cap = max_input_tokens if max_input_tokens is not None else _STRUCTURED_DELTA_DEFAULT_MAX_INPUT_TOKENS
+    doc_json, surviving_body, retracted_body, input_truncated = _fit_structured_delta_prompt_parts(
+        source_query=source_query,
+        current_document_json=current_document_json,
+        candidate_markdown=surviving_block,
+        facts_block=retracted_block,
+        budget_hint=budget_hint,
+        task_footer=task_footer,
+        max_input_tokens=input_cap,
+    )
+    truncation_note = ""
+    if input_truncated:
+        truncation_note = (
+            "\n\n*Note: Document or fact lists were truncated to fit the model context "
+            "window. Prefer minimal, high-leverage operations, and keep anything you "
+            "cannot confidently attribute to a retracted fact.*"
+        )
+
+    return (
+        f"## Topic\n{source_query}\n\n"
+        f"## CURRENT DOCUMENT (apply ops to this; reference section ids as listed)\n"
+        f"```json\n{doc_json}\n```\n\n"
+        f"## STILL-SUPPORTED FACTS (these remain valid — do not remove content resting on them)\n"
+        f"{surviving_body}\n\n"
+        f"## RETRACTED FACTS (no longer in the memory bank — remove content resting on these)\n"
+        f"{retracted_body}"
         f"{budget_hint}{truncation_note}\n\n"
         f"{task_footer}"
     )

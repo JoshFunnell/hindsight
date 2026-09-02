@@ -28,6 +28,7 @@ from .base import (
     EntityPrunePassResult,
     MemoriesExtension,
     MemoryPatch,
+    MemoryScopeWatermark,
     RecallArms,
     RelinkPassResult,
     ScanPage,
@@ -52,32 +53,28 @@ class PostgresMemories(MemoriesExtension):
         facts: list,
         document_id: str | None = None,
         defer_index: bool = False,
-        txn=None,
     ) -> list[str]:
-        # `txn` is ignored: Postgres memories live in the caller's own transaction, so the
-        # write is already atomic with it — there is no separate store to hold invisible.
         # `defer_index` is meaningless here: the INSERT that returns the ids is
         # also what indexes the facts, so there is nothing to defer.
         return await writes.insert_facts(conn=conn, ops=ops, bank_id=bank_id, facts=facts, document_id=document_id)
 
-    async def delete_facts(self, bank_id: str, unit_ids: list[str], *, txn=None) -> None:
+    async def delete_facts(self, bank_id: str, unit_ids: list[str]) -> None:
         """No-op: the caller's `memory_units` DELETE (or its FK cascade) removed them."""
 
-    async def delete_where(self, bank_id: str, predicate: DeletePredicate, txn=None) -> int:
+    async def delete_where(self, bank_id: str, predicate: DeletePredicate) -> int:
         """No-op: predicate deletes are issued as SQL by the caller that owns the transaction."""
         return 0
 
-    async def delete_document(self, *, conn, fq_table, bank_id: str, document_id: str, txn=None) -> None:
-        # `txn` ignored: Postgres memories are covered by the caller's own transaction.
+    async def delete_document(self, *, conn, fq_table, bank_id: str, document_id: str) -> None:
         await writes.delete_document(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id)
 
     async def drop_bank_storage(self, bank_id: str) -> None:
         """No-op: deleting the bank cascades to its memories."""
 
-    async def delete_observations(self, *, conn, fq_table, bank_id: str, txn=None) -> None:
+    async def delete_observations(self, *, conn, fq_table, bank_id: str) -> None:
         await writes.delete_observations(conn=conn, fq_table=fq_table, bank_id=bank_id)
 
-    async def update_memories(self, bank_id: str, patches: list[MemoryPatch], txn=None) -> None:
+    async def update_memories(self, bank_id: str, patches: list[MemoryPatch]) -> None:
         """No-op: the caller's UPDATE already wrote the row it holds open."""
 
     # ------------------------------------------------------------------ recall
@@ -100,6 +97,7 @@ class PostgresMemories(MemoriesExtension):
         created_before: datetime | None = None,
         min_semantic: float | None = None,
         min_keyword: float | None = None,
+        enable_text_search: bool = True,
         enable_graph: bool = True,
     ) -> "dict[str, RecallArms]":
         """Run every recall arm for Postgres by orchestrating the split per-arm SQL internally.
@@ -107,8 +105,8 @@ class PostgresMemories(MemoriesExtension):
         The per-arm split is Postgres's own business, kept off the interface: this reproduces the
         exact orchestration recall used before it was unified — one dense+BM25 UNION query and the
         temporal query share a single connection, then the graph retriever runs per fact_type on the
-        pool in parallel, seeded by the same dense over-fetch. Result is byte-identical to running
-        the arms separately; fusion/rerank still happen downstream.
+        pool in parallel, seeded by the same dense results. Result is byte-identical to running the
+        arms separately; fusion/rerank still happen downstream.
         """
         import asyncio
 
@@ -150,6 +148,7 @@ class PostgresMemories(MemoriesExtension):
                 min_semantic=min_semantic,
                 min_keyword=min_keyword,
                 graph_seed_min_similarity=graph_seed_min_similarity,
+                enable_text_search=enable_text_search,
             )
 
             temporal_by_ft: dict[str, list] = {}
@@ -172,7 +171,7 @@ class PostgresMemories(MemoriesExtension):
                 )
 
         # Graph per fact_type in parallel, on the pool, after the dense connection is released —
-        # seeded by the dense over-fetch (preselected_semantic_seeds), matching the prior path.
+        # seeded by the dense results (preselected_semantic_seeds), matching the prior path.
         graph_by_ft: dict[str, list] = {ft: [] for ft in fact_types}
         if enable_graph:
             assert retriever is not None  # only resolved when the arm is on
@@ -227,7 +226,16 @@ class PostgresMemories(MemoriesExtension):
         min_semantic: float | None = None,
         min_keyword: float | None = None,
         graph_seed_min_similarity: float | None = None,
+        enable_text_search: bool = True,
     ) -> "dict[str, SemanticBm25Result]":
+        """The dense + keyword arms, as one UNION query.
+
+        How deep the ANN scan goes is not decided here: the connection carries
+        ``hnsw.iterative_scan``, which lets the scan resume until this query's own LIMIT
+        is met (see ``_ANN_TUNING_HIGH_RECALL``). Before that was enabled the scan
+        stopped at ``hnsw.ef_search`` rows — a fixed 200 — so a larger recall budget
+        widened the SQL and changed nothing.
+        """
         # Imported here: retrieval imports this package, so a module-level import
         # would close the cycle.
         from ..search.retrieval import retrieve_semantic_bm25_combined_sql
@@ -247,6 +255,7 @@ class PostgresMemories(MemoriesExtension):
             min_semantic=min_semantic,
             min_keyword=min_keyword,
             graph_seed_min_similarity=graph_seed_min_similarity,
+            enable_text_search=enable_text_search,
         )
 
     async def temporal_search(
@@ -387,7 +396,6 @@ class PostgresMemories(MemoriesExtension):
         unit_ids: list[str],
         when: datetime | None,
         failed: bool = False,
-        txn=None,
     ) -> None:
         await reads.mark_consolidated(
             conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids, when=when, failed=failed
@@ -416,6 +424,19 @@ class PostgresMemories(MemoriesExtension):
             tag_groups=tag_groups,
         )
 
+    async def any_memory_updated_since_batch(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        scopes: list[MemoryScopeWatermark],
+    ) -> dict[str, bool]:
+        return await reads.any_memory_updated_since_batch(conn=conn, fq_table=fq_table, bank_id=bank_id, scopes=scopes)
+
+    async def live_memory_ids(self, *, conn, fq_table, bank_id: str, unit_ids: list[Any]) -> set[str]:
+        return await reads.live_memory_ids(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids)
+
     # -- count surfaces --
 
     async def consolidation_freshness(self, *, conn, fq_table, bank_id: str) -> dict[str, Any]:
@@ -441,7 +462,7 @@ class PostgresMemories(MemoriesExtension):
 
     # ------------------------------------------------------------------ observations
 
-    async def upsert_observation(self, *, conn, bank_id: str, record, txn=None) -> None:
+    async def upsert_observation(self, *, conn, bank_id: str, record) -> None:
         """No-op: the observation was written as a `memory_units` row by the caller."""
 
     async def observations_for_sources(
@@ -465,7 +486,7 @@ class PostgresMemories(MemoriesExtension):
         ops,
         fq_table,
         bank_id: str,
-        fact_type: str | None = None,
+        fact_type: str | list[str] | None = None,
         search_query: str | None = None,
         consolidation_state: str | None = None,
         state: str | None = None,
@@ -503,9 +524,7 @@ class PostgresMemories(MemoriesExtension):
     async def get_archived_memory(self, *, conn, fq_table, bank_id: str, unit_id: str) -> StoredMemory | None:
         return await writes.get_archived_memory(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id)
 
-    async def invalidate_memory(
-        self, *, conn, fq_table, bank_id: str, unit_id: str, reason: str | None, txn=None
-    ) -> bool:
+    async def invalidate_memory(self, *, conn, fq_table, bank_id: str, unit_id: str, reason: str | None) -> bool:
         return await writes.invalidate_memory(
             conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id, reason=reason
         )
@@ -515,10 +534,10 @@ class PostgresMemories(MemoriesExtension):
             conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id, reason=reason
         )
 
-    async def restore_memory(self, *, conn, fq_table, bank_id: str, unit_id: str, txn=None) -> StoredMemory | None:
+    async def restore_memory(self, *, conn, fq_table, bank_id: str, unit_id: str) -> StoredMemory | None:
         return await writes.restore_memory(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id)
 
-    async def set_memory_embedding(self, *, conn, fq_table, bank_id: str, unit_id: str, embedding, txn=None) -> None:
+    async def set_memory_embedding(self, *, conn, fq_table, bank_id: str, unit_id: str, embedding) -> None:
         await writes.set_memory_embedding(
             conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id, embedding=embedding
         )
@@ -541,7 +560,9 @@ class PostgresMemories(MemoriesExtension):
         event_date,
         mentioned_at,
         entity_ids: list[str] | None,
-        txn=None,
+        entity_names: list[str] | None = None,  # noqa: ARG002 — this store's registry is SQL; the host already minted+linked, so entity_ids is authoritative.
+        embedding=None,
+        current_fact_type: str | None = None,  # noqa: ARG002 — one UPDATE writes every field, so a fact-type change needs no different path.
     ) -> None:
         await writes.apply_edit(
             conn=conn,
@@ -556,6 +577,7 @@ class PostgresMemories(MemoriesExtension):
             event_date=event_date,
             mentioned_at=mentioned_at,
             entity_ids=entity_ids,
+            embedding=embedding,
         )
 
     async def list_entities(
@@ -626,7 +648,14 @@ class PostgresMemories(MemoriesExtension):
     # ------------------------------------------------------------------ maintenance
 
     async def record_unit_entities(
-        self, *, conn, ops, fq_table, bank_id: str | None = None, unit_ids: list[Any], entity_ids: list[Any]
+        self,
+        *,
+        conn,
+        ops,
+        fq_table,
+        bank_id: str | None = None,
+        unit_ids: list[Any],
+        entity_ids: list[Any],
     ) -> None:
         # The join is keyed by global unit id, so bank_id is not needed here.
         await ops.bulk_insert_unit_entities(conn, fq_table("unit_entities"), unit_ids, entity_ids)

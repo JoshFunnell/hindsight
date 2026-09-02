@@ -48,8 +48,8 @@ def document_serialization_sql(table: str, alias: str) -> str:
     that were racing each other for one document are put in a line.
 
     A peer wedged in 'processing' holds its document until claim recovery
-    releases it, the same caveat ``graph_maintenance_bank_serialization_sql``
-    carries and the same general gap.
+    releases it, the same caveat ``bank_serialization_sql`` carries and the same
+    general gap.
 
     The candidate row is always 'pending' and the 'pending' branch is
     strictly-older, so the subquery can never match the candidate itself. The
@@ -78,40 +78,64 @@ def document_serialization_sql(table: str, alias: str) -> str:
     """
 
 
-def graph_maintenance_bank_serialization_sql(table: str, alias: str) -> str:
-    """SQL predicate serialising ``graph_maintenance`` claims per bank (#3230).
+_BANK_SERIALIZED_OPERATION_TYPES = ("graph_maintenance", "consolidation")
 
-    Every graph_maintenance run for a bank is interchangeable — the payload
-    carries only ``bank_id``, and ``run_graph_maintenance_job`` drains that bank's
-    queues — so a second concurrent run for one bank adds no work. It is worse than
-    useless: ``claim_graph_maintenance_batch`` locks queue rows ``FOR UPDATE``
-    *without* ``SKIP LOCKED`` (it is written assuming a single runner per bank),
-    so the runs convoy on each other's row locks while each holds a worker slot.
 
-    Same guarantee ``consolidation`` already gets from its ``bank_id != ALL(busy)``
-    exclusion, and the same caveat: a row wedged in 'processing' holds its bank
-    until something releases it (``hindsight-admin recover``, or a restart with a
-    stable ``HINDSIGHT_API_WORKER_ID`` so ``recover_own_tasks`` matches it). That
-    is a general gap in claim recovery, not specific to graph_maintenance.
+def bank_serialization_sql(table: str, alias: str, operation_type: str | None = None) -> str:
+    """SQL predicate keeping one bank to a single in-flight run, per operation type.
 
-    Two differences from the consolidation form, both forced by the shape of this
-    problem:
+    Applies to the operation types whose runs for a bank are *interchangeable*
+    — the payload carries only ``bank_id`` and the job drains that bank's whole
+    backlog — so a second concurrent run for the same bank recomputes the first
+    one's work and adds nothing:
 
-    * It is a **predicate**, not a separate claim phase. Pulling graph_maintenance
-      into its own phase after the generic shared-pool query would drop it below
-      every other operation type: it has no reserved-slot floor
-      (``WORKER_SLOT_TYPE_DEFAULTS`` gives consolidation 2 and graph_maintenance
-      0), and the poller's fairness pass calls ``claim_tasks`` with
-      ``shared_limit=1``, so a single pending retain would starve it indefinitely.
-      As a predicate it keeps competing by ``created_at``.
-    * It also suppresses every same-bank row but the oldest **within one batch**.
-      Excluding busy banks alone does not: with several pending rows and nothing
-      yet processing, one batch claims them all — the convoy, unchanged. Several
-      pending rows per bank are reachable through the recovery paths
+    * ``graph_maintenance`` (#3230). ``claim_graph_maintenance_batch`` locks
+      queue rows ``FOR UPDATE`` *without* ``SKIP LOCKED`` (it is written
+      assuming a single runner per bank), so concurrent runs also convoy on each
+      other's row locks while each holds a worker slot.
+    * ``consolidation`` (#3700). Two runs claimed together read the same
+      ``total_unconsolidated`` backlog and hand the same memories to the LLM
+      twice — pure duplicated inference on the slowest path in the system.
+
+    Ordering, not just exclusion, is the point, and both halves of the predicate
+    are needed:
+
+    * The ``processing`` branch is the guarantee across batches and across
+      workers: a bank with a run in flight is not claimed again.
+    * The strictly-older ``pending`` branch is the guarantee *within* one batch.
+      Excluding busy banks alone does not give it: with several pending rows and
+      nothing yet processing, one batch claims them all. Several pending rows per
+      bank are reachable through the recovery paths
       (``_reclaim_own_processing_tasks`` resets *all* of a worker's processing
       rows in one statement, from ``recover_own_tasks`` at startup and
       ``release_own_tasks`` at shutdown, plus ``_schedule_retry`` /
-      ``_defer_operation`` / ``hindsight-admin recover``).
+      ``_defer_operation`` / ``hindsight-admin recover``). It also covers the
+      window in which a peer is claimed but not yet committed as ``processing``:
+      a concurrent worker reads it as the older ``pending`` row and stands down.
+
+    This is a **predicate**, not a separate claim phase, because
+    ``graph_maintenance`` cannot afford to be one: it has no reserved-slot floor
+    (``WORKER_SLOT_TYPE_DEFAULTS`` gives consolidation 2 and graph_maintenance
+    0), and the poller's fairness pass calls ``claim_tasks`` with
+    ``shared_limit=1``, so a phase after the generic shared-pool query would let
+    a single pending retain starve it indefinitely. As a predicate it keeps
+    competing by ``created_at``. Consolidation has its own claim path (bank
+    priority tiers); the same predicate goes on every query there.
+
+    Suppression here only *defers* — unlike the submit-time dedup in
+    ``_submit_async_operation``, nothing is dropped. That is why scoped
+    consolidations (``observation_scopes``, which submit-time dedup deliberately
+    exempts because a scoped run covers only its tag subset) need no carve-out:
+    they queue behind the bank's in-flight run instead of racing it, and are
+    claimed on a later poll with a fresh watermark.
+
+    The caveat is unchanged: a row wedged in 'processing' holds its bank until
+    something releases it (``hindsight-admin recover``, or a restart with a
+    stable ``HINDSIGHT_API_WORKER_ID`` so ``recover_own_tasks`` matches it). That
+    is a general gap in claim recovery, not specific to these operation types.
+
+    Rows of any other operation type are unaffected, and banks are independent
+    of one another, so this costs no parallelism anywhere else.
 
     The candidate row is always 'pending' and the 'pending' branch is
     strictly-older, so the subquery can never match the candidate itself. The
@@ -121,23 +145,60 @@ def graph_maintenance_bank_serialization_sql(table: str, alias: str) -> str:
     Args:
         table: Fully-qualified async_operations table.
         alias: Alias of the outer candidate row in the calling query.
+        operation_type: The one type the calling query is already restricted to,
+            if it is restricted to one — consolidation has its own claim path.
+            Matches peers against that constant and drops the guard on the
+            candidate's type, which can only be true there. Leave unset for the
+            mixed-type claim queries, where the candidate's own type has to pick
+            its peers and rows of every other type must fall straight through.
+            Inlined into the SQL text, so it is checked against the known set.
     """
+    if operation_type is None:
+        types = ", ".join(f"'{t}'" for t in _BANK_SERIALIZED_OPERATION_TYPES)
+        candidate_guard = f"{alias}.operation_type NOT IN ({types}) OR "
+        peer_type = f"{alias}.operation_type"
+    elif operation_type in _BANK_SERIALIZED_OPERATION_TYPES:
+        candidate_guard = ""
+        peer_type = f"'{operation_type}'"
+    else:
+        raise ValueError(f"{operation_type} is not serialised per bank: {_BANK_SERIALIZED_OPERATION_TYPES}")
+
     return f"""
-        ({alias}.operation_type <> 'graph_maintenance' OR NOT EXISTS (
-            SELECT 1 FROM {table} gm_peer
-            WHERE gm_peer.bank_id = {alias}.bank_id
-              AND gm_peer.operation_type = 'graph_maintenance'
+        ({candidate_guard}NOT EXISTS (
+            SELECT 1 FROM {table} bank_peer
+            WHERE bank_peer.bank_id = {alias}.bank_id
+              AND bank_peer.operation_type = {peer_type}
               AND (
-                  gm_peer.status = 'processing'
-                  OR (gm_peer.status = 'pending'
-                      AND gm_peer.task_payload IS NOT NULL
-                      AND (gm_peer.next_retry_at IS NULL OR gm_peer.next_retry_at <= NOW())
-                      AND (gm_peer.created_at < {alias}.created_at
-                           OR (gm_peer.created_at = {alias}.created_at
-                               AND gm_peer.operation_id < {alias}.operation_id)))
+                  bank_peer.status = 'processing'
+                  OR (bank_peer.status = 'pending'
+                      AND bank_peer.task_payload IS NOT NULL
+                      AND (bank_peer.next_retry_at IS NULL OR bank_peer.next_retry_at <= NOW())
+                      AND (bank_peer.created_at < {alias}.created_at
+                           OR (bank_peer.created_at = {alias}.created_at
+                               AND bank_peer.operation_id < {alias}.operation_id)))
               )
         ))
     """
+
+
+@dataclass
+class ClaimedOperations:
+    """One claim cycle's rows, plus where the bank rotation got to.
+
+    ``claim_tasks`` picks the bank whose turn it is *inside* the claim query, so
+    the caller cannot know which bank that was from the rows alone — the
+    rotation row is not distinguishable from the ones claimed by age. Handing
+    the cursor back keeps the rotation's state in the poller (where the tenant
+    rotation already lives) without costing a second statement to ask.
+    """
+
+    rows: list[ResultRow]
+    """Claimed rows, rotation row first, then oldest-first."""
+
+    next_bank_cursor: str
+    """Bank served by the rotation, to claim past next time. Empty string starts
+    a new round — which is what an empty rotation tier means: no bank sorts after
+    the cursor any more."""
 
 
 @dataclass
@@ -491,7 +552,12 @@ class DataAccessOps(ABC):
         index_clause: str,
         fact_types: dict[str, str],
     ) -> None:
-        """Create per-bank partial vector indexes.
+        """Create per-bank partial vector indexes for a freshly created bank.
+
+        Only reached when the size threshold is off (the default), where indexes
+        are created up front rather than earned; with a threshold set, the
+        maintenance operation builds them CONCURRENTLY off the request path
+        instead. See ``per_bank_indexes_are_eager``.
 
         PG creates per-(bank, fact_type) partial indexes.
         Non-PG is a no-op (uses global index).
@@ -745,21 +811,31 @@ class DataAccessOps(ABC):
         reserved_limits: dict[str, int],
         shared_limit: int,
         *,
+        bank_cursor: str = "",
         consolidation_bank_priority: dict[str, int] | None = None,
-    ) -> list[ResultRow]:
+    ) -> ClaimedOperations:
         """Claim pending tasks from the async_operations table.
 
-        PG implementation can use NOT EXISTS + FOR UPDATE SKIP LOCKED in one query.
-        Oracle implementation uses two-step claims (query busy banks first, then
-        claim excluding them) to avoid ORA-02014.
+        Implementations must apply :func:`bank_serialization_sql` to every query
+        that can return a ``graph_maintenance`` or ``consolidation`` row, so at
+        most one such row per bank is ever in flight, and
+        :func:`document_serialization_sql` to every query that can return a
+        ``retain`` row, so at most one retain per document is ever in flight.
 
-        Implementations must apply :func:`graph_maintenance_bank_serialization_sql`
-        to every query that can return a ``graph_maintenance`` row, so at most one
-        such row per bank is ever in flight, and :func:`document_serialization_sql`
-        to every query that can return a ``retain`` row, so at most one retain per
-        document is ever in flight.
+        The shared pool must additionally be claimed with one row taken for the
+        bank after ``bank_cursor`` — deficit round robin with a quantum of one
+        slot, the rest of the pool still filled oldest-first. Without it,
+        claiming is a global FIFO and one bank mid-backfill holds every slot
+        until its queue drains, so a bank with a single queued write waits
+        behind the whole backlog (#3861). Both tiers belong in *one* statement:
+        the rotation is a bounded index seek, the backfill is the query that was
+        always there, and a separate seek would cost a round trip on every claim.
 
         Args:
+            bank_cursor: Bank the rotation served last; the claim takes one row for
+                the first bank sorting after it. The empty string starts a round
+                from the beginning, and is also what a caller with no rotation
+                state passes.
             consolidation_bank_priority: Per-bank priority for consolidation scheduling.
                 Maps bank name patterns to integer priorities (higher = claimed first).
                 Patterns support ``*`` as wildcard (converted to SQL ``%`` for LIKE).
@@ -767,9 +843,9 @@ class DataAccessOps(ABC):
                 When set, consolidation tasks are claimed in priority tiers.
                 None preserves current behavior (pure created_at ordering).
 
-        Returns claimed rows with operation_id, operation_type, task_payload,
-        retry_count, bank_id and serialization_key. The caller is responsible for
-        building ClaimedTask objects.
+        Returns the claimed rows — operation_id, operation_type, task_payload,
+        retry_count, bank_id and serialization_key — together with the rotation's
+        next cursor. The caller is responsible for building ClaimedTask objects.
         """
         ...
 

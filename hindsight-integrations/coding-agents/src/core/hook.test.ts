@@ -38,7 +38,7 @@ const UNRELATED_PROMPT = "completely unrelated banana smoothie question";
 
 function makeClient(
   overrides: Partial<{
-    reflect: (query: string, opts: { budget?: string; timeoutMs?: number }) => Promise<string>;
+    reflect: (query: string, opts: { budget?: string; timeoutMs: number }) => Promise<string>;
     listPages: () => Promise<unknown>;
     getPage: (pageId: string) => Promise<unknown>;
   }> = {}
@@ -227,7 +227,7 @@ describe("buildHookOutput", () => {
     });
     expect(client.reflect).not.toHaveBeenCalled();
     expect(out.context ?? "").not.toContain("<hindsight_memory>");
-    // Tool-only mode's pull trigger: the roster refresh must carry the reflect-on-new-goals rule.
+    // Tool-only mode's pull trigger: the roster refresh must carry the pages-first rule.
     const cfg2 = resolveConfig({ autoReflect: false, pageRefreshEveryTurns: 1 });
     const out2 = await buildHookOutput({
       harness: "claude-code",

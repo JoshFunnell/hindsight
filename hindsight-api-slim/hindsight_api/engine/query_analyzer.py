@@ -125,22 +125,47 @@ def _query_can_score(query: str) -> bool:
     return bool(_SCOREABLE_RE.search(_NON_ALNUM_RE.sub("", low)))
 
 
+def _is_bare_year_span(tokens: list[str], token_set: set[str]) -> bool:
+    """Whether a matched span's only date content is a single four-digit integer.
+
+    dateparser resolves an isolated four-digit integer to a year, so port
+    numbers, ticket ids and buffer sizes come back as dates that outscore every
+    other candidate — the false-positive class from issue #3250. A real date
+    always carries something more: a second number ("2026-06-10", "15:30"), a
+    month or period word ("March 1890", "year 2019"), or an ordinal/unit suffix
+    ("the 21st", "10am"), all of which leave this predicate False.
+
+    Genuine bare years never reach here: ``extract_period`` runs first and
+    resolves the ones a word disambiguates ("in 2019") to the whole calendar
+    year, which is the window the query actually asks for. This path only sees
+    the ones nothing introduces, where dateparser would have produced the
+    reference date's month/day in that year — a single wrong day.
+    """
+    numeric = [token for token in tokens if token.isdigit()]
+    if len(numeric) != 1 or len(numeric[0]) != 4:
+        return False
+    return not (token_set & _SCOREABLE_WORDS)
+
+
 def _date_match_score(text: str) -> int:
     """Score how strong a temporal signal a matched span carries.
 
-    A score of 0 means the span is a bare token with no explicit date content
-    (the false-positive class from issue #2768) and should be rejected. Higher
-    scores mean a stronger, less ambiguous date reference. A digit is the
-    strongest signal (day/year/ISO date); an explicit English month/relative
-    word next; weekday names and period words weakest but still explicit.
+    A score of 0 means the span carries no explicit date content and should be
+    rejected: a bare token (issue #2768) or a lone four-digit integer, which
+    dateparser resolves to a year (issue #3250). Higher scores mean a stronger,
+    less ambiguous date reference. A digit is the strongest signal (day/year/ISO
+    date); an explicit English month/relative word next; weekday names and
+    period words weakest but still explicit.
     """
     tokens = _TOKEN_RE.findall(text.lower())
     if not tokens:
         return 0
+    token_set = set(tokens)
     score = 0
     if any(any(ch.isdigit() for ch in tok) for tok in tokens):
+        if _is_bare_year_span(tokens, token_set):
+            return 0
         score += 100
-    token_set = set(tokens)
     if token_set & _MONTH_WORDS:
         score += 50
     if token_set & _RELATIVE_WORDS:
@@ -430,11 +455,17 @@ class TransformerQueryAnalyzer(QueryAnalyzer):
                 "transformers is required for TransformerQueryAnalyzer. Install it with: pip install transformers"
             )
 
+        from .local_device import align_local_model_weights
+
         logger.info(f"Loading query analyzer model: {self.model_name}...")
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self._model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name)
         self._model.to(self.device)
         self._model.eval()
+        # Zero-copy safetensors weights can land on a sub-element byte offset, which
+        # corrupts the CPU matmul (see engine/local_device.py). `.to()` is a no-op for a
+        # CPU model, so it does not launder the alignment.
+        align_local_model_weights(self._model, label=f"QueryAnalyzer[{self.model_name}]")
         logger.info("Query analyzer model loaded")
 
     def _load_model(self):

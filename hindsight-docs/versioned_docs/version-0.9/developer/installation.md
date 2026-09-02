@@ -77,7 +77,7 @@ Run everything in one container with embedded PostgreSQL:
 ```bash
 export OPENAI_API_KEY=sk-xxx
 
-docker run -it --pull always --name hindsight --restart unless-stopped -p 8888:8888 -p 9999:9999 \
+docker run -it --pull always --name hindsight --restart unless-stopped --shm-size=1g -p 8888:8888 -p 9999:9999 \
   -e HINDSIGHT_API_LLM_API_KEY=$OPENAI_API_KEY \
   -v hindsight-data:/home/hindsight/.pg0 \
   ghcr.io/vectorize-io/hindsight:latest
@@ -89,7 +89,19 @@ docker run -it --pull always --name hindsight --restart unless-stopped -p 8888:8
 :::note Persisting data: named volume vs. host bind mount
 The container runs as a non-root user (UID 1000). The `hindsight-data` **named volume** above is recommended — Docker creates it owned by the container user, so it works with no extra setup.
 
-If you instead bind-mount a **host directory** (`-v $HOME/.hindsight-docker:/home/hindsight/.pg0`), that directory must be writable by UID 1000, or the embedded database fails to start with `Permission denied`. Either `chown` the directory to UID 1000, or run the container as your host user: `--user $(id -u):$(id -g) -e HOME=/home/hindsight` (after `chown`-ing the directory to your own UID).
+If you instead bind-mount a **host directory** (`-v $HOME/.hindsight-docker:/home/hindsight/.pg0`), that directory must be owned by UID 1000, or the embedded database fails to start with `Permission denied`:
+
+```bash
+sudo chown -R 1000:1000 $HOME/.hindsight-docker
+```
+
+Do **not** run the image under a different UID with `--user` to work around this. The image only defines the `hindsight` user (UID 1000), so any other UID has no `/etc/passwd` entry, and startup crashes in a library that looks the running user up by ID:
+
+```
+KeyError: 'getpwuid(): uid not found: 1042'
+```
+
+Running as UID 1000 (the default) with the directory chowned to match is the supported way to use a host bind mount. If you cannot chown the directory — for example on a NAS share mounted with a fixed `uid=` — use a named volume instead.
 :::
 
 All published images are [signed with Cosign](#verifying-image-signatures) — verification is optional.
@@ -104,10 +116,12 @@ Set `HINDSIGHT_API_WORKER_ID` to a stable value (e.g., `-e HINDSIGHT_API_WORKER_
 
 | Variant | Size (AMD64) | Size (ARM64) | When to use |
 |---------|--------------|--------------|-------------|
-| **Full** (`latest`) | ~9 GB | ~3.7 GB | Default. Works out of the box with no external services except the LLM. |
+| **Full** (`latest`) | ~9 GB | ~3.7 GB | Default. Embeddings and reranking run in the image; the LLM is always external, including for local inference. |
 | **Slim** (`slim`) | ~500 MB | ~500 MB | Use when you already rely on external services for embeddings and reranking (OpenAI, Cohere, TEI). Significantly smaller image, faster deploys. Requires [external providers](./configuration#embeddings). |
 
 The slim image corresponds to the [`hindsight-api-slim`](#bare-metal-pip) pip package. See [Configuration](./configuration#embeddings) for external provider options.
+
+Neither image bundles llama.cpp, so the built-in `llamacpp` provider is not available in Docker. To run inference locally, start llama.cpp (or Ollama, LM Studio, vLLM) alongside Hindsight and point `HINDSIGHT_API_LLM_BASE_URL` at it — see [`docker/docker-compose/local-llm/`](https://github.com/vectorize-io/hindsight/tree/main/docker/docker-compose/local-llm) for a working compose file.
 
 ### Bundling Custom Models in a Custom Image
 

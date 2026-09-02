@@ -18,7 +18,9 @@ export async function POST(request: NextRequest) {
       query_timestamp,
       tags,
       tags_match,
+      tag_groups,
       min_scores,
+      temporal_window,
     } = body;
 
     const response = await sdk.recallMemories({
@@ -35,7 +37,9 @@ export async function POST(request: NextRequest) {
         query_timestamp,
         tags,
         tags_match,
+        tag_groups,
         min_scores,
+        temporal_window,
       },
     });
 

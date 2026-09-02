@@ -1,23 +1,11 @@
 """Delta operations for structured mental models.
 
 The LLM's job during a delta refresh is to emit a list of these operations,
-each targeting an existing section (by id) or referencing a position relative
-to one.  ``apply_operations`` validates and applies each op in turn against a
-copy of the document; invalid ops (unknown ``section_id``, out-of-range
-``block_index``, a mismatched block ``anchor``, malformed payloads) are
-dropped with a debug-friendly reason.
-
-Block-targeting ops (``replace_block``, ``remove_block``, and ``insert_block``
-when its index names an existing block) also carry a content ``anchor``: a
-verbatim excerpt of the block the LLM believes is at the given index.
-``apply_operations`` checks the anchor against the block actually there
-before mutating anything. This guards against a wrong-but-in-range index,
-which is otherwise indistinguishable from a correct one — the LLM's only way
-to know a block's index in the compact JSON it is shown is to count array
-elements, and a miscount silently lands the op on the wrong block instead of
-failing loudly. See ``serialize_document_for_delta_prompt`` for the
-prompt-facing view that annotates each block with its index so the model can
-read it instead of counting.
+each targeting an existing section (by id) or a block inside one (by id).
+``apply_operations`` validates and applies each op in turn against a copy of
+the document; invalid ops (unknown ``section_id``, unknown ``block_id``, a
+block that lives in a different section) are dropped with a debug-friendly
+reason.
 
 Sections and blocks not mentioned by any op are physically copied through
 unchanged — there is no LLM-mediated re-emission of unchanged text, so prose
@@ -30,6 +18,14 @@ Why operations and not "output the new structured doc":
 - Operations make the no-change case mechanical: zero ops → identical doc.
 - Operations are auditable: each refresh produces a log of exactly what
   changed, useful for debugging the LLM's behaviour and explaining diffs.
+
+Why blocks are addressed by id and not by index (#3273):
+An index has to be *counted* by the model, and an off-by-one is still in
+range, so it silently overwrites an unrelated block and is recorded as a
+success — no length change for a shrink guard to notice. An id is copied, not
+derived; a wrong one does not resolve and is skipped and reported. Block ids
+travel with the document (see ``structured_doc.Block``), so the model only ever
+has to echo back a string it was given.
 
 Failure modes are by design conservative: an operation list that fails to
 parse against the Pydantic schema, or an LLM that returns invalid ops, results
@@ -44,19 +40,17 @@ import logging
 import re
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
 from hindsight_api.engine.llm_wrapper import parse_llm_json
 
 from .structured_doc import (
     Block,
-    BulletListBlock,
-    CodeBlock,
-    OrderedListBlock,
-    ParagraphBlock,
     Section,
     StructuredDocument,
+    make_block_id,
     make_unique_id,
+    normalize_block_text,
     slugify_heading,
 )
 
@@ -70,67 +64,67 @@ class _OpBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _coerce_block_texts(value: Any) -> Any:
+    """Accept a new block written as ``{"id": ..., "text": ...}`` where a string is expected.
+
+    The document the model is shown gives every existing block an ``id``, and
+    half the operations address blocks *by* ``block_id``. A model that has just
+    read that structure emits ids for the blocks it creates too; the prompt's
+    bare-string example is the only thing saying otherwise, and #3901 is 74
+    ``add_section`` ops over 30 hours where that was not enough. Because this
+    call is deliberately text-mode (the discriminated-union schema is not
+    accepted by every provider — see the call site in ``memory_engine``), the
+    prompt is the only lever there is, so the parser absorbs the second spelling
+    instead of paying a full reflect to reject it.
+
+    The id is *dropped*, not honoured: ``apply_operations`` mints ids for new
+    blocks with ``make_block_id`` against the ids already reserved in this batch,
+    and taking the model's would reintroduce exactly the collisions that scheme
+    exists to prevent. Nothing else is rewritten — an entry that is neither a
+    string nor a ``{"text": ...}`` object is passed through so it still fails
+    with its own validation error rather than being quietly discarded.
+    """
+    if not isinstance(value, list):
+        return value
+    return [item["text"] if isinstance(item, dict) and isinstance(item.get("text"), str) else item for item in value]
+
+
 class AppendBlockOp(_OpBase):
     """Add a new block at the end of an existing section."""
 
     op: Literal["append_block"] = "append_block"
     section_id: str
-    block: Block
+    text: str
 
 
 class InsertBlockOp(_OpBase):
-    """Insert a new block at ``index`` in an existing section.
+    """Insert a new block into an existing section.
 
-    ``index`` may equal ``len(section.blocks)`` (append) but not be greater.
-
-    ``anchor`` names the block this insert will land before: a verbatim
-    excerpt of the block currently at ``index``. Required only when ``index``
-    names an existing block (``index < len(section.blocks)``); at the append
-    position there is no block to anchor against, so ``anchor`` may be left
-    empty there. See ``ReplaceBlockOp`` for the matching rules and why this
-    exists.
+    ``after_block_id`` names the block the new one follows; ``null`` puts it
+    first. An unknown id is a skip, not an append at a guessed position.
     """
 
     op: Literal["insert_block"] = "insert_block"
     section_id: str
-    index: int = Field(ge=0)
-    anchor: str = ""
-    block: Block
+    after_block_id: str | None = None
+    text: str
 
 
 class ReplaceBlockOp(_OpBase):
-    """Replace the block at ``index`` of an existing section.
-
-    ``anchor`` must be a verbatim excerpt (~50 chars) of the block's own
-    content at ``index`` — its ``text`` field, or ``items`` joined with a
-    space for list blocks — copied from what the model was shown at that
-    index. ``apply_operations`` compares it (whitespace-normalized) against
-    the block actually there before replacing it, and skips the op on a
-    mismatch or a missing anchor instead of applying it. This is the guard
-    against a miscounted, wrong-but-in-range ``index``: without it, a wrong
-    index is indistinguishable from a correct one and silently destroys the
-    wrong block's content.
-    """
+    """Replace the text of one block, keeping its position and id."""
 
     op: Literal["replace_block"] = "replace_block"
     section_id: str
-    index: int = Field(ge=0)
-    anchor: str = ""
-    block: Block
+    block_id: str
+    text: str
 
 
 class RemoveBlockOp(_OpBase):
-    """Remove the block at ``index`` of an existing section.
-
-    See ``ReplaceBlockOp`` for the ``anchor`` field's role and matching
-    rules — identical here, since removal is equally destructive of the
-    wrong block on a miscounted index.
-    """
+    """Remove one block from a section."""
 
     op: Literal["remove_block"] = "remove_block"
     section_id: str
-    index: int = Field(ge=0)
-    anchor: str = ""
+    block_id: str
 
 
 class AddSectionOp(_OpBase):
@@ -144,9 +138,14 @@ class AddSectionOp(_OpBase):
     op: Literal["add_section"] = "add_section"
     heading: str
     level: int = Field(default=2, ge=1, le=6)
-    blocks: list[Block] = Field(default_factory=list)
+    blocks: list[str] = Field(default_factory=list)
     after_section_id: str | None = None
     new_id: str | None = None
+
+    @field_validator("blocks", mode="before")
+    @classmethod
+    def _accept_id_bearing_blocks(cls, value: Any) -> Any:
+        return _coerce_block_texts(value)
 
 
 class RemoveSectionOp(_OpBase):
@@ -166,7 +165,12 @@ class ReplaceSectionBlocksOp(_OpBase):
 
     op: Literal["replace_section_blocks"] = "replace_section_blocks"
     section_id: str
-    blocks: list[Block] = Field(default_factory=list)
+    blocks: list[str] = Field(default_factory=list)
+
+    @field_validator("blocks", mode="before")
+    @classmethod
+    def _accept_id_bearing_blocks(cls, value: Any) -> Any:
+        return _coerce_block_texts(value)
 
 
 class RenameSectionOp(_OpBase):
@@ -192,6 +196,10 @@ Operation = Annotated[
 ]
 
 _OPERATION_ADAPTER: TypeAdapter[Operation] = TypeAdapter(Operation)
+
+# Payload fields carrying markdown; kept out of the audit summary so a refresh's
+# operation log stays readable (and small enough to store in reflect_response).
+_BODY_FIELDS = ("text", "blocks")
 
 
 def _validate_operations_list(raw_ops: Any) -> tuple[list[Operation], list[dict[str, Any]]]:
@@ -231,8 +239,17 @@ class DeltaAllOpsInvalidError(ValueError):
 
     Distinct from an empty ``operations`` array (a legitimate no-op): here every
     op was malformed, so returning zero valid ops would make the caller apply
-    nothing and silently drop this refresh's new facts. Raising instead lets the
-    caller fall back to a full rewrite, which still integrates the new facts.
+    nothing while recording a clean refresh, silently dropping this refresh's
+    new facts.
+
+    Raising does *not* buy a full rewrite — the caller catches it, records
+    ``delta_ops_failed`` and refuses to write, because the reflect candidate
+    covers only memories newer than the last refresh and writing it would drop
+    the rest of the document. So the document is preserved and the refresh is
+    reported as failed; the facts arrive on a later round. That makes every
+    raise here the cost of a discarded reflect call, which is why predictable
+    model spellings are absorbed in validation (see ``_coerce_block_texts``)
+    rather than left to fail.
     """
 
 
@@ -335,6 +352,8 @@ def parse_delta_operation_list(raw: Any) -> DeltaOperationList:
         except json.JSONDecodeError as exc:
             last_error = exc
             continue
+        if isinstance(payload, list):
+            payload = {"operations": payload}
         if not isinstance(payload, dict) or "operations" not in payload:
             last_error = ValueError("delta payload must be an object with an operations array")
             continue
@@ -360,128 +379,6 @@ def parse_delta_operation_list(raw: Any) -> DeltaOperationList:
     return DeltaOperationList()
 
 
-# Anchor matching -------------------------------------------------------------
-#
-# Block-targeting ops are validated against the document by *index*, but an
-# index alone cannot distinguish a correct one from a miscounted one that
-# still happens to be in range. The anchor closes that gap: the LLM quotes a
-# short excerpt of the block it believes is at the claimed index, and we
-# check that excerpt against the block actually there before mutating it.
-
-#: ~40-60 chars is enough to disambiguate two blocks that happen to share a
-#: short common opening (e.g. two bullet items both starting "The system"),
-#: while staying cheap for the model to quote and cheap for the prompt to
-#: carry every refresh.
-_ANCHOR_EXCERPT_CHARS = 50
-
-_WHITESPACE_RX = re.compile(r"\s+")
-
-
-def _normalize_anchor_text(text: str) -> str:
-    """Collapse whitespace runs to a single space and strip.
-
-    Anchors are compared after this normalization so incidental whitespace
-    differences (a stray double space, a line-wrapped newline inside the
-    model's quoted excerpt) never cause a spurious mismatch. Normalization
-    only touches whitespace characters, so any real content difference —
-    the case this exists to catch — still causes a mismatch.
-    """
-    return _WHITESPACE_RX.sub(" ", text).strip()
-
-
-def _block_content_text(block: Block) -> str:
-    """The block's own text content, independent of markdown rendering.
-
-    This mirrors what ``serialize_document_for_delta_prompt`` shows the model
-    for each block — the raw ``text`` field, or ``items`` joined with a space
-    — rather than ``render_block``'s markdown form (bullet ``- `` prefixes,
-    code fences). A model quoting verbatim from what it was shown then
-    produces a matching anchor without needing to reconstruct markdown syntax
-    it was never shown as such.
-    """
-    if isinstance(block, (ParagraphBlock, CodeBlock)):
-        return block.text
-    if isinstance(block, (BulletListBlock, OrderedListBlock)):
-        return " ".join(block.items)
-    # 2026-08-18: the running image parses markdown tables into
-    # structured_doc.TableBlock (headers + rows), which this overlay's base
-    # predates. Render any unknown block best-effort and NEVER raise here: the
-    # TypeError used to fail the whole refresh_mental_model op (self-improvement
-    # mm-4c0c72eb, 09:10Z) instead of letting the anchor mismatch skip the op and
-    # the fast path fall back to the full refresh.
-    headers = getattr(block, "headers", None)
-    rows = getattr(block, "rows", None)
-    if headers is not None or rows is not None:
-        parts = [" ".join(str(h) for h in (headers or []))]
-        parts.extend(" ".join(str(c) for c in row) for row in (rows or []))
-        return " ".join(p for p in parts if p)
-    text = getattr(block, "text", None)
-    if isinstance(text, str):
-        return text
-    items = getattr(block, "items", None)
-    if isinstance(items, list):
-        return " ".join(str(i) for i in items)
-    return ""
-
-
-def _anchor_matches(block: Block, anchor: str) -> bool:
-    """True if ``anchor`` verbatim-matches (whitespace-normalized) a prefix
-    of ``block``'s own content. An empty/whitespace-only anchor never
-    matches — see ``_check_block_anchor`` for the "missing anchor" case.
-    """
-    normalized_anchor = _normalize_anchor_text(anchor)
-    if not normalized_anchor:
-        return False
-    normalized_content = _normalize_anchor_text(_block_content_text(block))
-    return normalized_content.startswith(normalized_anchor)
-
-
-def _check_block_anchor(section: Section, index: int, anchor: str) -> str | None:
-    """Validate a block-targeting op's anchor against the block actually at
-    ``index`` (the caller must range-check ``index`` first).
-
-    Returns ``None`` when the op may proceed, or a skip reason string when it
-    must not. A missing/empty anchor is treated as a mismatch — fail closed —
-    so an op from a model (or an older caller) that never adopted the anchor
-    contract loses that op rather than risk it landing on the wrong block.
-    """
-    if not anchor:
-        return "missing anchor"
-    if not _anchor_matches(section.blocks[index], anchor):
-        return f"anchor mismatch at index {index}"
-    return None
-
-
-def serialize_document_for_delta_prompt(doc: StructuredDocument) -> str:
-    """Render a document to the JSON the delta-ops prompt shows the model,
-    with each block additionally annotated with its own 0-based ``index``
-    within its section.
-
-    Without this, the model has to silently count array elements in a
-    compact, unannotated JSON dump to know which index a block sits at —
-    exactly the failure mode that produces the wrong-but-in-range indices the
-    ``anchor`` fields above guard against. Annotating the index removes the
-    need to count at all.
-
-    ``index`` is prompt-only. It is not, and must never become, a real field
-    on ``Block``: every block subtype declares ``model_config =
-    ConfigDict(extra="forbid")``, so nothing that parses this JSON back
-    through ``StructuredDocument.model_validate`` can accept it — callers
-    parse the model's *operations* against the real document, never this
-    view, back into a ``StructuredDocument``.
-    """
-    sections_out = [
-        {
-            "id": section.id,
-            "heading": section.heading,
-            "level": section.level,
-            "blocks": [{"index": i, **block.model_dump(mode="json")} for i, block in enumerate(section.blocks)],
-        }
-        for section in doc.sections
-    ]
-    return json.dumps({"version": doc.version, "sections": sections_out})
-
-
 # Application ---------------------------------------------------------------
 
 
@@ -502,9 +399,37 @@ class AppliedDelta(BaseModel):
 def _op_summary(op: Operation) -> dict[str, Any]:
     """Compact dict suitable for the audit trail."""
     data = op.model_dump()
-    return {k: v for k, v in data.items() if k != "block" and k != "blocks"} | {
-        "op": data["op"],
-    }
+    return {k: v for k, v in data.items() if k not in _BODY_FIELDS} | {"op": data["op"]}
+
+
+# A model that wants one more row in a table sometimes emits the row as its own
+# block instead of replacing the table (observed against a real provider in
+# ``test_document_survives_many_delta_rounds_intact``). Rendered with a blank
+# line before it, a bare row is not a table row — it is a broken fragment. The
+# prompt asks for ``replace_block`` in that case; this is the safety net for
+# when the model does it anyway.
+#
+# Note the narrowness: this never re-reads or reclassifies stored content. It
+# only decides whether a *new* block should join the one before it, and the join
+# is a plain concatenation, so nothing can be reinterpreted or lost.
+_TABLE_ROW_RX = re.compile(r"^\s*\|")
+_TABLE_SEPARATOR_RX = re.compile(r"^\s*\|?[\s:]*-{2,}[\s:|-]*\|?\s*$")
+
+
+def _all_table_rows(text: str) -> bool:
+    lines = text.splitlines()
+    return bool(lines) and all(_TABLE_ROW_RX.match(line) for line in lines)
+
+
+def _is_table(text: str) -> bool:
+    """A table needs a header, a separator row, and pipes on every line."""
+    lines = text.splitlines()
+    return len(lines) >= 2 and _all_table_rows(text) and any(_TABLE_SEPARATOR_RX.match(line) for line in lines)
+
+
+def _is_orphan_table_rows(text: str) -> bool:
+    """Rows with no separator of their own — only meaningful inside a table."""
+    return _all_table_rows(text) and not any(_TABLE_SEPARATOR_RX.match(line) for line in text.splitlines())
 
 
 def apply_operations(
@@ -514,13 +439,16 @@ def apply_operations(
     """Apply a list of operations to a document, returning a new document.
 
     The original document is never mutated. Invalid operations (unknown
-    section, out-of-range index, a mismatched or missing block anchor, name
-    collision when adding a section) are skipped and recorded in ``skipped``
-    with a ``reason`` string.
+    section, unknown block, a block that belongs to another section) are
+    skipped and recorded in ``skipped`` with a ``reason`` string.
     """
     new_doc = doc.model_copy(deep=True)
     applied: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    # Ids handed out during this batch stay reserved even if the block that
+    # owned one is later removed, so two ops in the same batch can never be
+    # given the same id.
+    reserved_ids: set[str] = set(new_doc.block_ids())
 
     def skip(op: Operation, reason: str) -> None:
         entry = _op_summary(op)
@@ -528,14 +456,61 @@ def apply_operations(
         skipped.append(entry)
         logger.debug(f"[STRUCTURED_DELTA] skipping op {entry}")
 
+    def new_block(text: str) -> Block:
+        normalized = normalize_block_text(text)
+        block_id = make_block_id(normalized, reserved_ids)
+        reserved_ids.add(block_id)
+        return Block(id=block_id, text=normalized)
+
+    def resolve_block(op: Operation, section: Section, block_id: str) -> int | None:
+        index = section.block_index(block_id)
+        if index is not None:
+            return index
+        # Naming a real block in the wrong section is a targeting mistake, not a
+        # licence to edit it: report where it actually lives instead of applying
+        # the edit somewhere the model did not ask for.
+        owner = next((s.id for s in new_doc.sections if s.block_by_id(block_id) is not None), None)
+        if owner is not None:
+            skip(op, f"block_id {block_id} belongs to section {owner}, not {section.id}")
+        else:
+            skip(op, f"unknown block_id: {block_id}")
+        return None
+
+    def merge_orphan_rows(op: Operation, section: Section, position: int) -> bool:
+        """Fold bare table rows into the table they were meant to extend."""
+        if position == 0 or not _is_orphan_table_rows(op.text):
+            return False
+        target = section.blocks[position - 1]
+        if not _is_table(target.text):
+            return False
+        target.text = f"{target.text}\n{normalize_block_text(op.text)}"
+        entry = _op_summary(op)
+        entry["merged_into_block_id"] = target.id
+        applied.append(entry)
+        logger.info(
+            "[STRUCTURED_DELTA] merged orphan table row(s) into block %s of section %s",
+            target.id,
+            section.id,
+        )
+        return True
+
+    def empty_text(op: Operation, text: str) -> bool:
+        if text.strip():
+            return False
+        skip(op, "block text is empty")
+        return True
+
     for op in operations:
         if isinstance(op, AppendBlockOp):
             section = new_doc.section_by_id(op.section_id)
             if section is None:
                 skip(op, f"unknown section_id: {op.section_id}")
                 continue
-            section.blocks.append(op.block)
-            applied.append(_op_summary(op))
+            if empty_text(op, op.text):
+                continue
+            if not merge_orphan_rows(op, section, len(section.blocks)):
+                section.blocks.append(new_block(op.text))
+                applied.append(_op_summary(op))
             continue
 
         if isinstance(op, InsertBlockOp):
@@ -543,22 +518,18 @@ def apply_operations(
             if section is None:
                 skip(op, f"unknown section_id: {op.section_id}")
                 continue
-            if op.index > len(section.blocks):
-                skip(
-                    op,
-                    f"index out of range: {op.index} > {len(section.blocks)}",
-                )
+            if empty_text(op, op.text):
                 continue
-            if op.index < len(section.blocks):
-                # `index` names an existing block (the one this insert lands
-                # before); at the append position (index == len(blocks))
-                # there is no block there to anchor against.
-                anchor_reason = _check_block_anchor(section, op.index, op.anchor)
-                if anchor_reason is not None:
-                    skip(op, anchor_reason)
+            if op.after_block_id is None:
+                position = 0
+            else:
+                anchor = resolve_block(op, section, op.after_block_id)
+                if anchor is None:
                     continue
-            section.blocks.insert(op.index, op.block)
-            applied.append(_op_summary(op))
+                position = anchor + 1
+            if not merge_orphan_rows(op, section, position):
+                section.blocks.insert(position, new_block(op.text))
+                applied.append(_op_summary(op))
             continue
 
         if isinstance(op, ReplaceBlockOp):
@@ -566,17 +537,15 @@ def apply_operations(
             if section is None:
                 skip(op, f"unknown section_id: {op.section_id}")
                 continue
-            if op.index >= len(section.blocks):
-                skip(
-                    op,
-                    f"index out of range: {op.index} >= {len(section.blocks)}",
-                )
+            if empty_text(op, op.text):
                 continue
-            anchor_reason = _check_block_anchor(section, op.index, op.anchor)
-            if anchor_reason is not None:
-                skip(op, anchor_reason)
+            index = resolve_block(op, section, op.block_id)
+            if index is None:
                 continue
-            section.blocks[op.index] = op.block
+            # The id is positional identity, not a content hash: keeping it means
+            # an op list that replaces a block and then edits it again still
+            # resolves, and the audit trail follows one block across refreshes.
+            section.blocks[index] = Block(id=op.block_id, text=normalize_block_text(op.text))
             applied.append(_op_summary(op))
             continue
 
@@ -585,17 +554,10 @@ def apply_operations(
             if section is None:
                 skip(op, f"unknown section_id: {op.section_id}")
                 continue
-            if op.index >= len(section.blocks):
-                skip(
-                    op,
-                    f"index out of range: {op.index} >= {len(section.blocks)}",
-                )
+            index = resolve_block(op, section, op.block_id)
+            if index is None:
                 continue
-            anchor_reason = _check_block_anchor(section, op.index, op.anchor)
-            if anchor_reason is not None:
-                skip(op, anchor_reason)
-                continue
-            section.blocks.pop(op.index)
+            section.blocks.pop(index)
             applied.append(_op_summary(op))
             continue
 
@@ -607,7 +569,7 @@ def apply_operations(
                 id=section_id,
                 heading=op.heading,
                 level=op.level,
-                blocks=list(op.blocks),
+                blocks=[new_block(text) for text in op.blocks if text.strip()],
             )
             if op.after_section_id is None:
                 new_doc.sections.append(new_section)
@@ -636,7 +598,7 @@ def apply_operations(
             if section is None:
                 skip(op, f"unknown section_id: {op.section_id}")
                 continue
-            section.blocks = list(op.blocks)
+            section.blocks = [new_block(text) for text in op.blocks if text.strip()]
             applied.append(_op_summary(op))
             continue
 

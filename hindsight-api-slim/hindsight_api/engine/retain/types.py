@@ -5,13 +5,107 @@ These dataclasses provide type safety throughout the retain operation,
 from content input to fact storage.
 """
 
+import functools
 import logging
+from array import array
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, TypedDict
 from uuid import UUID
 
+import numpy as np
+
+from ..metadata_utils import drop_null_values
+
 logger = logging.getLogger(__name__)
+
+# An embedding, packed. ``array("f")`` stores the vector as a contiguous block of C floats
+# instead of one boxed ``PyFloat`` per dimension: a 384-dim vector measures 1,616 bytes
+# packed against 12,344 bytes as ``list[float]``, a 7.6x difference that scales with the
+# number of facts a retain batch holds at once (#3756).
+#
+# "f" (float32) is the width pgvector's ``vector`` column stores anyway, so nothing is lost
+# on the way to the database — the rounding that used to happen at the INSERT now happens
+# one step earlier, and the stored bytes are the same.
+# Unparameterised on purpose: `array.array` is only generic in the type stubs, so
+# `array[float]` raises TypeError at import time on CPython.
+PackedEmbedding = array
+
+
+def pack_embedding(values: Sequence[float]) -> PackedEmbedding:
+    """Pack an embedding vector for carrying through the retain pipeline."""
+    return array("f", values)
+
+
+# What a function that merely carries or renders an embedding should accept. Retain holds the
+# packed form; imports and re-embeds hold a plain float list; a few paths hold a rendered
+# pgvector literal already. All three reach the same link/ANN helpers.
+EmbeddingLike = PackedEmbedding | Sequence[float] | str
+
+
+def _repr_literal(values: Iterable[object]) -> str:
+    """Per-element ``repr()`` formatting, kept for non-finite and non-numeric inputs."""
+    return "[" + ",".join(repr(float(v)) for v in values) + "]"  # type: ignore[arg-type]
+
+
+@functools.lru_cache(maxsize=64)
+def _literal_template(dim: int) -> str:
+    """``"[%.9g,%.9g,...]"`` for ``dim`` elements, built once per embedding width.
+
+    Nine significant digits is ``FLT_DECIMAL_DIG`` — the shortest fixed precision that
+    round-trips every float32 bit pattern — so a value narrowed to float32 renders and
+    parses back to exactly the bytes the ``vector`` column stores.
+    """
+    return "[" + ",".join(["%.9g"] * dim) + "]"
+
+
+def _format_literal(values: list[float]) -> str:
+    """Render float32-valued floats as a pgvector literal in one C-level format call.
+
+    Formatting the whole vector through a single ``str.__mod__`` keeps the per-element
+    work inside CPython's C formatter, rather than paying a Python-level ``repr()`` call
+    and a boxed ``PyFloat`` per dimension.
+    """
+    if not values:
+        return "[]"
+    rendered = _literal_template(len(values)) % tuple(values)
+    # Finite ``%.9g`` output is drawn only from [0-9.eE+-], so an "n" can only have come
+    # from "nan", "inf" or "-inf" — none of which pgvector accepts. Hand those to the
+    # repr formatting the link steps have always screened them out of.
+    return _repr_literal(values) if "n" in rendered else rendered
+
+
+def embedding_to_pgvector(embedding: EmbeddingLike) -> str:
+    """Render an embedding as the ``'[0.1,0.2,...]'`` literal asyncpg binds to ``vector``.
+
+    Handles every form a caller may hold: the packed array retain carries, a plain float
+    list (imports, re-embeds), a NumPy array, or a literal that was already rendered.
+
+    Everything numeric is narrowed to float32 before formatting, because float32 is the
+    width the column stores. That narrowing has to happen exactly once: applying ``%.9g``
+    straight to a float64 rounds twice — once to nine digits, once to float32 — and the
+    two roundings disagree on ~0.8% of values, landing a neighbouring float32. Narrowing
+    first makes the single remaining rounding the same one PostgreSQL would have done.
+
+    The literal is fixed-width, not shortest-form: this used to render through orjson,
+    whose Ryu formatter emitted ``0.1`` where nine digits give ``0.100000001``. Both parse
+    to the same float32, so stored bytes are unchanged, but the text is ~12% longer and
+    query logs look different. orjson bought ~5x on this formatting and nothing else in
+    the API used it — see ``hindsight-dev/benchmarks/micro/vector_serialization.py``.
+    """
+    if isinstance(embedding, str):
+        return embedding
+    if isinstance(embedding, array) and embedding.typecode == "f":
+        # Already float32, so ``tolist()`` hands over values ``%.9g`` renders exactly.
+        return _format_literal(embedding.tolist())
+    if isinstance(embedding, (np.ndarray, list, tuple)):
+        # ``asarray`` without a dtype infers one: real numbers give a numeric kind, while
+        # objects that merely implement ``__float__`` give "O" and fall through to repr.
+        values = np.asarray(embedding)
+        if values.dtype.kind in "fiub":
+            return _format_literal(values.astype(np.float32, copy=False).tolist())
+    return _repr_literal(embedding)
 
 
 class RetainContentDict(TypedDict, total=False):
@@ -24,6 +118,8 @@ class RetainContentDict(TypedDict, total=False):
         metadata: Custom key-value metadata (optional)
         document_id: Document ID for this content item (optional)
         entities: User-provided entities to merge with extracted entities (optional)
+        resolve_entities: Whether the supplied `entities` are resolved against the bank's
+            existing entities (optional, default True). False takes them literally.
         tags: Visibility scope tags for this content item (optional)
         observation_scopes: How to scope observations for consolidation (optional).
             "per_tag" runs one pass per individual tag; "combined" (default) runs a
@@ -33,6 +129,10 @@ class RetainContentDict(TypedDict, total=False):
         update_mode: How to handle existing documents with the same document_id (optional).
             "replace" (default) deletes old data and reprocesses. "append" concatenates
             new content to the existing document and reprocesses.
+        force_reextract: Re-run extraction even when the content is byte-identical to what
+            is already stored (optional, default False). Internal — set by
+            ``reprocess_document``, not accepted on the public retain API. See
+            ``retain_batch`` for the two skips it suppresses.
     """
 
     content: str  # Required
@@ -41,11 +141,25 @@ class RetainContentDict(TypedDict, total=False):
     metadata: dict[str, str]
     document_id: str
     entities: list[dict[str, str]]  # [{"text": "...", "type": "..."}]
+    resolve_entities: bool
     tags: list[str]  # Visibility scope tags
     observation_scopes: (
         Literal["per_tag", "combined", "all_combinations", "shared"] | list[list[str]]
     )  # Observation scopes for consolidation
     update_mode: Literal["replace", "append"]
+    force_reextract: bool
+
+
+@dataclass
+class UserEntities:
+    """The entities a caller supplied for one retain content item, and how to match them.
+
+    Kept together so the resolution choice travels with the names it applies to: retain merges
+    these with the extractor's own entities into one batch, and only these are authoritative.
+    """
+
+    entities: list[dict[str, str]]
+    resolve: bool = True
 
 
 @dataclass
@@ -61,10 +175,22 @@ class RetainContent:
     event_date: datetime | None = None
     metadata: dict[str, str] = field(default_factory=dict)
     entities: list[dict[str, str]] = field(default_factory=list)  # User-provided entities
+    # Whether the supplied `entities` are matched against the bank's existing entities. False
+    # takes them literally; extracted entities are always resolved either way (#3479).
+    resolve_entities: bool = True
     tags: list[str] = field(default_factory=list)  # Visibility scope tags
     observation_scopes: Literal["per_tag", "combined", "all_combinations", "shared"] | list[list[str]] | None = (
         None  # Observation scopes
     )
+
+    def __post_init__(self) -> None:
+        # Drop null-valued metadata keys (issue #3209): the retain API accepts
+        # arbitrary JSON metadata, and a null value stored verbatim poisons the
+        # read path, which validates MemoryFact.metadata as dict[str, str].
+        # Non-string values are preserved; the read path coerces them. An
+        # explicit ``"metadata": null`` in the request normalizes to {} so the
+        # field always matches its declared type.
+        self.metadata = drop_null_values(self.metadata)
 
 
 @dataclass
@@ -147,7 +273,9 @@ class ProcessedFact:
     # Core fact data
     fact_text: str
     fact_type: str
-    embedding: list[float]
+    # Packed, not ``list[float]`` — see ``PackedEmbedding``. Render it for SQL with
+    # ``embedding_to_pgvector``; ``list(...)`` recovers the plain float list.
+    embedding: PackedEmbedding
 
     # Temporal data
     occurred_start: datetime | None
@@ -224,7 +352,7 @@ class ProcessedFact:
 
     @staticmethod
     def from_extracted_fact(
-        extracted_fact: "ExtractedFact", embedding: list[float], chunk_id: str | None = None
+        extracted_fact: "ExtractedFact", embedding: Sequence[float], chunk_id: str | None = None
     ) -> "ProcessedFact | None":
         """
         Create ProcessedFact from ExtractedFact.
@@ -257,7 +385,7 @@ class ProcessedFact:
         return ProcessedFact(
             fact_text=fact_text,
             fact_type=extracted_fact.fact_type,
-            embedding=embedding,
+            embedding=pack_embedding(embedding),
             occurred_start=occurred_start,
             occurred_end=occurred_end,
             mentioned_at=mentioned_at,

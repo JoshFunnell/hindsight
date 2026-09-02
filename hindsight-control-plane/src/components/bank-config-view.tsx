@@ -72,7 +72,7 @@ type StrategiesEdits = {
 
 type LabelValue = { value: string; description: string };
 type MapField = {
-  type: "text" | "value" | "multi-values" | "map";
+  type: "text" | "multi-text" | "value" | "multi-values" | "map";
   description: string;
   values?: LabelValue[];
   fields?: Record<string, MapField>;
@@ -80,7 +80,7 @@ type MapField = {
 type LabelGroup = {
   key: string;
   description: string;
-  type: "value" | "multi-values" | "text" | "map";
+  type: "value" | "multi-values" | "text" | "multi-text" | "map";
   optional: boolean;
   tag: boolean;
   values: LabelValue[];
@@ -112,10 +112,17 @@ type DocStorageEdits = {
   store_document_text: boolean | null;
 };
 
-// Recall pipeline stages. null = inherit the server default (all three ship
+// Mental models and the knowledge pages backed by them. null = inherit the
+// server default.
+type MentalModelsEdits = {
+  mental_model_min_refresh_interval_seconds: number | null;
+};
+
+// Recall pipeline stages. null = inherit the server default (all four ship
 // enabled); explicit false switches that stage off for this bank, trading
-// recall breadth for latency. Semantic + BM25 always run.
+// recall breadth for latency. Semantic always runs — it is the baseline arm.
 type RecallEdits = {
+  enable_text_search: boolean | null;
   enable_temporal_retrieval: boolean | null;
   enable_graph_retrieval: boolean | null;
   enable_reranking: boolean | null;
@@ -215,6 +222,19 @@ function getMcpToolGroups(t: (key: string) => string): McpToolGroup[] {
       tools: ["list_operations", "get_operation", "cancel_operation"],
     },
     { key: "tags", label: t("mcpGroupTags"), tools: ["list_tags"] },
+    {
+      key: "knowledgeBase",
+      label: t("mcpGroupKnowledgeBase"),
+      tools: [
+        "get_knowledge_base_tree",
+        "search_knowledge_base",
+        "get_knowledge_page",
+        "create_knowledge_folder",
+        "create_knowledge_page",
+        "update_knowledge_node",
+        "delete_knowledge_node",
+      ],
+    },
   ];
 }
 
@@ -251,6 +271,13 @@ const MCP_ALL_TOOLS: string[] = [
   "get_operation",
   "cancel_operation",
   "list_tags",
+  "get_knowledge_base_tree",
+  "search_knowledge_base",
+  "get_knowledge_page",
+  "create_knowledge_folder",
+  "create_knowledge_page",
+  "update_knowledge_node",
+  "delete_knowledge_node",
 ];
 const ALL_TOOLS: string[] = MCP_ALL_TOOLS;
 
@@ -309,8 +336,16 @@ function docStorageSlice(overrides: Record<string, any>): DocStorageEdits {
   };
 }
 
+function mentalModelsSlice(overrides: Record<string, any>): MentalModelsEdits {
+  return {
+    mental_model_min_refresh_interval_seconds:
+      overrides.mental_model_min_refresh_interval_seconds ?? null,
+  };
+}
+
 function recallSlice(overrides: Record<string, any>): RecallEdits {
   return {
+    enable_text_search: overrides.enable_text_search ?? null,
     enable_temporal_retrieval: overrides.enable_temporal_retrieval ?? null,
     enable_graph_retrieval: overrides.enable_graph_retrieval ?? null,
     enable_reranking: overrides.enable_reranking ?? null,
@@ -352,6 +387,9 @@ export function BankConfigView() {
   const [auditEdits, setAuditEdits] = useState<AuditEdits>(auditSlice({}));
   const [docStorageEdits, setDocStorageEdits] = useState<DocStorageEdits>(docStorageSlice({}));
   const [recallEdits, setRecallEdits] = useState<RecallEdits>(recallSlice({}));
+  const [mentalModelsEdits, setMentalModelsEdits] = useState<MentalModelsEdits>(
+    mentalModelsSlice({})
+  );
 
   // Per-section saving/error state
   const [retainSaving, setRetainSaving] = useState(false);
@@ -361,6 +399,7 @@ export function BankConfigView() {
   const [geminiSaving, setGeminiSaving] = useState(false);
   const [securityPrivacySaving, setSecurityPrivacySaving] = useState(false);
   const [recallSaving, setRecallSaving] = useState(false);
+  const [mentalModelsSaving, setMentalModelsSaving] = useState(false);
   const [retainError, setRetainError] = useState<string | null>(null);
   const [observationsError, setObservationsError] = useState<string | null>(null);
   const [reflectError, setReflectError] = useState<string | null>(null);
@@ -368,6 +407,7 @@ export function BankConfigView() {
   const [geminiError, setGeminiError] = useState<string | null>(null);
   const [securityPrivacyError, setSecurityPrivacyError] = useState<string | null>(null);
   const [recallError, setRecallError] = useState<string | null>(null);
+  const [mentalModelsError, setMentalModelsError] = useState<string | null>(null);
 
   // Dirty tracking
   const retainDirty = useMemo(
@@ -406,6 +446,10 @@ export function BankConfigView() {
     () => JSON.stringify(recallEdits) !== JSON.stringify(recallSlice(baseOverrides)),
     [recallEdits, baseOverrides]
   );
+  const mentalModelsDirty = useMemo(
+    () => JSON.stringify(mentalModelsEdits) !== JSON.stringify(mentalModelsSlice(baseOverrides)),
+    [mentalModelsEdits, baseOverrides]
+  );
   useEffect(() => {
     if (bankId) loadAll();
   }, [bankId]);
@@ -440,6 +484,7 @@ export function BankConfigView() {
       setAuditEdits(auditSlice(overrides));
       setDocStorageEdits(docStorageSlice(overrides));
       setRecallEdits(recallSlice(overrides));
+      setMentalModelsEdits(mentalModelsSlice(overrides));
     } catch (err) {
       console.error("Failed to load bank data:", err);
     } finally {
@@ -565,6 +610,7 @@ export function BankConfigView() {
       setBaseOverrides((prev) => {
         const next = { ...prev };
         for (const key of [
+          "enable_text_search",
           "enable_temporal_retrieval",
           "enable_graph_retrieval",
           "enable_reranking",
@@ -578,6 +624,28 @@ export function BankConfigView() {
       setRecallError(err.message || t("recallFailedToSave"));
     } finally {
       setRecallSaving(false);
+    }
+  };
+
+  const saveMentalModels = async () => {
+    if (!bankId) return;
+    setMentalModelsSaving(true);
+    setMentalModelsError(null);
+    try {
+      // Same tombstone convention as the sections above: a null clears the bank
+      // override server-side, so the setting falls back to the server default.
+      await client.updateBankConfig(bankId, { ...mentalModelsEdits });
+      setBaseOverrides((prev) => {
+        const next = { ...prev };
+        const value = mentalModelsEdits.mental_model_min_refresh_interval_seconds;
+        if (value === null) delete next.mental_model_min_refresh_interval_seconds;
+        else next.mental_model_min_refresh_interval_seconds = value;
+        return next;
+      });
+    } catch (err: any) {
+      setMentalModelsError(err.message || t("mentalModelsFailedToSave"));
+    } finally {
+      setMentalModelsSaving(false);
     }
   };
 
@@ -832,6 +900,35 @@ export function BankConfigView() {
           />
         </ConfigSection>
 
+        {/* Mental Models & Knowledge Pages Section */}
+        <ConfigSection
+          title={t("mentalModelsTitle")}
+          description={t("mentalModelsDescription")}
+          error={mentalModelsError}
+          dirty={mentalModelsDirty}
+          saving={mentalModelsSaving}
+          onSave={saveMentalModels}
+        >
+          <FieldRow
+            label={t("mentalModelMinRefreshIntervalLabel")}
+            description={t("mentalModelMinRefreshIntervalDescription")}
+          >
+            <Input
+              type="number"
+              min={0}
+              value={mentalModelsEdits.mental_model_min_refresh_interval_seconds ?? ""}
+              onChange={(e) =>
+                setMentalModelsEdits({
+                  mental_model_min_refresh_interval_seconds: e.target.value
+                    ? parseInt(e.target.value, 10)
+                    : null,
+                })
+              }
+              placeholder={t("serverDefault")}
+            />
+          </FieldRow>
+        </ConfigSection>
+
         {/* MCP Tools Section */}
         <ConfigSection
           title={t("mcpToolsTitle")}
@@ -948,6 +1045,7 @@ export function BankConfigView() {
         >
           {(
             [
+              ["enable_text_search", "recallTextSearch"],
               ["enable_temporal_retrieval", "recallTemporalRetrieval"],
               ["enable_graph_retrieval", "recallGraphRetrieval"],
               ["enable_reranking", "recallReranking"],
@@ -1637,6 +1735,7 @@ function exampleBadge(
       .map((f) => `${key}:${f}:<value>`)
       .join(", ")}`;
   if (attr.type === "text") return `e.g. ${key}:<any text>`;
+  if (attr.type === "multi-text") return `e.g. ${key}:<any text>, ${key}:<any text>`;
   if ((attr.values?.length ?? 0) > 0) return `e.g. ${key}:${attr.values![0].value || "<value>"}`;
   return `e.g. ${key}:<value>`;
 }
@@ -1657,6 +1756,7 @@ function MapFieldsEditor({
   const t = useTranslations("bankConfig");
   const FIELD_TYPE_LABELS: Record<MapField["type"], string> = {
     text: t("fieldTypeText"),
+    "multi-text": t("fieldTypeMultiText"),
     value: t("fieldTypeValue"),
     "multi-values": t("fieldTypeMultiValues"),
     map: t("fieldTypeMap"),
@@ -1743,7 +1843,9 @@ function MapFieldsEditor({
                   updateField(fieldName, {
                     type: v,
                     ...(v === "map" ? { fields: field.fields ?? {}, values: undefined } : {}),
-                    ...(v === "text" ? { fields: undefined, values: undefined } : {}),
+                    ...(v === "text" || v === "multi-text"
+                      ? { fields: undefined, values: undefined }
+                      : {}),
                     ...(v === "value" || v === "multi-values"
                       ? { fields: undefined, values: field.values ?? [] }
                       : {}),

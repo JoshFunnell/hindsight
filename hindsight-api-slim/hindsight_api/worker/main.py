@@ -219,6 +219,14 @@ def main():
     # Configure logging
     config.configure_logging()
 
+    # Initialize OpenTelemetry tracing if enabled. The worker runs consolidation,
+    # batch retain and mental-model refresh, so without this the LLM-heaviest half
+    # of a deployment emits no spans at all (issue #3614). Done after logging setup
+    # so the "Tracing initialized" line is visible.
+    from ..tracing import initialize_tracing_from_config
+
+    initialize_tracing_from_config(config, default_service_name="hindsight-worker")
+
     from ..utils import warn_if_container_default_worker_id
 
     warn_if_container_default_worker_id(args.worker_id)
@@ -311,6 +319,7 @@ def main():
             slot_reservations=config.worker_slot_reservations,
             consolidation_bank_priority=config.worker_consolidation_bank_priority or None,
             max_retries=config.worker_max_retries,
+            on_wall_timeout=memory.on_task_wall_timeout,
         )
 
         # Create the HTTP app for metrics/health
@@ -407,6 +416,13 @@ def main():
 
         # Close memory engine
         await memory.close()
+
+        # Flush queued spans before exiting: a consolidation span can be minutes
+        # long, and everything still batched is lost if the process just exits.
+        from ..tracing import shutdown_tracing
+
+        shutdown_tracing()
+
         print("Worker shutdown complete")
 
     def cleanup():

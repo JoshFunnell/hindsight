@@ -19,6 +19,13 @@
  * hook, which has the longest budget and nothing waiting on its result. The prompt path does
  * nothing here at all.
  *
+ * EVERY HARNESS NEEDS BOTH POINTS, not just the fresh-process hook ones. The persistent-plugin
+ * hosts (opencode, Kilo, Cline, Prime Agent, dsh) run no hook binaries, so they reach these through
+ * `RuntimeCore`: `seedIfCold` is their SessionStart and the write-back is their Stop. Missing that
+ * is what #3524 reported — dsh in daemon mode never started a daemon, so every `hindsight_*` call
+ * failed with ECONNREFUSED until the user ran `daemon-start.js` by hand. `daemon.test.ts` now fails
+ * if a harness entrypoint builds a client without reaching one of the two.
+ *
  * A daemon that is down is NOT special-cased anywhere downstream. Once the URL is resolved, every
  * mode uses the identical client and the identical error handling: an unreachable local daemon
  * surfaces as the same connection failure (and the same `retain_failed` diagnostic) as an
@@ -26,7 +33,8 @@
  * made daemon mode behave differently from the other two for no benefit.
  *
  * There is no stop. One daemon serves every agent and repo on the machine, so ending one session
- * must not cut memory out from under another; `daemonIdleTimeout` retires it instead.
+ * must not cut memory out from under another. Nothing retires it either: the server's idle timeout
+ * was removed after it killed in-flight requests (#3903), so `daemonIdleTimeout` is inert.
  */
 import { execFileSync, spawn as realSpawn } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -67,7 +75,11 @@ export async function isServerHealthy(baseUrl: string, timeoutMs = 2_000): Promi
 export function hasRustToolchain(): boolean {
   if (process.platform !== "darwin") return true; // wheels cover linux + windows
   try {
-    execFileSync("cargo", ["--version"], { stdio: "pipe", timeout: 10_000 });
+    execFileSync("cargo", ["--version"], {
+      stdio: "pipe",
+      timeout: 10_000,
+      windowsHide: true,
+    });
     return true;
   } catch {
     return false;
@@ -77,7 +89,11 @@ export function hasRustToolchain(): boolean {
 /** Is `uv`/`uvx` on PATH? The daemon is fetched and run through it. */
 export function hasUvx(): boolean {
   try {
-    execFileSync("uvx", ["--version"], { stdio: "pipe", timeout: 10_000 });
+    execFileSync("uvx", ["--version"], {
+      stdio: "pipe",
+      timeout: 10_000,
+      windowsHide: true,
+    });
     return true;
   } catch {
     return false;
@@ -136,7 +152,11 @@ export function detectLlm(env: NodeJS.ProcessEnv = process.env): LlmChoice | und
 
 function onPath(bin: string): boolean {
   try {
-    execFileSync("which", [bin], { stdio: "pipe", timeout: 5_000 });
+    execFileSync("which", [bin], {
+      stdio: "pipe",
+      timeout: 5_000,
+      windowsHide: true,
+    });
     return true;
   } catch {
     return false;
@@ -149,9 +169,15 @@ export function daemonEnv(
   cfg: Config,
   env: NodeJS.ProcessEnv = process.env
 ): Record<string, string | undefined> {
-  const out: Record<string, string | undefined> = {
-    HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT: String(cfg.daemonIdleTimeout),
-  };
+  const out: Record<string, string | undefined> = {};
+  // Forwarded only when set, and inert either way: the server dropped its idle timeout in #3903
+  // (it measured idleness from the request *start*, so a long retain killed its own daemon). Kept
+  // so an existing config still starts — the daemon ignores the value.
+  // It used to default to 300s here, which made the plugin the one thing on the machine opting a
+  // SHARED daemon into an auto-exit; every other integration shipped 0.
+  if (cfg.daemonIdleTimeout !== undefined) {
+    out.HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT = String(cfg.daemonIdleTimeout);
+  }
   for (const [key, value] of Object.entries(env)) {
     if (key.startsWith("HINDSIGHT_API_") && value) out[key] = value;
   }
@@ -181,6 +207,7 @@ export function startDaemonDetached(
     const child = spawnFn("node", [starter, "--harness", harness], {
       detached: true,
       stdio: "ignore",
+      windowsHide: true,
     });
     // spawn() failures often surface ASYNCHRONOUSLY as an 'error' event; unhandled, that would
     // crash the hook.

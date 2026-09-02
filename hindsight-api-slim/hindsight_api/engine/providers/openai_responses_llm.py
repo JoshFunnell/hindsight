@@ -52,6 +52,7 @@ from hindsight_api.engine.llm_interface import (
     OutputTooLongError,
 )
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
+from hindsight_api.engine.llm_transport import build_sdk_timeout, describe_transport_error
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
 
 # Provider-agnostic pure helpers (text cleanup, quota-defer parsing, json-mode
@@ -63,7 +64,7 @@ from hindsight_api.engine.providers.openai_compatible_llm import (
     _strip_reasoning_tags,
 )
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
-from hindsight_api.engine.structured_output import strict_json_schema
+from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
 
@@ -225,7 +226,8 @@ class OpenAIResponsesLLM(LLMInterface):
             else:
                 client_kwargs["base_url"] = self.base_url
         if self.timeout:
-            client_kwargs["timeout"] = self.timeout
+            # Per-phase so the connect leg is capped independently (issue #3881).
+            client_kwargs["timeout"] = build_sdk_timeout(self.timeout)
 
         self._client = AsyncOpenAI(**client_kwargs)
         logger.info(
@@ -387,7 +389,7 @@ class OpenAIResponsesLLM(LLMInterface):
                 )
                 logger.warning(
                     f"APIConnectionError ({self.provider}/{self.model}, scope={scope}, HTTP {status_code}, "
-                    f"attempt {attempt + 1}/{max_retries + 1}): {str(e)[:200]}"
+                    f"attempt {attempt + 1}/{max_retries + 1}): {str(e)[:200]} [{describe_transport_error(e)}]"
                 )
                 if attempt < max_retries:
                     await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
@@ -477,7 +479,7 @@ class OpenAIResponsesLLM(LLMInterface):
                     }
                 }
             else:
-                schema = response_format.model_json_schema()
+                schema = provider_json_schema(response_format)
                 params["input"] = _ensure_json_word_in_user_message(_inject_schema_into_input(input_items, schema))
                 params["text"] = {"format": {"type": "json_object"}}
 

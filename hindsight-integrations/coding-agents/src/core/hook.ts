@@ -18,11 +18,11 @@
  * without stdin/stdout; `runHook` is thin plumbing around it, with a `makeClient` seam for tests.
  */
 import { existsSync, readFileSync } from "node:fs";
-import { deriveBankId } from "./bank";
+import { deriveBankIdOrSkip } from "./bank";
 import type { Config } from "./config";
 import { applyBankConfig, loadConfig } from "./config";
 import { diag, diagFilePath } from "./diag";
-import { log, setLogLevel } from "./log";
+import { describeError, log, setLogLevel } from "./log";
 import { startBackgroundSeed } from "./seed";
 import type { ClientOpts } from "./hindsight";
 import { HindsightClient } from "./hindsight";
@@ -33,6 +33,7 @@ import { buildRosterRefresh, parsePageList } from "./knowledge-injection";
 import {
   readSessionCache,
   sessionCacheFile,
+  sessionRootDir,
   writeSessionCache,
   type SessionCache,
 } from "./session-cache";
@@ -58,7 +59,7 @@ export interface HookSpec {
 
 /** Minimal client shape `buildHookOutput` needs — `HindsightClient` satisfies it structurally. */
 interface HookClient {
-  reflect(query: string, opts: { budget?: string; timeoutMs?: number }): Promise<string>;
+  reflect(query: string, opts: { budget?: string; timeoutMs: number }): Promise<string>;
   listPages(): Promise<unknown>;
   knowledgePagesSupported?: boolean;
 }
@@ -99,7 +100,7 @@ export async function buildHookOutput(args: {
 
   // ── reflect: once per session, on the first prompt ────────────────────────────
   // autoReflect false = tool-only mode: no injected synthesis; the roster's tool guide instead
-  // instructs the agent to call hindsight_reflect itself when a new goal is set.
+  // sends new goals through knowledge pages first and reserves reflection for gaps.
   let reflectAnswer = cached.reflectAnswer;
   let reflectRanThisTurn = false;
   // Set ONLY by the catch below. An empty answer is not a failure: reflect can legitimately have
@@ -134,11 +135,11 @@ export async function buildHookOutput(args: {
       reflectAnswer = ""; // ran and failed — don't retry every turn; the diag trail records it
       reflectFailed = true;
       log.warn(harness, "reflect failed — session runs without memory", {
-        error: String((e as Error)?.message || e).slice(0, 200),
+        error: describeError(e),
       });
       diag(harness, "reflect_failed", {
         ms: Date.now() - t0,
-        error: String((e as Error)?.message || e).slice(0, 200),
+        error: describeError(e),
         query: prompt.slice(0, 80),
       });
     }
@@ -159,7 +160,7 @@ export async function buildHookOutput(args: {
         client.knowledgePagesSupported === false ? "knowledge_pages_unavailable" : "pages_failed",
         {
           ms: Date.now() - t0,
-          error: String((e as Error)?.message || e).slice(0, 200),
+          error: describeError(e),
         }
       );
     }
@@ -239,7 +240,10 @@ export async function runHook(
   const out = (context: string | undefined, notice?: string) =>
     process.stdout.write(JSON.stringify(spec.emit(context ?? "", notice, ev)));
 
-  const resolved = applyBankConfig(cfg, deriveBankId(cfg, cwd, spec.harness), cwd);
+  const sessionRoot = sessionRootDir(spec.harness, sessionId, cwd);
+  const derived = deriveBankIdOrSkip(cfg, cwd, spec.harness, sessionRoot);
+  if (derived === null) return; // repository unidentifiable: stay silent rather than invent a bank
+  const resolved = applyBankConfig(cfg, derived, cwd);
   cfg = resolved.cfg;
   const bankId = resolved.bankId;
   if (cfg.disabled) {
@@ -251,6 +255,7 @@ export async function runHook(
     apiToken: cfg.apiToken,
     bank: bankId,
     maxParallelRetains: cfg.maxParallelRetains,
+    observationScopes: cfg.observationScopes,
   });
   const cacheFile = sessionCacheFile(spec.harness, sessionId || "no-session");
 

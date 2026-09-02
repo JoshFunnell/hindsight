@@ -118,6 +118,7 @@ hindsight_client_api/models/mental_model_refresh_scope_tag_groups_inner.py
 hindsight_client_api/models/mental_model_refresh_trace.py
 hindsight_client_api/models/mental_model_refresh_window.py
 hindsight_client_api/models/mental_model_response.py
+hindsight_client_api/models/mental_model_retraction.py
 hindsight_client_api/models/mental_model_trace_tool_call.py
 hindsight_client_api/models/mental_model_trigger_input.py
 hindsight_client_api/models/mental_model_trigger_input_tag_groups_inner.py
@@ -147,6 +148,7 @@ hindsight_client_api/models/reflect_request.py
 hindsight_client_api/models/reflect_response.py
 hindsight_client_api/models/reflect_tool_call.py
 hindsight_client_api/models/reflect_trace.py
+hindsight_client_api/models/refresh_mental_model_operation_details.py
 hindsight_client_api/models/reprocess_document_response.py
 hindsight_client_api/models/retain_request.py
 hindsight_client_api/models/retain_response.py
@@ -160,6 +162,7 @@ hindsight_client_api/models/tag_group_not_output.py
 hindsight_client_api/models/tag_group_or_input.py
 hindsight_client_api/models/tag_group_or_output.py
 hindsight_client_api/models/tag_item.py
+hindsight_client_api/models/temporal_window.py
 hindsight_client_api/models/timestamp.py
 hindsight_client_api/models/token_usage.py
 hindsight_client_api/models/tool_calls_include_options.py
