@@ -62,6 +62,10 @@ FastPathFallbackReason = Literal[
     "delta_ops_failed",
     "delta_ops_invalid",
     "delta_ops_all_skipped",
+    # The document cites facts that no longer exist. Neither tier can remove them
+    # (tier 0 writes nothing; tier 1 only sees the new-fact window), so the refresh
+    # goes to the agentic loop, which runs the retraction pass.
+    "retracted_grounding",
 ]
 
 # What a refresh did, as recorded on the operation. A superset of RefreshOutcome:

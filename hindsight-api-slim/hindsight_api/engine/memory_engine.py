@@ -7174,6 +7174,7 @@ class MemoryEngine(MemoryEngineInterface):
         created_after: datetime | None = None,
         created_before: datetime | None = None,
         min_scores: MinScores | None = None,
+        temporal_window: "TemporalWindow | None" = None,
         _connection_budget: int | None = None,
         _quiet: bool = False,
         reranking: RecallReranking = "cross_encoder",
@@ -7355,6 +7356,12 @@ class MemoryEngine(MemoryEngineInterface):
                 created_after=created_after,
                 created_before=created_before,
                 min_scores=min_scores,
+                # Forwarded unchanged to every sub-call: the window ranks memories
+                # dated inside it higher within each bank, and the union merge then
+                # sorts on the cross-encoder score those sub-calls produced. Dropping
+                # it here would silently give a multi-bank recall a different ranking
+                # from the same query against one bank.
+                temporal_window=temporal_window,
                 _connection_budget=_connection_budget,
                 _quiet=_quiet,
                 reranking=per_bank_reranking,
@@ -16367,6 +16374,59 @@ class MemoryEngine(MemoryEngineInterface):
             started=started,
         )
 
+        # Derived BEFORE the fast path, not after reflect as upstream has it: the
+        # fast path returns without ever reaching the agentic loop, so a tier-0 or
+        # tier-1 refresh would skip the unsay pass below -- and tier 0 (an empty
+        # delta window) is precisely the state a document sits in when its cited
+        # facts were deleted rather than replaced. The derivation reads only the
+        # stored row, never anything reflect produced, so moving it changes nothing
+        # about what it computes.
+        # Retracted grounding: facts the stored document still cites that no longer
+        # exist. Derived here rather than passed in by whatever removed them, because
+        # ``submit_async_refresh_mental_model`` guarantees that refreshes carry no
+        # per-request options — that is what makes its pending-dedupe safe (#3487), and
+        # a payload of ids would break it by making one queued refresh no longer cover
+        # the next caller's intent. Deriving also makes the pass idempotent (a failed
+        # run recomputes the same set) and covers invalidation, every delete path, and
+        # the observation sweep without instrumenting any of them.
+        #
+        # Only delta needs this. A full refresh regenerates the document from live
+        # facts and rebuilds ``based_on`` wholesale, so a retracted fact cannot survive
+        # either surface.
+        retracted = RetractedGrounding()
+        retraction_deferred_reason: str | None = None
+        # Set once the unsay pass has run to completion, which is what licenses
+        # pruning the retracted ids out of based_on below.
+        retraction_handled = False
+        retraction_operations: MentalModelDeltaOperations | None = None
+        if use_delta:
+            stored_based_on = (mental_model.get("reflect_response") or {}).get("based_on")
+            cited_ids = based_on_fact_ids(stored_based_on)
+            if cited_ids:
+                from .memories import get_memories
+
+                store = get_memories()
+                backend = await self._get_backend()
+                async with acquire_with_retry(backend) as conn:
+                    live_ids = await store.live_memory_ids(
+                        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=cited_ids
+                    )
+                    retracted = partition_retracted(stored_based_on, live_ids)
+                    if retracted:
+                        # Re-ingesting a document deletes its facts and re-extracts them
+                        # under fresh ids, so the old ones read exactly like a retraction.
+                        # The replacements are not observations yet — those are minted by a
+                        # consolidation run that happens *after* retain commits — so waiting
+                        # for the commit is not enough. Unsaying in that gap deletes prose
+                        # whose replacement does not exist, and because the ids leave
+                        # ``based_on`` with it, nothing would ever notice again. Wait for the
+                        # bank to be caught up instead; staleness re-offers this every round.
+                        freshness = await store.consolidation_freshness(conn=conn, fq_table=fq_table, bank_id=bank_id)
+                        if freshness.get("pending"):
+                            retraction_deferred_reason = (
+                                f"{freshness['pending']} fact(s) are still pending consolidation"
+                            )
+
         # Deterministic delta fast path, ahead of the agentic loop. Only delta
         # refreshes that survived the mode decision above are eligible: full mode
         # regenerates the whole document from the unbounded window, which is not
@@ -16379,6 +16439,13 @@ class MemoryEngine(MemoryEngineInterface):
             fast_path_enabled = (
                 resolved_config.mental_model_delta_fast_path if trigger_fast_path is None else bool(trigger_fast_path)
             )
+            if fast_path_enabled and retracted:
+                # Neither tier can unsay: tier 0 writes nothing at all, and tier 1's
+                # prompt carries only the new-fact window, which by construction does
+                # not contain the facts that were deleted. Hand the refresh to the
+                # agentic path, which runs the retraction pass.
+                fast_path_enabled = False
+                fast_path_fallback_reason = "retracted_grounding"
             if fast_path_enabled:
                 fast_path = await self._try_delta_fast_path(
                     ctx,
@@ -16520,52 +16587,6 @@ class MemoryEngine(MemoryEngineInterface):
         _patch_fresh_retrieval_empty = not any(
             v for v in based_on_serialized_payload.values() if v
         )
-        # Retracted grounding: facts the stored document still cites that no longer
-        # exist. Derived here rather than passed in by whatever removed them, because
-        # ``submit_async_refresh_mental_model`` guarantees that refreshes carry no
-        # per-request options — that is what makes its pending-dedupe safe (#3487), and
-        # a payload of ids would break it by making one queued refresh no longer cover
-        # the next caller's intent. Deriving also makes the pass idempotent (a failed
-        # run recomputes the same set) and covers invalidation, every delete path, and
-        # the observation sweep without instrumenting any of them.
-        #
-        # Only delta needs this. A full refresh regenerates the document from live
-        # facts and rebuilds ``based_on`` wholesale, so a retracted fact cannot survive
-        # either surface.
-        retracted = RetractedGrounding()
-        retraction_deferred_reason: str | None = None
-        # Set once the unsay pass has run to completion, which is what licenses
-        # pruning the retracted ids out of based_on below.
-        retraction_handled = False
-        retraction_operations: MentalModelDeltaOperations | None = None
-        if use_delta:
-            stored_based_on = (mental_model.get("reflect_response") or {}).get("based_on")
-            cited_ids = based_on_fact_ids(stored_based_on)
-            if cited_ids:
-                from .memories import get_memories
-
-                store = get_memories()
-                backend = await self._get_backend()
-                async with acquire_with_retry(backend) as conn:
-                    live_ids = await store.live_memory_ids(
-                        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=cited_ids
-                    )
-                    retracted = partition_retracted(stored_based_on, live_ids)
-                    if retracted:
-                        # Re-ingesting a document deletes its facts and re-extracts them
-                        # under fresh ids, so the old ones read exactly like a retraction.
-                        # The replacements are not observations yet — those are minted by a
-                        # consolidation run that happens *after* retain commits — so waiting
-                        # for the commit is not enough. Unsaying in that gap deletes prose
-                        # whose replacement does not exist, and because the ids leave
-                        # ``based_on`` with it, nothing would ever notice again. Wait for the
-                        # bank to be caught up instead; staleness re-offers this every round.
-                        freshness = await store.consolidation_freshness(conn=conn, fq_table=fq_table, bank_id=bank_id)
-                        if freshness.get("pending"):
-                            retraction_deferred_reason = (
-                                f"{freshness['pending']} fact(s) are still pending consolidation"
-                            )
-
         # In delta mode, based_on must accumulate: the mental model is
         # grounded on ALL facts ever used, not just the latest delta's new
         # ones. Merge previous based_on with current, deduplicating by id.
