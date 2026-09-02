@@ -16331,7 +16331,14 @@ class MemoryEngine(MemoryEngineInterface):
         if stored_max_tokens is not None:
             reflect_kwargs["max_tokens"] = stored_max_tokens
 
-        resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+        # Same idiom as _resolve_bank_audit_enabled: before initialize() has built
+        # the resolver there is no bank config to read, so the deployment default
+        # applies. Both settings read from this object (compaction budget, delta fast
+        # path) are gates with a defined default, not values a caller supplied.
+        _resolver = getattr(self, "_config_resolver", None)
+        resolved_config = (
+            await _resolver.resolve_full_config(bank_id, request_context) if _resolver is not None else get_config()
+        )
         compact_enabled = bool(getattr(resolved_config, "mental_model_compact_to_max_tokens", True))
         size_budget_tokens: int | None = None
         if compact_enabled and stored_max_tokens is not None:
@@ -17463,7 +17470,6 @@ class MemoryEngine(MemoryEngineInterface):
             outcome=run.outcome,
             fast_path=run.fast_path,
             fast_path_fallback_reason=run.fast_path_fallback_reason,
-            would_persist=run.outcome == "content_written",
             would_persist=writes_content,
             scope=run.scope,
             window=run.window,

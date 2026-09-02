@@ -45,7 +45,7 @@ from .identifier_retention import (
     protected_identifiers,
     strip_salvage,
 )
-from .reflect.tokenization import count_cl100k_tokens
+from .reflect.tokenization import count_prompt_tokens
 
 # Live operator-joshf mental models are current-state-first: the opening is
 # the standing rule, the tail is superseded history. Date/session averages
@@ -192,7 +192,7 @@ def _make_unit(text: str, *, sentence_split: bool = False) -> _Unit:
         text=text,
         kind=_kind_of(text, sentence_split),
         identifiers=frozenset(extract_identifiers(text)),
-        tokens=count_cl100k_tokens(text),
+        tokens=count_prompt_tokens(text),
     )
 
 
@@ -200,7 +200,7 @@ def _units_for_budget(text: str, budget: int) -> list[_Unit]:
     """Blocks, sentence-split only when a single block cannot fit the budget."""
     units: list[_Unit] = []
     for block in _split_blocks(text):
-        block_tokens = count_cl100k_tokens(block)
+        block_tokens = count_prompt_tokens(block)
         if block_tokens > budget:
             sentences = _split_sentences(block)
             if len(sentences) == 1:
@@ -300,7 +300,7 @@ def _pack_ordered_to_budget(
 
     ordered = sorted(missing, key=lambda x: (_taxonomy_rank(x), x))
     full_packed = _packed_identifier_sentences(set(ordered))
-    if count_cl100k_tokens(_compose(kept, full_packed)) <= budget:
+    if count_prompt_tokens(_compose(kept, full_packed)) <= budget:
         return full_packed, set()
 
     # Binary search for maximum prefix of ordered that fits
@@ -311,7 +311,7 @@ def _pack_ordered_to_budget(
         mid = (low + high) // 2
         test_ids = set(ordered[:mid]) if mid > 0 else set()
         test_packed = _packed_identifier_sentences(test_ids) if test_ids else ""
-        if count_cl100k_tokens(_compose(kept, test_packed)) <= budget:
+        if count_prompt_tokens(_compose(kept, test_packed)) <= budget:
             best_k = mid
             low = mid + 1
         else:
@@ -324,7 +324,7 @@ def _pack_ordered_to_budget(
 
 
 def _fits(kept: list[_Unit], packed: str, budget: int) -> bool:
-    return count_cl100k_tokens(_compose(kept, packed)) <= budget
+    return count_prompt_tokens(_compose(kept, packed)) <= budget
 
 
 def _longest_fitting_prefix(units: list[_Unit], budget: int, source_ids: set[str]) -> list[_Unit]:
@@ -333,10 +333,10 @@ def _longest_fitting_prefix(units: list[_Unit], budget: int, source_ids: set[str
     for length in range(1, len(units) + 1):
         kept = _prefix(units, length)
         body = _join_units(kept)
-        if count_cl100k_tokens(body) > budget:
+        if count_prompt_tokens(body) > budget:
             break
         packed = _pack_for(source_ids, body)
-        if count_cl100k_tokens(_compose(kept, packed)) <= budget:
+        if count_prompt_tokens(_compose(kept, packed)) <= budget:
             best = kept
 
     if best:
@@ -348,9 +348,9 @@ def _longest_fitting_prefix(units: list[_Unit], budget: int, source_ids: set[str
     for length in range(1, len(units) + 1):
         kept = _prefix(units, length)
         body = _join_units(kept)
-        if count_cl100k_tokens(body) <= prose_target:
+        if count_prompt_tokens(body) <= prose_target:
             best = kept
-        elif not best and count_cl100k_tokens(body) <= budget:
+        elif not best and count_prompt_tokens(body) <= budget:
             best = kept
             break
         else:
@@ -375,7 +375,7 @@ def _fill_toward_budget(
         if _fits(trial, packed, budget):
             result = trial
             continue
-        if count_cl100k_tokens(_join_units(trial)) <= max(1, int(budget * 0.75)):
+        if count_prompt_tokens(_join_units(trial)) <= max(1, int(budget * 0.75)):
             result = trial
             continue
         if unit.kind != "block":
@@ -387,7 +387,7 @@ def _fill_toward_budget(
             if _fits(trial, packed, budget):
                 result = trial
                 continue
-            if count_cl100k_tokens(_join_units(trial)) <= max(1, int(budget * 0.75)):
+            if count_prompt_tokens(_join_units(trial)) <= max(1, int(budget * 0.75)):
                 result = trial
                 continue
             return result
@@ -427,7 +427,7 @@ def compact_to_budget(content: str, max_tokens: int) -> CompactionResult:
     On any internal failure the input is returned unchanged with a warning.
     """
     text = content or ""
-    tokens_before = count_cl100k_tokens(text)
+    tokens_before = count_prompt_tokens(text)
     if max_tokens <= 0 or tokens_before <= max_tokens:
         return _unchanged(text, tokens_before)
 
@@ -462,17 +462,17 @@ def _compact_oversized(text: str, tokens_before: int, max_tokens: int) -> Compac
     compacted = _compose(kept, packed)
 
     # Trim kept units if compose is still over ceiling
-    while kept and count_cl100k_tokens(compacted) > max_tokens:
+    while kept and count_prompt_tokens(compacted) > max_tokens:
         kept = kept[:-1]
         packed, dropped_ids = _pack_ordered_to_budget(kept, source_ids, max_tokens)
         compacted = _compose(kept, packed)
 
-    if count_cl100k_tokens(compacted) > max_tokens:
+    if count_prompt_tokens(compacted) > max_tokens:
         kept = []
         packed, dropped_ids = _pack_ordered_to_budget([], source_ids, max_tokens)
         compacted = packed
 
-    tokens_after = count_cl100k_tokens(compacted)
+    tokens_after = count_prompt_tokens(compacted)
 
     # Belt: output may never exceed max(4 * max_tokens chars, 65536)
     char_ceiling = max(4 * max_tokens, 65536)
@@ -486,7 +486,7 @@ def _compact_oversized(text: str, tokens_before: int, max_tokens: int) -> Compac
         ceiling_cut = True
         ids_after = extract_identifiers(compacted)
         dropped_ids = source_ids - ids_after
-        tokens_after = count_cl100k_tokens(compacted)
+        tokens_after = count_prompt_tokens(compacted)
 
     # Floor guard: if the compacted text has no prose paragraph OR not compacted.strip(), return unchanged
     compacted_salvage, compacted_prose = count_prose_and_residue(compacted)
@@ -507,7 +507,7 @@ def _compact_oversized(text: str, tokens_before: int, max_tokens: int) -> Compac
     dropped_prose = sum(1 for unit in units if id(unit) not in kept_ids_set and not unit.identifiers)
 
     identifiers_exceed_budget = bool(all_dropped_ids) or (
-        count_cl100k_tokens(_packed_identifier_sentences(source_ids)) > max_tokens if source_ids else False
+        count_prompt_tokens(_packed_identifier_sentences(source_ids)) > max_tokens if source_ids else False
     )
 
     warning = (

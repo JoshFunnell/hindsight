@@ -28,6 +28,10 @@ from hindsight_api.engine.reflect.delta_ops import Operation
 _OPERATION_PROMPTS = {
     "STRUCTURED_DELTA_SYSTEM_PROMPT": prompts.STRUCTURED_DELTA_SYSTEM_PROMPT,
     "STRUCTURED_RETRACTION_SYSTEM_PROMPT": prompts.STRUCTURED_RETRACTION_SYSTEM_PROMPT,
+    # The delta fast path's prompt is the base prompt plus an escape-hatch
+    # addendum, so it carries the same operations vocabulary and must be checked
+    # against the same schema.
+    "STRUCTURED_DELTA_FAST_PATH_SYSTEM_PROMPT": prompts.STRUCTURED_DELTA_FAST_PATH_SYSTEM_PROMPT,
 }
 
 _OP_SHAPE_RX = re.compile(r'\{"op":\s*"(\w+)"([^`]*)')
