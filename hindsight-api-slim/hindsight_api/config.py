@@ -1654,11 +1654,49 @@ DEFAULT_MENTAL_MODEL_COMPACT_TO_MAX_TOKENS = True
 # model writes fluent generic no-info text, which passes every emptiness check
 # there is, and the working document is gone -- measured 2026-08-01, which is why
 # mm_refresh_safe.py had to snapshot and restore around every refresh).
-# OFF by default for the same reason as the fast path above: a stubbed reflect
-# returns real text with no facts BY CONSTRUCTION, so an on-by-default guard
-# refuses upstream's own suite. Our deployment opts in through the compose env,
-# where every other behaviour-changing overlay switch already lives.
+#
+# It DERIVES from the fast-path setting rather than carrying its own default, so
+# the two overlay switches cannot disagree by accident. Turning the fast path on
+# is what says "this is our deployment", and the refute of DESIGN-S107 was right
+# that the two failure modes are asymmetric: a dropped fast path costs tokens,
+# a dropped guard re-opens a silent content clobber. One env line should not be
+# able to take the guard away while the rest of the overlay stays on. Set
+# HINDSIGHT_API_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD explicitly to override in
+# either direction. This constant is only the value when nothing is set and the
+# fast path is off -- i.e. an upstream-shaped run.
 DEFAULT_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD = False
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean env var, treating an EMPTY value as unset.
+
+    ``HINDSIGHT_API_X:`` in a compose file, or ``X=`` in a shell, sets the variable to the
+    empty string rather than removing it. Without this, the empty string parses as false,
+    which for the pair below is the single most dangerous state (the cheap overlay on, the
+    safe one off) reached by a typo. Both refute lenses found this crack on 2026-09-02.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("true", "1", "yes")
+
+
+def mental_model_delta_fast_path_enabled() -> bool:
+    """Whether the deterministic delta fast path runs before the agentic loop."""
+    return _env_flag(ENV_MENTAL_MODEL_DELTA_FAST_PATH, DEFAULT_MENTAL_MODEL_DELTA_FAST_PATH)
+
+
+def mental_model_empty_retrieval_guard_enabled() -> bool:
+    """Whether the #2894 empty-fresh-retrieval guard refuses a clobbering refresh.
+
+    Unset means "follow the fast path", so a deployment opts into our overlay
+    behaviour once and cannot silently keep the cheap half without the safe half.
+    """
+    raw = os.getenv(ENV_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD)
+    if raw is None or not raw.strip():
+        return mental_model_delta_fast_path_enabled()
+    return raw.strip().lower() in ("true", "1", "yes")
+
 
 # Recall pipeline stages — all on by default, so recall behaviour is unchanged
 # unless a bank opts out.
@@ -4478,18 +4516,12 @@ class HindsightConfig:
             recall_chunks_max_tokens=int(
                 os.getenv(ENV_RECALL_CHUNKS_MAX_TOKENS, str(DEFAULT_RECALL_CHUNKS_MAX_TOKENS))
             ),
-            mental_model_delta_fast_path=os.getenv(
-                ENV_MENTAL_MODEL_DELTA_FAST_PATH, str(DEFAULT_MENTAL_MODEL_DELTA_FAST_PATH)
-            ).lower()
-            in ("true", "1", "yes"),
+            mental_model_delta_fast_path=mental_model_delta_fast_path_enabled(),
             mental_model_compact_to_max_tokens=os.getenv(
                 ENV_MENTAL_MODEL_COMPACT_TO_MAX_TOKENS, str(DEFAULT_MENTAL_MODEL_COMPACT_TO_MAX_TOKENS)
             ).lower()
             in ("true", "1", "yes"),
-            mental_model_empty_retrieval_guard=os.getenv(
-                ENV_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD, str(DEFAULT_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD)
-            ).lower()
-            in ("true", "1", "yes"),
+            mental_model_empty_retrieval_guard=mental_model_empty_retrieval_guard_enabled(),
             recall_budget_function=_validate_recall_budget_function(
                 os.getenv(ENV_RECALL_BUDGET_FUNCTION, DEFAULT_RECALL_BUDGET_FUNCTION)
             ),

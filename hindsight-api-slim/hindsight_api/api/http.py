@@ -4078,13 +4078,39 @@ def create_app(
         import asyncio
         import socket
 
-        from hindsight_api.config import get_config
+        from hindsight_api.config import (
+            ENV_MENTAL_MODEL_DELTA_FAST_PATH,
+            ENV_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD,
+            get_config,
+        )
         from hindsight_api.worker import WorkerPoller
 
         config = get_config()
         poller = None
         poller_task = None
         loop_watchdog = None
+
+        # The two mental-model refresh overlays are opt-in, and their absence is
+        # otherwise SILENT: the server keeps working, every refresh just takes the
+        # agentic path at roughly ten times the tokens (13,533 input tokens on tier 1
+        # against ~150k agentic, measured 2026-08-19), and a document whose retrieval
+        # comes back empty gets overwritten instead of preserved. A dropped compose
+        # line is the realistic way to lose them, so say so once at startup rather
+        # than trusting a comment in a file nobody reads at 3am (S107 refute).
+        if not config.mental_model_delta_fast_path:
+            logging.warning(
+                "Mental-model delta fast path is OFF (%s is not true). Every refresh will run the "
+                "agentic path: ~10x the input tokens per refresh. Set it to true unless this is "
+                "deliberate.",
+                ENV_MENTAL_MODEL_DELTA_FAST_PATH,
+            )
+        if not config.mental_model_empty_retrieval_guard:
+            logging.warning(
+                "Mental-model empty-retrieval guard is OFF (%s is not true). A refresh whose "
+                "retrieval comes back empty over a previously grounded document will OVERWRITE it "
+                "(issue #2894) instead of preserving it.",
+                ENV_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD,
+            )
 
         # Initialize OpenTelemetry metrics. Remember the collector we displace so
         # shutdown can put it back: the collector is a module global, so an app

@@ -28,12 +28,17 @@ is upstream's ``test_empty_reflect_answer_preserves_existing_content``.
 """
 
 import inspect
+import os
 import re
 import unittest
 
 from hindsight_api.config import (
+    DEFAULT_MENTAL_MODEL_DELTA_FAST_PATH,
     DEFAULT_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD,
+    ENV_MENTAL_MODEL_DELTA_FAST_PATH,
     ENV_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD,
+    mental_model_delta_fast_path_enabled,
+    mental_model_empty_retrieval_guard_enabled,
 )
 
 
@@ -126,6 +131,56 @@ class EmptyRetrievalGuardTests(unittest.TestCase):
                 previous_reflect_response=GROUNDED,
             )
         )
+
+
+class GuardFollowsTheFastPathTests(unittest.TestCase):
+    """The two overlay switches must not be able to disagree by accident.
+
+    Both refute lenses (2026-09-02) reached the same dangerous state from different
+    directions: the cheap overlay on, the clobber guard off. The guard therefore has no
+    default of its own -- unset, it follows the fast path -- and an EMPTY value counts as
+    unset, because `VAR:` in a compose file and `VAR=` in a shell both set the empty string
+    rather than removing the variable.
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: os.environ.pop(k, None)
+            for k in (ENV_MENTAL_MODEL_DELTA_FAST_PATH, ENV_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD)
+        }
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_unset_guard_follows_the_fast_path_on(self):
+        os.environ[ENV_MENTAL_MODEL_DELTA_FAST_PATH] = "true"
+        self.assertTrue(mental_model_empty_retrieval_guard_enabled())
+
+    def test_unset_guard_follows_the_fast_path_off(self):
+        os.environ[ENV_MENTAL_MODEL_DELTA_FAST_PATH] = "false"
+        self.assertFalse(mental_model_empty_retrieval_guard_enabled())
+
+    def test_empty_guard_value_counts_as_unset_and_still_follows(self):
+        """The compose typo: `HINDSIGHT_API_..._GUARD:` with nothing after it."""
+        os.environ[ENV_MENTAL_MODEL_DELTA_FAST_PATH] = "true"
+        os.environ[ENV_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD] = ""
+        self.assertTrue(mental_model_empty_retrieval_guard_enabled())
+        os.environ[ENV_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD] = "   "
+        self.assertTrue(mental_model_empty_retrieval_guard_enabled())
+
+    def test_an_explicit_false_still_overrides(self):
+        """Deliberate decoupling stays possible -- only the accidental kind is closed."""
+        os.environ[ENV_MENTAL_MODEL_DELTA_FAST_PATH] = "true"
+        os.environ[ENV_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD] = "false"
+        self.assertFalse(mental_model_empty_retrieval_guard_enabled())
+
+    def test_an_empty_fast_path_value_falls_back_to_the_code_default(self):
+        os.environ[ENV_MENTAL_MODEL_DELTA_FAST_PATH] = ""
+        self.assertEqual(mental_model_delta_fast_path_enabled(), DEFAULT_MENTAL_MODEL_DELTA_FAST_PATH)
 
     def test_engine_still_spells_the_predicate_this_way(self):
         """Pin the mirror to the engine, whitespace-insensitively.
