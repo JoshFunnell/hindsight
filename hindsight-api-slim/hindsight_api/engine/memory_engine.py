@@ -17017,53 +17017,36 @@ class MemoryEngine(MemoryEngineInterface):
                 fast_path_fallback_reason=fast_path_fallback_reason,
             )
 
-        # LOCAL PATCH (2026-08-01 v2, upstream #2959 + #2894, cross-model
-        # reviewed; REBASED onto v0.9.0 2026-08-07; RE-APPLIED onto the
-        # SPEC-A two-tier branch e034f97 2026-08-08 -- _finish became
-        # _build_refresh_run, and tier-1 makes the placeholder leg
-        # structurally unreachable on the fast path, so this guard covers
-        # the tier-2/loop path only): refuse to overwrite EXISTING REAL
-        # content when (a) the candidate is a known failure placeholder
-        # (#2959: NO_ANSWER_TEXT or the iteration-limit fallback --
-        # non-empty, so the emptiness guard above passes it), or (b) THIS
-        # reflect retrieved nothing fresh (#2894: embedding index
-        # unavailable -> model emits generic no-info text; measured
-        # pre-merge, because delta carry-over refills based_on and makes a
-        # post-merge check fail-open). Both legs gate on existing real
-        # content (has_delta_baseline): a bootstrap "no answer" on an
-        # empty/PENDING model is a correct first write, not a clobber.
+        # LOCAL PATCH (2026-08-01, #2894 leg only; RE-APPLIED onto the SPEC-A
+        # two-tier branch e034f97 2026-08-08; the #2959 placeholder leg RETIRED
+        # 2026-09-02 on the main port -- upstream f4a936950 raises
+        # ReflectNoAnswerError instead of substituting either placeholder string,
+        # so a candidate carrying one can no longer reach this point and the
+        # constant it matched no longer exists).
+        #
+        # What is left has no upstream equivalent: refuse to overwrite EXISTING
+        # REAL content when THIS reflect retrieved nothing fresh (embedding index
+        # unavailable -> the model emits fluent generic no-info text, which is a
+        # real answer to every emptiness check upstream has). Measured PRE-merge,
+        # because delta carry-over refills based_on and makes a post-merge check
+        # fail-open. Gated on existing real content (has_delta_baseline): a
+        # bootstrap write on an empty/PENDING model is correct, not a clobber.
         # Reuses outcome "refresh_failed_empty_candidate" so the caller's
-        # preserve-and-fail path needs no new outcome value; the warning
-        # below records the precise reason for audit.
-        # TWOTIER1 merge 2026-08-18: return via _finalize_refresh_document so
-        # the size-budget compact + identifier gate cannot be skipped here.
-        from .reflect.agent import NO_ANSWER_TEXT as _PATCH_NO_ANSWER
-
-        _patch_cand = final_content.strip()
-        _patch_placeholder = (
-            _patch_cand == _PATCH_NO_ANSWER.strip()
-            or _patch_cand.startswith("I was unable to formulate a complete answer")
-        )
-        if has_delta_baseline and (_patch_placeholder or _patch_fresh_retrieval_empty):
-            _patch_reason = (
-                "placeholder_candidate" if _patch_placeholder else "empty_fresh_retrieval"
-            )
+        # preserve-and-fail path needs no new outcome value; the warning below
+        # records the reason for audit. Returns via _finish so the size-budget
+        # compact and the identifier gate cannot be skipped here.
+        if has_delta_baseline and _patch_fresh_retrieval_empty:
             warnings.append(
-                f"LOCAL PATCH #2959/#2894: refresh produced a {_patch_reason} render over "
+                "LOCAL PATCH #2894: refresh produced an empty_fresh_retrieval render over "
                 "existing real content; preserving previous content and failing the refresh."
             )
-            return _finalize_refresh_document(
-                ctx,
-                evidence,
+            return _finish(
                 effective_mode=effective_mode,
                 mode_fallback_reason=mode_fallback_reason,
                 final_content=final_content,
                 final_structured=None,
                 delta_operations=delta_operations,
-                reflect_response=reflect_response_payload,
                 outcome="refresh_failed_empty_candidate",
-                warnings=warnings,
-                fast_path_fallback_reason=fast_path_fallback_reason,
             )
 
         # Refuse to write a delta-window candidate as the whole document (#3112).
