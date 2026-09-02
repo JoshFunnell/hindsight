@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 
+from .._cross_loop import CrossLoopSemaphore
 from ..config import (
     DEFAULT_LITELLM_API_BASE,
     DEFAULT_RERANKER_ALIBABA_MODEL,
@@ -647,7 +648,7 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
     """
 
     # Global semaphore shared across all instances and calls to prevent thundering herd
-    _global_semaphore: asyncio.Semaphore | None = None
+    _global_semaphore: CrossLoopSemaphore | None = None
     _global_max_concurrent: int = DEFAULT_RERANKER_TEI_MAX_CONCURRENT
 
     def __init__(
@@ -686,7 +687,10 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
             or RemoteTEICrossEncoder._global_max_concurrent != max_concurrent
         ):
             RemoteTEICrossEncoder._global_max_concurrent = max_concurrent
-            RemoteTEICrossEncoder._global_semaphore = asyncio.Semaphore(max_concurrent)
+            # CrossLoopSemaphore, not asyncio.Semaphore: this is a CLASS attribute, so
+            # it is shared by every event loop in the process and an asyncio.Semaphore
+            # would bind to whichever loop first waits on it.
+            RemoteTEICrossEncoder._global_semaphore = CrossLoopSemaphore(max_concurrent)
 
     @property
     def provider_name(self) -> str:
