@@ -1320,13 +1320,20 @@ def _retry_or_reraise_worker_task(e: Exception, task_dict: dict[str, Any]) -> No
     re-raises ``e`` so the poller marks the operation failed with the message.
     Consolidation has its own indefinite-retry / dedup-by-bank path and must
     not use this helper.
+
+    The message goes through ``format_task_error`` because that is what the
+    branch this helper replaced passed (``message=error_message``): a bare
+    ``str(e)`` is empty for ``TimeoutError()``, ``CancelledError()`` and every
+    bare ``raise SomeError()``, which is issue #3218 arriving again by the back
+    door. One caller reaches this before ``error_message`` is computed, so the
+    formatting has to live here rather than at the call sites.
     """
     config = get_config()
     retry_count = task_dict.get("_retry_count", 0)
     if retry_count < config.worker_max_retries:
         raise RetryTaskAt(
             retry_at=datetime.now(UTC) + timedelta(seconds=config.worker_task_retry_backoff_seconds),
-            message=str(e),
+            message=format_task_error(e),
         )
     raise e
 
