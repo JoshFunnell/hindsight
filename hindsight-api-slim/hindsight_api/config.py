@@ -322,6 +322,30 @@ def _parse_boolean_env(env_name: str, default: bool) -> bool:
     raise ValueError(f"Invalid {env_name} value {raw!r}: expected true, false, 1, or 0")
 
 
+def _clamp_int(raw: object, lo: int, hi: int, default: int, *, name: str = "") -> int:
+    """Parse an int and clamp to [lo, hi].
+
+    Non-int or value below ``lo`` -> ``default`` (never silent ``lo``).
+    Value above ``hi`` still clamps to ``hi``.
+    """
+    label = name or "int"
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        logger.warning("%s value %r is not an int; using default %s", label, raw, default)
+        return default
+    if value < lo:
+        logger.warning(
+            "%s value %s is below lo=%s; using default %s",
+            label,
+            value,
+            lo,
+            default,
+        )
+        return default
+    return min(hi, value)
+
+
 # Per-operation LLM configuration (optional, falls back to global LLM config)
 ENV_RETAIN_LLM_PROVIDER = "HINDSIGHT_API_RETAIN_LLM_PROVIDER"
 ENV_RETAIN_LLM_API_KEY = "HINDSIGHT_API_RETAIN_LLM_API_KEY"
@@ -498,6 +522,11 @@ ENV_RERANKER_MAX_CANDIDATES = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES"
 ENV_RERANKER_MAX_CANDIDATES_LOW = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_LOW"
 ENV_RERANKER_MAX_CANDIDATES_MID = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_MID"
 ENV_RERANKER_MAX_CANDIDATES_HIGH = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_HIGH"
+# Multi-bank union CE + local CE CPU thread pin (server-level, not per-bank).
+ENV_MULTI_UNION_CAP = "HINDSIGHT_API_MULTI_UNION_CAP"
+ENV_MULTI_PER_BANK_PRE_CAP = "HINDSIGHT_API_MULTI_PER_BANK_PRE_CAP"
+ENV_MULTI_PER_BANK_FLOOR = "HINDSIGHT_API_MULTI_PER_BANK_FLOOR"
+ENV_RERANKER_TORCH_THREADS = "HINDSIGHT_API_RERANKER_TORCH_THREADS"
 ENV_SEMANTIC_MIN_SIMILARITY = "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY"
 ENV_GRAPH_SEED_MIN_SIMILARITY = "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY"
 ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY = "HINDSIGHT_API_TEMPORAL_SEMANTIC_MIN_SIMILARITY"
@@ -658,6 +687,8 @@ ENV_ENABLE_OBSERVATIONS = "HINDSIGHT_API_ENABLE_OBSERVATIONS"
 ENV_ENABLE_AUTO_CONSOLIDATION = "HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION"
 ENV_CONSOLIDATION_BATCH_SIZE = "HINDSIGHT_API_CONSOLIDATION_BATCH_SIZE"
 ENV_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND"
+ENV_CONSOLIDATION_HOT_WINDOW_SECONDS = "HINDSIGHT_API_CONSOLIDATION_HOT_WINDOW_SECONDS"
+ENV_CONSOLIDATION_HOT_ROUND_MAX = "HINDSIGHT_API_CONSOLIDATION_HOT_ROUND_MAX"
 ENV_CONSOLIDATION_LLM_BATCH_SIZE = "HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE"
 ENV_CONSOLIDATION_DEDUP_THRESHOLD = "HINDSIGHT_API_CONSOLIDATION_DEDUP_THRESHOLD"
 ENV_CONSOLIDATION_LLM_PARALLELISM = "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM"
@@ -803,6 +834,10 @@ ENV_REFLECT_MAX_COMPLETION_TOKENS = "HINDSIGHT_API_REFLECT_MAX_COMPLETION_TOKENS
 ENV_RECALL_INCLUDE_CHUNKS = "HINDSIGHT_API_RECALL_INCLUDE_CHUNKS"
 ENV_RECALL_MAX_TOKENS = "HINDSIGHT_API_RECALL_MAX_TOKENS"
 ENV_RECALL_CHUNKS_MAX_TOKENS = "HINDSIGHT_API_RECALL_CHUNKS_MAX_TOKENS"
+
+# Mental model refresh
+ENV_MENTAL_MODEL_DELTA_FAST_PATH = "HINDSIGHT_API_MENTAL_MODEL_DELTA_FAST_PATH"
+ENV_MENTAL_MODEL_COMPACT_TO_MAX_TOKENS = "HINDSIGHT_API_MENTAL_MODEL_COMPACT_TO_MAX_TOKENS"
 
 # Recall pipeline stages. Each arm of recall costs latency, and a bank whose
 # content has no temporal or relational structure pays for stages it cannot use
@@ -1003,6 +1038,10 @@ DEFAULT_RERANKER_MAX_CANDIDATES = 300
 DEFAULT_RERANKER_MAX_CANDIDATES_LOW = 0
 DEFAULT_RERANKER_MAX_CANDIDATES_MID = 0
 DEFAULT_RERANKER_MAX_CANDIDATES_HIGH = 0
+DEFAULT_MULTI_UNION_CAP = 200
+DEFAULT_MULTI_PER_BANK_PRE_CAP = 50
+DEFAULT_MULTI_PER_BANK_FLOOR = 1
+DEFAULT_RERANKER_TORCH_THREADS = 0
 DEFAULT_SEMANTIC_MIN_SIMILARITY = 0.3
 DEFAULT_GRAPH_SEED_MIN_SIMILARITY = 0.3
 DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY = 0.1
@@ -1239,6 +1278,12 @@ DEFAULT_CONSOLIDATION_BATCH_SIZE = 50  # Memories to load per batch (internal me
 DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = (
     100  # Max memories per consolidation round (0 = unlimited). Limits how long one bank holds a worker slot.
 )
+# Units retained inside this window are taken first (newest among them) so a
+# retain during a backlog is not stuck behind oldest-first FIFO. 0 disables
+# the hot slice and the fetch is newest-first for the whole round.
+DEFAULT_CONSOLIDATION_HOT_WINDOW_SECONDS = 900
+# Cap on how many hot-window units one round will jump to the front.
+DEFAULT_CONSOLIDATION_HOT_ROUND_MAX = 20
 DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE = 8  # Facts per LLM call (1 = no batching; >1 = batch mode)
 # Cosine >= this between a newly-created or freshly-updated observation and an existing one
 # triggers a focused 1-by-1 LLM "merge or keep" pass (the LLM reads both, so numbers/negation/
@@ -1346,6 +1391,15 @@ DEFAULT_REFLECT_MAX_COMPLETION_TOKENS: int | None = None
 DEFAULT_RECALL_INCLUDE_CHUNKS = True  # Whether internal recall (e.g. mental model refresh) returns raw chunks
 DEFAULT_RECALL_MAX_TOKENS = 2048  # Token budget for facts returned by internal recall
 DEFAULT_RECALL_CHUNKS_MAX_TOKENS = 1000  # Token budget for raw chunks returned by internal recall
+
+# Mental model refresh: run the deterministic delta fast path before the agentic
+# reflect loop. On by default — the fast path preserves every outcome and hands
+# back to the loop on any doubt, so the loop still produces the result whenever
+# a surgical edit is not obviously safe. Set false to always run the loop.
+DEFAULT_MENTAL_MODEL_DELTA_FAST_PATH = True
+# Honour per-model max_tokens on the stored document: drop prose, keep
+# identifiers. Off only as a kill switch if a compact write needs revert.
+DEFAULT_MENTAL_MODEL_COMPACT_TO_MAX_TOKENS = True
 
 # Recall pipeline stages — all on by default, so recall behaviour is unchanged
 # unless a bank opts out.
@@ -2448,6 +2502,8 @@ class HindsightConfig:
     consolidation_batch_size: int
     consolidation_dedup_threshold: float
     consolidation_max_memories_per_round: int
+    consolidation_hot_window_seconds: int
+    consolidation_hot_round_max: int
     consolidation_llm_batch_size: int
     consolidation_llm_parallelism: int
     consolidation_max_tokens: int
@@ -2487,6 +2543,11 @@ class HindsightConfig:
     recall_include_chunks: bool
     recall_max_tokens: int
     recall_chunks_max_tokens: int
+
+    # Mental model refresh: deterministic delta fast path before the agentic loop
+    mental_model_delta_fast_path: bool
+    # Honour per-model max_tokens as a stored-document size budget
+    mental_model_compact_to_max_tokens: bool
 
     # Recall budget mapping: how the Budget enum (LOW/MID/HIGH) maps to thinking_budget integer.
     # function="fixed": use the recall_budget_fixed_* values directly (legacy behavior).
@@ -2646,6 +2707,13 @@ class HindsightConfig:
     # sees). Stored lower-cased; empty means no header is ever forwarded.
     extension_passthrough_headers: list[str] = field(default_factory=list)
 
+    # Multi-bank union CE + local CE CPU thread pin (static, server-level).
+    # Defaults keep HindsightConfig(**kwargs) callers source-compatible.
+    multi_union_cap: int = DEFAULT_MULTI_UNION_CAP
+    multi_per_bank_pre_cap: int = DEFAULT_MULTI_PER_BANK_PRE_CAP
+    multi_per_bank_floor: int = DEFAULT_MULTI_PER_BANK_FLOOR
+    reranker_torch_threads: int = DEFAULT_RERANKER_TORCH_THREADS
+
     # Class-level sets for configuration categorization
 
     # CREDENTIAL_FIELDS: Never exposed via API, never configurable per-tenant/bank
@@ -2733,6 +2801,8 @@ class HindsightConfig:
         "consolidation_llm_batch_size",
         "consolidation_llm_parallelism",
         "consolidation_max_memories_per_round",
+        "consolidation_hot_window_seconds",
+        "consolidation_hot_round_max",
         "consolidation_source_facts_max_tokens",
         "consolidation_source_facts_max_tokens_per_observation",
         "observations_mission",
@@ -2745,6 +2815,9 @@ class HindsightConfig:
         "recall_include_chunks",
         "recall_max_tokens",
         "recall_chunks_max_tokens",
+        # Mental model refresh (per-model override lives on trigger.delta_fast_path)
+        "mental_model_delta_fast_path",
+        "mental_model_compact_to_max_tokens",
         # Recall budget mapping (Budget enum -> thinking_budget integer)
         "recall_budget_function",
         "recall_budget_fixed_low",
@@ -3714,6 +3787,18 @@ class HindsightConfig:
                     str(DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND),
                 )
             ),
+            consolidation_hot_window_seconds=int(
+                os.getenv(
+                    ENV_CONSOLIDATION_HOT_WINDOW_SECONDS,
+                    str(DEFAULT_CONSOLIDATION_HOT_WINDOW_SECONDS),
+                )
+            ),
+            consolidation_hot_round_max=int(
+                os.getenv(
+                    ENV_CONSOLIDATION_HOT_ROUND_MAX,
+                    str(DEFAULT_CONSOLIDATION_HOT_ROUND_MAX),
+                )
+            ),
             consolidation_dedup_threshold=float(
                 os.getenv(ENV_CONSOLIDATION_DEDUP_THRESHOLD, str(DEFAULT_CONSOLIDATION_DEDUP_THRESHOLD))
             ),
@@ -3841,6 +3926,14 @@ class HindsightConfig:
             recall_chunks_max_tokens=int(
                 os.getenv(ENV_RECALL_CHUNKS_MAX_TOKENS, str(DEFAULT_RECALL_CHUNKS_MAX_TOKENS))
             ),
+            mental_model_delta_fast_path=os.getenv(
+                ENV_MENTAL_MODEL_DELTA_FAST_PATH, str(DEFAULT_MENTAL_MODEL_DELTA_FAST_PATH)
+            ).lower()
+            in ("true", "1", "yes"),
+            mental_model_compact_to_max_tokens=os.getenv(
+                ENV_MENTAL_MODEL_COMPACT_TO_MAX_TOKENS, str(DEFAULT_MENTAL_MODEL_COMPACT_TO_MAX_TOKENS)
+            ).lower()
+            in ("true", "1", "yes"),
             recall_budget_function=_validate_recall_budget_function(
                 os.getenv(ENV_RECALL_BUDGET_FUNCTION, DEFAULT_RECALL_BUDGET_FUNCTION)
             ),
@@ -3952,6 +4045,34 @@ class HindsightConfig:
             extension_passthrough_headers=[
                 h.lower() for h in _parse_str_list(os.getenv(ENV_EXTENSION_PASSTHROUGH_HEADERS, ""))
             ],
+            multi_union_cap=_clamp_int(
+                os.getenv(ENV_MULTI_UNION_CAP, str(DEFAULT_MULTI_UNION_CAP)),
+                1,
+                500,
+                DEFAULT_MULTI_UNION_CAP,
+                name=ENV_MULTI_UNION_CAP,
+            ),
+            multi_per_bank_pre_cap=_clamp_int(
+                os.getenv(ENV_MULTI_PER_BANK_PRE_CAP, str(DEFAULT_MULTI_PER_BANK_PRE_CAP)),
+                1,
+                500,
+                DEFAULT_MULTI_PER_BANK_PRE_CAP,
+                name=ENV_MULTI_PER_BANK_PRE_CAP,
+            ),
+            multi_per_bank_floor=_clamp_int(
+                os.getenv(ENV_MULTI_PER_BANK_FLOOR, str(DEFAULT_MULTI_PER_BANK_FLOOR)),
+                1,
+                20,
+                DEFAULT_MULTI_PER_BANK_FLOOR,
+                name=ENV_MULTI_PER_BANK_FLOOR,
+            ),
+            reranker_torch_threads=_clamp_int(
+                os.getenv(ENV_RERANKER_TORCH_THREADS, str(DEFAULT_RERANKER_TORCH_THREADS)),
+                0,
+                8,
+                DEFAULT_RERANKER_TORCH_THREADS,
+                name=ENV_RERANKER_TORCH_THREADS,
+            ),
         )
         config.validate()
         return config

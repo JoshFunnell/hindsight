@@ -184,7 +184,8 @@ from hindsight_api.engine.response_models import (
     RecallScores,
     TokenUsage,
 )
-from hindsight_api.engine.search.tags import TagGroup, TagsMatch
+from hindsight_api.engine.response_models import RecallResult as CoreRecallResult
+from hindsight_api.engine.search.tags import TagGroup, TagsMatch, validate_entity_leaf_placement
 from hindsight_api.engine.structured_output import validate_response_schema
 from hindsight_api.extensions import HttpExtension, OperationValidationError, load_extension
 from hindsight_api.liveness import LivenessResponse, liveness_response
@@ -367,6 +368,13 @@ class RecallRequest(BaseModel):
             raise ValueError("'tags' and 'tag_groups' are mutually exclusive. Use 'tag_groups' for compound filtering.")
         return self
 
+    @field_validator("tag_groups")
+    @classmethod
+    def validate_recall_entity_leaf_placement(cls, v: list[TagGroup] | None) -> list[TagGroup] | None:
+        # Entity leaves may not sit under 'not' -- see validate_entity_leaf_placement.
+        validate_entity_leaf_placement(v)
+        return v
+
 
 class RecallResult(BaseModel):
     """Single recall result item."""
@@ -407,6 +415,7 @@ class RecallResult(BaseModel):
         None  # IDs of source facts (observation type only, when source_facts is enabled)
     )
     scores: RecallScores | None = None  # Per-stage recall scores (final/reranker/semantic/text)
+    bank_id: str | None = None  # Source bank (set by multi-bank recall; null for single-bank)
 
 
 class EntityObservationResponse(BaseModel):
@@ -606,6 +615,124 @@ class RecallResponse(BaseModel):
             "results[].source_fact_ids have no entry in source_facts — the budget ran out, the "
             "references are not dangling. Only set when source facts were requested."
         ),
+    )
+    metadata: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional response metadata. Multi-bank recall populates metadata['multi_bank'] with "
+            "merge mode, per-bank status, and auto-fallback reason when score-merge cannot run."
+        ),
+    )
+
+
+class MultiBankRecallRequest(RecallRequest):
+    """Request model for multi-bank recall (additive endpoint).
+
+    Same fields as :class:`RecallRequest`, plus ``bank_ids`` and ``merge``.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "bank_ids": ["work", "personal"],
+                "query": "What are my open tasks?",
+                "merge": "score",
+                "budget": "mid",
+                "max_tokens": 4096,
+            }
+        }
+    )
+
+    bank_ids: list[str] = Field(
+        description=(
+            "Memory banks to query in parallel (max 10). Order is preserved for interleave merge."
+        ),
+        min_length=1,
+        max_length=10,
+    )
+    merge: Literal["score", "interleave"] = Field(
+        default="score",
+        description=(
+            "How to order the union of per-bank results. "
+            "'score' (default): sort by normalized cross-encoder score; auto-falls back to "
+            "'interleave' when any bank did not run cross_encoder (enable_reranking=false or "
+            "non-CE reranking). 'interleave': round-robin by per-bank rank."
+        ),
+    )
+
+    @field_validator("bank_ids")
+    @classmethod
+    def validate_bank_ids_nonempty_strings(cls, v: list[str]) -> list[str]:
+        cleaned = [bid.strip() for bid in v if isinstance(bid, str) and bid.strip()]
+        if not cleaned:
+            raise ValueError("bank_ids must contain at least one non-empty bank id")
+        return cleaned
+
+
+def _core_recall_to_http_response(core_result: CoreRecallResult) -> RecallResponse:
+    """Map engine :class:`RecallResult` (core) to the HTTP :class:`RecallResponse`."""
+
+    def _fact_to_result(fact: MemoryFact) -> RecallResult:
+        return RecallResult(
+            id=fact.id,
+            text=fact.text,
+            type=fact.fact_type,
+            entities=fact.entities,
+            context=fact.context,
+            occurred_start=fact.occurred_start,
+            occurred_end=fact.occurred_end,
+            mentioned_at=fact.mentioned_at,
+            document_id=fact.document_id,
+            metadata=fact.metadata,
+            chunk_id=fact.chunk_id,
+            tags=fact.tags,
+            source_fact_ids=fact.source_fact_ids,
+            scores=fact.scores,
+            bank_id=fact.bank_id,
+        )
+
+    recall_results = [_fact_to_result(fact) for fact in core_result.results]
+
+    chunks_response = None
+    if core_result.chunks:
+        chunks_response = {
+            chunk_id: ChunkData(
+                id=chunk_id,
+                text=chunk_info.chunk_text,
+                chunk_index=chunk_info.chunk_index,
+                truncated=chunk_info.truncated,
+            )
+            for chunk_id, chunk_info in core_result.chunks.items()
+        }
+
+    entities_response = None
+    if core_result.entities:
+        entities_response = {
+            name: EntityStateResponse(
+                entity_id=state.entity_id,
+                canonical_name=state.canonical_name,
+                observations=[
+                    EntityObservationResponse(text=obs.text, mentioned_at=obs.mentioned_at)
+                    for obs in state.observations
+                ],
+            )
+            for name, state in core_result.entities.items()
+        }
+
+    source_facts_response = None
+    if core_result.source_facts:
+        source_facts_response = {
+            fact_id: _fact_to_result(fact) for fact_id, fact in core_result.source_facts.items()
+        }
+
+    return RecallResponse(
+        results=recall_results,
+        trace=core_result.trace,
+        entities=entities_response,
+        chunks=chunks_response,
+        source_facts=source_facts_response,
+        source_facts_truncated=getattr(core_result, "source_facts_truncated", None),
+        metadata=core_result.metadata,
     )
 
 
@@ -1030,6 +1157,13 @@ class ReflectRequest(BaseModel):
         if self.tags is not None and self.tag_groups is not None:
             raise ValueError("'tags' and 'tag_groups' are mutually exclusive. Use 'tag_groups' for compound filtering.")
         return self
+
+    @field_validator("tag_groups")
+    @classmethod
+    def validate_reflect_entity_leaf_placement(cls, v: list[TagGroup] | None) -> list[TagGroup] | None:
+        # Entity leaves may not sit under 'not' -- see validate_entity_leaf_placement.
+        validate_entity_leaf_placement(v)
+        return v
 
 
 class ReflectFact(BaseModel):
@@ -2194,9 +2328,22 @@ class MentalModelTrigger(BaseModel):
         description=(
             "Compound boolean tag expressions to use during refresh instead of the model's own tags. "
             "When set, these tag groups are passed to reflect and the model's flat tags are NOT used for filtering. "
-            "Supports nested and/or/not expressions for complex tag-based scoping."
+            "Supports nested and/or/not expressions for complex tag-based scoping, plus entity leaves "
+            "({entities: [names], match: any|all}) that scope by what a memory is ABOUT rather than which "
+            "tag compartment it lives in -- matched case-insensitively against canonical entity names, "
+            "including entities reached through an observation's source memories. The same expressions "
+            "drive the staleness gate, so an entity-scoped model refreshes exactly when facts about its "
+            "entities arrive. Entity leaves may not appear under 'not'."
         ),
     )
+
+    @field_validator("tag_groups")
+    @classmethod
+    def validate_trigger_entity_leaf_placement(cls, v: list[TagGroup] | None) -> list[TagGroup] | None:
+        # Entity leaves may not sit under 'not' -- see validate_entity_leaf_placement.
+        validate_entity_leaf_placement(v)
+        return v
+
     include_chunks: bool | None = Field(
         default=None,
         description=(
@@ -2216,6 +2363,18 @@ class MentalModelTrigger(BaseModel):
         description=(
             "Override the token budget for raw chunks returned by the internal recall during refresh. "
             "None means use the bank/global config default (recall_chunks_max_tokens)."
+        ),
+    )
+    delta_fast_path: bool | None = Field(
+        default=None,
+        description=(
+            "Override whether a delta refresh may take the deterministic fast path: fetch the "
+            "memories created since the last refresh and, if there are any, turn them into edit "
+            "operations with a single LLM call instead of running the agentic reflect loop. An "
+            "empty window costs no LLM call at all. The fast path hands back to the loop whenever "
+            "a surgical edit is not obviously safe, so every outcome is preserved either way. "
+            "None means use the bank/global config default (mental_model_delta_fast_path). "
+            "Ignored in full mode, which never takes the fast path."
         ),
     )
     response_schema: dict | None = Field(
@@ -2533,6 +2692,15 @@ class UpdateMentalModelRequest(BaseModel):
     )
 
     name: str | None = Field(default=None, description="New name for the mental model")
+    content: str | None = Field(
+        default=None,
+        description=(
+            "New content for the mental model, set directly (e.g. to restore a previous "
+            "version from mental-model history) rather than generated by a refresh. "
+            "Recomputes the embedding, records the previous content in mental_model_history, "
+            "and advances last_refreshed_at (see MemoryEngine.update_mental_model)."
+        ),
+    )
     source_query: str | None = Field(default=None, description="New source query for the mental model")
     max_tokens: int | None = Field(default=None, ge=256, le=8192, description="Maximum tokens for generated content")
     tags: list[str] | None = Field(default=None, description="Tags for scoped visibility")
@@ -4621,77 +4789,17 @@ def _register_routes(app: FastAPI):
                     bank_id=bank_id,
                 )
 
-            # Convert core MemoryFact objects to API RecallResult objects (excluding internal metrics)
-            def _fact_to_result(fact: "MemoryFact") -> RecallResult:
-                return RecallResult(
-                    id=fact.id,
-                    text=fact.text,
-                    type=fact.fact_type,
-                    entities=fact.entities,
-                    context=fact.context,
-                    occurred_start=fact.occurred_start,
-                    occurred_end=fact.occurred_end,
-                    mentioned_at=fact.mentioned_at,
-                    document_id=fact.document_id,
-                    metadata=fact.metadata,
-                    chunk_id=fact.chunk_id,
-                    tags=fact.tags,
-                    source_fact_ids=fact.source_fact_ids,
-                    scores=fact.scores,
-                )
-
-            recall_results = [_fact_to_result(fact) for fact in core_result.results]
-
-            # Convert chunks from engine to HTTP API format
-            chunks_response = None
-            if core_result.chunks:
-                chunks_response = {}
-                for chunk_id, chunk_info in core_result.chunks.items():
-                    chunks_response[chunk_id] = ChunkData(
-                        id=chunk_id,
-                        text=chunk_info.chunk_text,
-                        chunk_index=chunk_info.chunk_index,
-                        truncated=chunk_info.truncated,
-                    )
-
-            # Convert core EntityState objects to API EntityStateResponse objects
-            entities_response = None
-            if core_result.entities:
-                entities_response = {}
-                for name, state in core_result.entities.items():
-                    entities_response[name] = EntityStateResponse(
-                        entity_id=state.entity_id,
-                        canonical_name=state.canonical_name,
-                        observations=[
-                            EntityObservationResponse(text=obs.text, mentioned_at=obs.mentioned_at)
-                            for obs in state.observations
-                        ],
-                    )
-
-            # Convert source facts dict to API format
-            source_facts_response = None
-            if core_result.source_facts:
-                source_facts_response = {
-                    fact_id: _fact_to_result(fact) for fact_id, fact in core_result.source_facts.items()
-                }
-
-            response = RecallResponse(
-                results=recall_results,
-                trace=core_result.trace,
-                entities=entities_response,
-                chunks=chunks_response,
-                source_facts=source_facts_response,
-                source_facts_truncated=core_result.source_facts_truncated,
-            )
+            response = _core_recall_to_http_response(core_result)
 
             handler_duration = time.time() - handler_start
             recall_duration = time.time() - recall_start
             post_recall = handler_duration - pre_recall - recall_duration
             if handler_duration > 1.0:
+                entities_n = len(response.entities) if response.entities else 0
                 logging.info(
                     f"[RECALL HTTP] bank={bank_id} handler_total={handler_duration:.3f}s "
                     f"pre={pre_recall:.3f}s recall={recall_duration:.3f}s post={post_recall:.3f}s "
-                    f"results={len(recall_results)} entities={len(entities_response) if entities_response else 0}"
+                    f"results={len(response.results)} entities={entities_n}"
                 )
 
             return response
@@ -4717,6 +4825,175 @@ def _register_routes(app: FastAPI):
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(
                 f"[RECALL ERROR] bank={bank_id} handler_duration={handler_duration:.3f}s error={str(e)}\n{error_detail}"
+            )
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/v1/default/memories/recall",
+        response_model=RecallResponse,
+        summary="Recall memory across multiple banks",
+        description=(
+            "Recall across multiple memory banks in parallel and merge results.\n\n"
+            "Merge modes:\n"
+            "- `score` (default): sort the union by each result's normalized cross-encoder score; "
+            "auto-falls back to `interleave` when any bank did not run cross_encoder "
+            "(recorded in `metadata.multi_bank`).\n"
+            "- `interleave`: round-robin by per-bank rank.\n\n"
+            "Partial bank failures return successful banks' results plus per-bank status in metadata. "
+            "v1 does not dedup across banks. Each result includes `bank_id` attribution."
+        ),
+        operation_id="recall_memories_multi",
+        tags=["Memory"],
+    )
+    @audited("recall")
+    async def api_recall_multi(
+        request: MultiBankRecallRequest,
+        http_request: Request,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Multi-bank recall: parallel per-bank recall_async + merge (additive endpoint)."""
+        import time
+
+        handler_start = time.time()
+        metrics = get_metrics_collector()
+        primary_bank = request.bank_ids[0]
+
+        # Same query-length guard as single-bank recall.
+        max_query_tokens = get_config().recall_max_query_tokens
+        encoding = _get_tiktoken_encoding()
+        query_tokens = len(encoding.encode(request.query))
+        if query_tokens > max_query_tokens:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Query too long: {query_tokens} tokens exceeds maximum of {max_query_tokens}. Please shorten your query.",
+            )
+
+        # Precheck every distinct bank (body is already parsed on this path-less route).
+        # Checking only bank_ids[0] would let a caller hide a gated bank behind an allowed one.
+        validator = getattr(app.state.memory, "_operation_validator", None)
+        if validator is not None:
+            from hindsight_api.extensions import PrecheckContext
+
+            await app.state.memory._authenticate_tenant(request_context)
+            cl_header = http_request.headers.get("content-length")
+            content_length: int | None = None
+            if cl_header is not None:
+                try:
+                    parsed = int(cl_header)
+                except ValueError:
+                    parsed = -1
+                if parsed >= 0:
+                    content_length = parsed
+            seen_precheck: set[str] = set()
+            for bid in request.bank_ids:
+                if bid in seen_precheck:
+                    continue
+                seen_precheck.add(bid)
+                precheck_result = await validator.precheck(
+                    PrecheckContext(
+                        operation=PrecheckOperation.RECALL,
+                        bank_id=bid,
+                        request_context=request_context,
+                        content_length=content_length,
+                    )
+                )
+                if not precheck_result.allowed:
+                    raise HTTPException(
+                        status_code=precheck_result.status_code,
+                        detail=precheck_result.reason or "Operation not allowed",
+                    )
+
+        try:
+            fact_types = request.types if request.types else list(VALID_RECALL_FACT_TYPES)
+
+            question_date = None
+            if request.query_timestamp:
+                try:
+                    question_date = datetime.fromisoformat(request.query_timestamp.replace("Z", "+00:00"))
+                except ValueError as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid query_timestamp format. Expected ISO format (e.g., '2023-05-30T23:40:00'): {str(e)}",
+                    )
+
+            include_entities = request.include.entities is not None
+            max_entity_tokens = request.include.entities.max_tokens if include_entities else 500
+            include_chunks = request.include.chunks is not None
+            max_chunk_tokens = request.include.chunks.max_tokens if include_chunks else 8192
+            include_source_facts = request.include.source_facts is not None
+            max_source_facts_tokens = request.include.source_facts.max_tokens if include_source_facts else 4096
+            max_source_facts_tokens_per_observation = (
+                request.include.source_facts.max_tokens_per_observation if include_source_facts else -1
+            )
+
+            with metrics.record_operation(
+                "recall",
+                bank_id=primary_bank,
+                source="api",
+                budget=request.budget.value,
+                max_tokens=request.max_tokens,
+            ):
+                core_result = await run_cancellable_on_disconnect(
+                    http_request,
+                    request_context,
+                    app.state.memory.recall_multi_async(
+                        bank_ids=request.bank_ids,
+                        query=request.query,
+                        merge=request.merge,
+                        budget=request.budget,
+                        max_tokens=request.max_tokens,
+                        enable_trace=request.trace,
+                        fact_type=fact_types,
+                        prefer_observations=request.prefer_observations,
+                        question_date=question_date,
+                        include_entities=include_entities,
+                        max_entity_tokens=max_entity_tokens,
+                        include_chunks=include_chunks,
+                        max_chunk_tokens=max_chunk_tokens,
+                        include_source_facts=include_source_facts,
+                        max_source_facts_tokens=max_source_facts_tokens,
+                        max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
+                        request_context=request_context,
+                        tags=request.tags,
+                        tags_match=request.tags_match,
+                        tag_groups=request.tag_groups,
+                        min_scores=request.min_scores,
+                    ),
+                    operation="recall",
+                    bank_id=primary_bank,
+                )
+
+            response = _core_recall_to_http_response(core_result)
+            handler_duration = time.time() - handler_start
+            if handler_duration > 1.0:
+                logging.info(
+                    f"[RECALL MULTI HTTP] banks={request.bank_ids} handler_total={handler_duration:.3f}s "
+                    f"results={len(response.results)}"
+                )
+            return response
+        except HTTPException:
+            raise
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except (asyncio.TimeoutError, TimeoutError):
+            handler_duration = time.time() - handler_start
+            logger.error(
+                f"[RECALL MULTI TIMEOUT] banks={request.bank_ids} handler_duration={handler_duration:.3f}s"
+            )
+            raise HTTPException(
+                status_code=504,
+                detail="Request timed out while searching memories. Try a shorter or more specific query.",
+            )
+        except Exception as e:
+            import traceback
+
+            handler_duration = time.time() - handler_start
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(
+                f"[RECALL MULTI ERROR] banks={request.bank_ids} handler_duration={handler_duration:.3f}s "
+                f"error={str(e)}\n{error_detail}"
             )
             raise HTTPException(status_code=500, detail=str(e))
 
@@ -5481,7 +5758,8 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}",
         response_model=MentalModelResponse,
         summary="Update mental model",
-        description="Update a mental model's name and/or source query.",
+        description="Update a mental model's name, content, source query, and/or other fields.\n\n"
+        "At least one field must be provided.",
         operation_id="update_mental_model",
         tags=["Mental Models"],
     )
@@ -5493,11 +5771,24 @@ def _register_routes(app: FastAPI):
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Update a mental model."""
+        if (
+            body.name is None
+            and body.content is None
+            and body.source_query is None
+            and body.max_tokens is None
+            and body.tags is None
+            and body.trigger is None
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="At least one field (name, content, source_query, max_tokens, tags, trigger) must be provided",
+            )
         try:
             mental_model = await app.state.memory.update_mental_model(
                 bank_id=bank_id,
                 mental_model_id=mental_model_id,
                 name=body.name,
+                content=body.content,
                 source_query=body.source_query,
                 max_tokens=body.max_tokens,
                 tags=body.tags,
@@ -7488,6 +7779,49 @@ def _register_routes(app: FastAPI):
             raise HTTPException(status_code=400, detail=str(e))
         except (AuthenticationError, HTTPException):
             raise
+        except (AttributeError, TypeError) as e:
+            # HQ overlay, 2026-08-19: a client sending the WRONG SHAPE for a
+            # config field was a 500 with a full traceback, which is a server
+            # fault's signature, not a bad request's.
+            #
+            # Reproduced, not theorised: POSTing memory_defense=true (a bool)
+            # where the field takes an object raised "'bool' object has no
+            # attribute 'get'" deep in update_bank_config. The caller saw a 500
+            # and the soak watcher raised [unhandled-in-overlay] against a
+            # 118-run clean streak -- so a malformed payload of ours was
+            # indistinguishable, to every instrument we have, from the memory
+            # stack breaking. That is the cost being fixed: not the status code
+            # for its own sake, but the signal it drowns.
+            #
+            # ATTRIBUTE/TYPE ERRORS ARE NOT ALL CLIENT FAULTS, and this is the
+            # honest limit of the fix: a genuine server bug of the same type now
+            # answers 400 instead of 500. It is still logged in full below, so it
+            # stays diagnosable, and the narrower alternative -- validating every
+            # config field's shape up front -- needs a schema this overlay does
+            # not own. Revisit if upstream publishes one (the mounts and their
+            # retire-when conditions are listed in patches/hindsight/PATCHES.md).
+            # NO TRACEBACK HERE, and that is the point of the whole change.
+            # Measured 2026-08-19, hours after the 400 landed: the response was
+            # correctly a 400, and the soak watcher STILL raised
+            # [unhandled-in-overlay] against a 118-run clean streak -- because it
+            # greps the log for tracebacks, and this branch was still writing one.
+            # Fixing the status code while leaving the traceback fixed the caller
+            # and not the signal, so a bad payload of ours stayed
+            # indistinguishable from the memory stack breaking, which was the
+            # entire cost being paid down. A client sending the wrong shape is not
+            # a fault of ours; the exception type and message are enough to
+            # diagnose it, and a real server fault still falls through to the
+            # handler below WITH its traceback.
+            logger.warning(
+                "Malformed bank config payload for %s: %s: %s",
+                bank_id,
+                type(e).__name__,
+                e,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"malformed value in config update: {e}",
+            )
         except Exception as e:
             import traceback
 

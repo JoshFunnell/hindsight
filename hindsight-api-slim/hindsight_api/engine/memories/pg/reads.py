@@ -360,14 +360,19 @@ async def find_unconsolidated(
     fact_types: list[str],
     limit: int,
     scope_tags: list[str] | None = None,
+    order: str = "asc",
+    created_after: datetime | None = None,
+    exclude_ids: list[str] | None = None,
 ) -> list[StoredMemory]:
-    """Memories not yet folded into an observation, oldest first.
+    """Memories not yet folded into an observation.
 
     The consolidator's candidate query: never consolidated, never *failed* to
-    consolidate (a memory the LLM could not handle must not be retried forever),
-    ordered by ``created_at`` so the queue drains in arrival order. ``scope_tags``
-    is the same ``tags @> scope`` containment the job's scope filter uses — the
-    job ORs several scopes together; one scope is passed here.
+    consolidate (a memory the LLM could not handle must not be retried forever).
+    Default order is oldest-first so a backlog still drains fairly; the job
+    overlays a hot-window newest-first slice so a retain during that backlog
+    is not stuck behind hundreds of older rows. ``scope_tags`` is the same
+    ``tags @> scope`` containment the job's scope filter uses — the job ORs
+    several scopes together; one scope is passed here.
     """
     where = [
         "bank_id = $1",
@@ -381,6 +386,13 @@ async def find_unconsolidated(
     if scope_tags:
         params.append(list(scope_tags))
         where.append(f"tags @> ${len(params)}::varchar[]")
+    if created_after is not None:
+        params.append(created_after)
+        where.append(f"created_at >= ${len(params)}")
+    if exclude_ids:
+        params.append(exclude_ids)
+        where.append(f"NOT (id = ANY(${len(params)}::uuid[]))")
+    direction = "DESC" if order == "desc" else "ASC"
     params.append(limit)
 
     rows = await conn.fetch(
@@ -388,7 +400,7 @@ async def find_unconsolidated(
         SELECT {_MEMORY_COLUMNS}
         FROM {fq_table("memory_units")}
         WHERE {" AND ".join(where)}
-        ORDER BY created_at ASC
+        ORDER BY created_at {direction}
         LIMIT ${len(params)}
         """,
         *params,

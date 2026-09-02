@@ -421,9 +421,11 @@ from ..pg0 import EmbeddedPostgres, parse_pg0_url
 from .entity_resolver import EntityResolver
 from .llm_wrapper import LLMConfig, requires_api_key, sanitize_llm_output, sanitize_text
 from .mental_model_refresh import (
+    FastPathFallbackReason,
     MentalModelDeltaOperations,
     MentalModelDryRunRefreshResult,
     MentalModelFactCounts,
+    MentalModelFastPathTier,
     MentalModelRefreshScope,
     MentalModelRefreshTrace,
     MentalModelRefreshWindow,
@@ -432,6 +434,7 @@ from .mental_model_refresh import (
     RefreshMode,
     RefreshOutcome,
 )
+from .multi_bank_recall import MultiBankMerge
 from .multi_llm import MultiLLMProvider
 from .query_analyzer import QueryAnalyzer
 from .reflect import run_reflect_agent
@@ -469,6 +472,21 @@ from .task_backend import TaskBackend
 RecallReranking = Literal["cross_encoder", "rrf", "interleave"]
 from .token_encoding import get_token_encoding
 
+
+def or_source_facts_truncated(members: list[object]) -> bool | None:
+    """OR ``source_facts_truncated`` across member-bank recall results.
+
+    Any member True -> True. At least one False and none True -> False.
+    None only when no member reported the flag (all missing/None).
+    """
+    flags = [getattr(m, "source_facts_truncated", None) for m in members]
+    if any(flag is True for flag in flags):
+        return True
+    if any(flag is False for flag in flags):
+        return False
+    return None
+
+
 RetainOutboxCallback = Callable[[asyncpg.Connection], Awaitable[None]]
 RetainOutboxCallbackFactory = Callable[[list[RetainContentDict]], RetainOutboxCallback | None]
 
@@ -499,6 +517,32 @@ class _LLMCallDefaults:
         }
 
 
+def _pick_override(override, default):
+    """Per-op/member override wins when explicitly set, even if falsy (e.g. ``{}``).
+
+    ``None`` means unset (inherit the default). A bare ``or`` swallows an
+    explicit empty dict, making it impossible to turn a global ``extra_body`` /
+    ``default_headers`` OFF for one operation or member.
+
+    NONE-SENTINEL ONLY -- do NOT apply this to the neighbouring string fields.
+    It is correct for the ``dict | None`` fields, which load via
+    ``json.loads(getenv(..., "null"))`` and so are ``None`` exactly when unset.
+    The string fields (``reasoning_effort``, ``*_service_tier``, provider /
+    api_key / model / base_url) use the opposite convention -- empty string
+    means unset -- and keep their ``or`` chains deliberately; routing ``""``
+    through here would return an empty override instead of inheriting.
+
+    DELIBERATELY NOT APPLIED to ``litellmrouter_config``, which is the same
+    ``dict | None`` shape and therefore has the same latent swallow. Left alone
+    because it is unclear whether an explicit ``{}`` is a meaningful "disable
+    routing for this operation" or simply a malformed config; changing it would
+    silently redefine that. Open question, not an oversight.
+
+    [s63 overlay port 2026-08-24 of grok/falsy-or-extra-body 4896bfbb+4958776e]
+    """
+    return default if override is None else override
+
+
 def _member_to_llm(member: "LLMMemberConfig", config: HindsightConfig, defaults: _LLMCallDefaults) -> LLMConfig:
     """Build an LLMProvider from one indexed multi-LLM member.
 
@@ -522,7 +566,7 @@ def _member_to_llm(member: "LLMMemberConfig", config: HindsightConfig, defaults:
         model=member.model,
         reasoning_effort=member.reasoning_effort or config.llm_reasoning_effort,
         extra_body=member.extra_body,
-        default_headers=member.default_headers or config.llm_default_headers,
+        default_headers=_pick_override(member.default_headers, config.llm_default_headers),
         cache_affinity=member.cache_affinity or config.llm_cache_affinity,
         ollama_num_ctx=config.llm_ollama_num_ctx,
         bedrock_service_tier=member.bedrock_service_tier,
@@ -971,6 +1015,24 @@ def _is_non_retryable_task_error(e: Exception) -> bool:
     )
 
 
+def _retry_or_reraise_worker_task(e: Exception, task_dict: dict[str, Any]) -> NoReturn:
+    """Apply the non-consolidation worker retry policy to a task error.
+
+    Raises ``RetryTaskAt`` while ``_retry_count < worker_max_retries``, else
+    re-raises ``e`` so the poller marks the operation failed with the message.
+    Consolidation has its own indefinite-retry / dedup-by-bank path and must
+    not use this helper.
+    """
+    config = get_config()
+    retry_count = task_dict.get("_retry_count", 0)
+    if retry_count < config.worker_max_retries:
+        raise RetryTaskAt(
+            retry_at=datetime.now(UTC) + timedelta(seconds=config.worker_task_retry_backoff_seconds),
+            message=str(e),
+        )
+    raise e
+
+
 class Budget(str, Enum):
     """Budget levels for recall/reflect operations."""
 
@@ -1040,6 +1102,34 @@ def _resolve_reranking(config_dict: dict, reranking: "RecallReranking") -> "Reca
     if reranking == "cross_encoder" and not config_dict.get("enable_reranking", True):
         return "rrf"
     return reranking
+
+
+def _union_ce_usable(
+    engine: object,
+    *,
+    requested_reranking: "RecallReranking",
+    enable_flags: list[bool],
+) -> bool:
+    """Whether recall_multi_async should run one CE pass over the union.
+
+    False (today's rrf/interleave path) when the caller skipped CE, any bank
+    has enable_reranking=false, or the engine has no usable CrossEncoder
+    (missing, null, or rrf passthrough). Tests that construct MemoryEngine
+    via object.__new__ have no reranker — they stay on the pre-union path.
+    """
+    if requested_reranking != "cross_encoder":
+        return False
+    if not enable_flags or not all(enable_flags):
+        return False
+    reranker = getattr(engine, "_cross_encoder_reranker", None)
+    if reranker is None:
+        return False
+    cross_encoder = getattr(reranker, "cross_encoder", None)
+    if cross_encoder is None:
+        return False
+    if getattr(cross_encoder, "provider_name", None) == "rrf":
+        return False
+    return True
 
 
 def utcnow():
@@ -1236,6 +1326,11 @@ def _count_retrieved_facts(tool_trace: list[ToolCallTrace]) -> dict[str, int]:
 #: trace: it explains results that look older than the window should allow.
 _WINDOW_BOUNDED_TOOLS = frozenset({"recall", "search_observations"})
 
+#: Token budget the delta fast path gives its observations fetch. Mirrors the
+#: default the reflect agent's ``search_observations`` tool is bound with, so the
+#: fast path reads the same slice of the window the loop's first call would.
+_FAST_PATH_OBSERVATIONS_MAX_TOKENS = 5000
+
 
 def _summarize_refresh_tool_calls(
     tool_trace: list[ToolCallTrace], created_after: datetime | None = None
@@ -1301,6 +1396,8 @@ class _MentalModelRefreshRun:
     source_query: str
     processed_watermark: datetime | None
     outcome: RefreshOutcome
+    fast_path: MentalModelFastPathTier | None = None
+    fast_path_fallback_reason: FastPathFallbackReason | None = None
     tool_calls: list[MentalModelTraceToolCall] = field(default_factory=list)
     llm_calls: list[LLMCallTrace] = field(default_factory=list)
     usage: TokenUsage = field(default_factory=TokenUsage)
@@ -1325,6 +1422,8 @@ class _MentalModelRefreshRun:
             effective_mode=self.effective_mode,
             mode_fallback_reason=self.mode_fallback_reason,
             outcome=self.outcome,
+            fast_path=self.fast_path,
+            fast_path_fallback_reason=self.fast_path_fallback_reason,
             tool_calls=tool_calls,
             llm_calls=self.llm_calls,
             delta_operations=self.delta_operations,
@@ -1332,6 +1431,323 @@ class _MentalModelRefreshRun:
             duration_ms=self.duration_ms,
             warnings=self.warnings,
         )
+
+
+@dataclass(frozen=True)
+class _MentalModelRefreshContext:
+    """What a refresh resolved before it branched on mode or outcome.
+
+    Every branch of ``_execute_mental_model_refresh`` reports the same identity,
+    scope and window; only the document it produced differs. Grouping them here
+    is what lets ``_build_refresh_run`` be a free function callable from *before*
+    the reflect loop runs — the property the deterministic delta fast path needs
+    in order to report through the same path as the agentic one.
+    """
+
+    mental_model_id: str
+    name: str
+    requested_mode: RefreshMode
+    scope: MentalModelRefreshScope
+    window: MentalModelRefreshWindow
+    current_content: str
+    source_query: str
+    processed_watermark: datetime | None
+    started: float
+
+
+@dataclass(frozen=True)
+class _MentalModelRefreshEvidence:
+    """What produced a refresh's candidate document, whichever path produced it.
+
+    The agentic loop fills this from its ``ReflectResult``; the delta fast path
+    fills it from its own typed retrieval plus (on tier 1) its single delta call.
+    The two fields later stages still mutate — ``reflect_response`` and
+    ``warnings`` — are deliberately NOT carried here, so nothing holds a snapshot
+    that keeps changing under it; they are passed per branch instead.
+    """
+
+    candidate_content: str
+    facts: MentalModelFactCounts
+    tool_calls: list[MentalModelTraceToolCall] = field(default_factory=list)
+    llm_calls: list[LLMCallTrace] = field(default_factory=list)
+    usage: TokenUsage = field(default_factory=TokenUsage)
+
+
+def _build_refresh_run(
+    ctx: _MentalModelRefreshContext,
+    evidence: _MentalModelRefreshEvidence,
+    *,
+    effective_mode: RefreshMode,
+    mode_fallback_reason: ModeFallbackReason | None,
+    final_content: str,
+    final_structured: StructuredDocument | None,
+    delta_operations: MentalModelDeltaOperations | None,
+    reflect_response: dict[str, Any],
+    outcome: RefreshOutcome,
+    warnings: list[str],
+    fast_path: MentalModelFastPathTier | None = None,
+    fast_path_fallback_reason: FastPathFallbackReason | None = None,
+) -> _MentalModelRefreshRun:
+    """Assemble the run that one refresh branch produced.
+
+    This was a closure inside ``_execute_mental_model_refresh`` that captured the
+    post-reflect locals. It is a free function now because the delta fast path
+    finishes *before* those locals exist, and a fast-path refresh that reported
+    through a different assembler than the agentic one would drift from it.
+    """
+    return _MentalModelRefreshRun(
+        mental_model_id=ctx.mental_model_id,
+        name=ctx.name,
+        requested_mode=ctx.requested_mode,
+        effective_mode=effective_mode,
+        mode_fallback_reason=mode_fallback_reason,
+        scope=ctx.scope,
+        window=ctx.window,
+        facts=evidence.facts,
+        current_content=ctx.current_content,
+        candidate_content=evidence.candidate_content,
+        final_content=final_content,
+        final_structured=final_structured,
+        delta_operations=delta_operations,
+        reflect_response=reflect_response,
+        source_query=ctx.source_query,
+        processed_watermark=ctx.processed_watermark,
+        outcome=outcome,
+        fast_path=fast_path,
+        fast_path_fallback_reason=fast_path_fallback_reason,
+        tool_calls=evidence.tool_calls,
+        llm_calls=evidence.llm_calls,
+        usage=evidence.usage,
+        duration_ms=int((time.time() - ctx.started) * 1000),
+        warnings=warnings,
+    )
+
+
+def _finalize_refresh_document(
+    ctx: _MentalModelRefreshContext,
+    evidence: _MentalModelRefreshEvidence,
+    *,
+    effective_mode: RefreshMode,
+    mode_fallback_reason: ModeFallbackReason | None,
+    final_content: str,
+    final_structured: StructuredDocument | None,
+    delta_operations: MentalModelDeltaOperations | None,
+    reflect_response: dict[str, Any],
+    outcome: RefreshOutcome,
+    warnings: list[str],
+    fast_path: MentalModelFastPathTier | None = None,
+    fast_path_fallback_reason: FastPathFallbackReason | None = None,
+    size_budget_tokens: int | None = None,
+    has_delta_baseline: bool = False,
+) -> _MentalModelRefreshRun:
+    """Apply the size budget and identifier gate, then assemble the run.
+
+    Both the delta fast path and the agentic path finish here so a tier-1
+    write cannot skip the identifier gate (it used to: the gate lived only
+    after ``reflect_async``) and so an oversized document is compacted on
+    every successful refresh, including the no-new-facts preserve path.
+    Compaction runs first so the gate sees a document that still carries
+    every identifier -- that is the whole point of compact_to_budget.
+    """
+    from .identifier_retention import evaluate as _evaluate_identifier_retention
+    from .mental_model_compaction import compact_to_budget
+    from .reflect.structured_doc import parse_markdown
+
+    reflect_payload = dict(reflect_response)
+    notes = list(warnings)
+    # S56 2026-08-22: identifiers the compactor itself dropped (named in its
+    # warning) are exempt from the retention REFUSAL but still warned about.
+    exempt_ids: set[str] | None = None
+
+    if size_budget_tokens and outcome in ("content_written", "content_preserved_no_new_facts"):
+        compacted = compact_to_budget(final_content, size_budget_tokens)
+        if compacted.changed and compacted.content.strip():
+            final_content = compacted.content
+            exempt_ids = set(getattr(compacted, "identifiers_lost_set", ()) or ()) or None
+            try:
+                final_structured = parse_markdown(final_content)
+            except Exception:
+                final_structured = None
+            if outcome == "content_preserved_no_new_facts":
+                # The window was empty, but the stored document was over budget.
+                # Persist the shrink so an oversized model converges without
+                # waiting for a new fact.
+                outcome = "content_written"
+            notes.append(compacted.warning or "size-budget: compacted over-budget mental model")
+            reflect_payload["size_budget"] = compacted.as_metadata()
+        elif compacted.changed:
+            notes.append("size-budget: compact produced empty content; left document unchanged")
+
+    if outcome == "content_written":
+        ident_refuse, ident_warning = _evaluate_identifier_retention(
+            ctx.current_content, final_content, has_delta_baseline, exempt=exempt_ids
+        )
+        if ident_warning:
+            notes.append(ident_warning)
+            reflect_payload["identifier_retention"] = ident_warning
+        if ident_refuse:
+            outcome = "refresh_failed_identifier_retention"
+
+    return _build_refresh_run(
+        ctx,
+        evidence,
+        effective_mode=effective_mode,
+        mode_fallback_reason=mode_fallback_reason,
+        final_content=final_content,
+        final_structured=final_structured,
+        delta_operations=delta_operations,
+        reflect_response=reflect_payload,
+        outcome=outcome,
+        warnings=notes,
+        fast_path=fast_path,
+        fast_path_fallback_reason=fast_path_fallback_reason,
+    )
+
+
+@dataclass(frozen=True)
+class _DeltaFastPathSuccess:
+    """A delta refresh the deterministic fast path completed on its own.
+
+    Tier 0 read the window, found nothing new, and preserved the document without
+    an LLM call. Tier 1 turned the window's facts into edit operations with one
+    call. Either way the agentic reflect loop never ran, so this carries the same
+    evidence the loop would have produced — that is what lets both routes report
+    through ``_build_refresh_run``.
+    """
+
+    tier: MentalModelFastPathTier
+    evidence: "_MentalModelRefreshEvidence"
+    based_on: dict[str, list[dict[str, Any]]]
+    final_content: str
+    final_structured: StructuredDocument | None
+    delta_operations: MentalModelDeltaOperations | None
+    outcome: RefreshOutcome
+    delta_applied: bool
+    delta_skipped_reason: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _DeltaFastPathFallback:
+    """The fast path ran and handed the refresh back to the agentic reflect loop.
+
+    Recorded rather than swallowed so the ledger explains every loop run: a delta
+    refresh that still cost a full agentic pass either was never eligible for the
+    fast path or hit one of these.
+    """
+
+    reason: FastPathFallbackReason
+
+
+#: ``None`` from ``_try_delta_fast_path`` means the fast path never ran at all
+#: (switched off, or the refresh is not an eligible delta); a fallback means it
+#: ran and declined. The distinction is what ``fast_path_fallback_reason`` reports.
+_DeltaFastPathResult = _DeltaFastPathSuccess | _DeltaFastPathFallback
+
+
+def _load_delta_baseline(
+    mental_model_id: str,
+    current_content: str,
+    stored_structured_content: dict[str, Any] | None,
+) -> StructuredDocument | None:
+    """The structured document a delta refresh edits, or None when there isn't one.
+
+    Uses the previously stored structured doc when available; otherwise parses the
+    existing markdown, so the very first delta refresh can operate without waiting
+    for a full rebuild.
+
+    A stored doc that fails validation (hand-edited JSON, a shape from an older
+    schema) is NOT fatal: the markdown in ``content`` is the same document and
+    ``parse_markdown`` is lenient, so re-deriving the baseline from it keeps the
+    delta path alive and rebuilds the structured doc as a side effect. Giving up
+    there would refuse every subsequent refresh (nothing else repairs the column)
+    over a baseline we can reconstruct.
+
+    Shared by the deterministic fast path and the agentic path, which must edit
+    the same baseline or the fast path would not be predicting the same refresh.
+    """
+    from .reflect.structured_doc import parse_markdown
+
+    if stored_structured_content is not None:
+        try:
+            return StructuredDocument.model_validate(stored_structured_content)
+        except Exception as exc:
+            logger.warning(
+                f"[MENTAL_MODELS] Stored structured doc for {mental_model_id} is unusable "
+                f"({exc}); re-deriving the delta baseline from the stored markdown"
+            )
+    try:
+        return parse_markdown(current_content)
+    except Exception as exc:
+        logger.warning(
+            f"[MENTAL_MODELS] Could not load structured doc for {mental_model_id} "
+            f"({exc}); delta has no baseline to edit"
+        )
+        return None
+
+
+def _serialize_window_fact(fact: dict[str, Any], fact_type: str) -> dict[str, Any]:
+    """One retrieved fact in the shape the structured-delta prompt consumes.
+
+    Deliberately the same four fields the agentic path serializes out of
+    ``reflect_result.based_on`` (id / text / type / context) and the same three
+    ``build_structured_delta_prompt`` renders — a fast-path prompt carrying extra
+    fields would not be the prompt the delta system prompt was written for.
+    """
+    return {
+        "id": str(fact.get("id", "")),
+        "text": fact.get("text", ""),
+        "type": fact_type,
+        "context": fact.get("context"),
+    }
+
+
+def _retrieval_warnings(facts: MentalModelFactCounts) -> list[str]:
+    """Plain-language warnings about a refresh's retrieval, if it looks unhealthy.
+
+    Shared by the agentic and fast paths so the same retrieval state always reads
+    the same way — the fast path's tier 0 IS the "retrieval returned nothing" case,
+    and a preview that described it differently from the loop would be misleading.
+    """
+    warnings: list[str] = []
+    retrieved_total = sum(facts.retrieved.values())
+    used_total = sum(facts.used.values())
+    if retrieved_total == 0:
+        warnings.append(
+            "Retrieval returned no facts at all. Check the resolved scope and the time window — "
+            "in delta mode nothing created after the last refresh is in range."
+        )
+    elif used_total == 0:
+        warnings.append(
+            f"Retrieval returned {retrieved_total} fact(s) but the reflect agent used none of them, "
+            "so the document was written from an empty evidence set. The source query may not match "
+            "what the retrieved memories are about."
+        )
+    return warnings
+
+
+def _accumulate_delta_based_on(
+    based_on: dict[str, list[dict[str, Any]]],
+    previous_reflect_response: dict[str, Any] | None,
+) -> None:
+    """Fold a delta refresh's prior evidence into this run's, in place.
+
+    In delta mode ``based_on`` must accumulate: the mental model is grounded on
+    ALL facts ever used, not just the latest window's. Carried facts are
+    deduplicated by id against the new ones, newest first.
+
+    Shared by both delta routes. A fast-path refresh that skipped this would keep
+    only the handful of facts in its window and silently drop the document's whole
+    provenance on the first tier-1 write.
+    """
+    prev_based_on = (previous_reflect_response or {}).get("based_on") or {}
+    for ftype, prev_facts in prev_based_on.items():
+        if not isinstance(prev_facts, list):
+            continue
+        new_ids = {f["id"] for f in based_on.get(ftype, [])}
+        carried = [f for f in prev_facts if isinstance(f, dict) and f.get("id") not in new_ids]
+        if carried:
+            based_on.setdefault(ftype, []).extend(carried)
 
 
 @dataclass
@@ -1690,7 +2106,7 @@ class MemoryEngine(MemoryEngineInterface):
             base_url=retain_base_url,
             model=retain_model,
             reasoning_effort=config.retain_llm_reasoning_effort or config.llm_reasoning_effort,
-            extra_body=config.retain_llm_extra_body or config.llm_extra_body,
+            extra_body=_pick_override(config.retain_llm_extra_body, config.llm_extra_body),
             default_headers=config.llm_default_headers,
             cache_affinity=config.retain_llm_cache_affinity or config.llm_cache_affinity,
             ollama_num_ctx=config.llm_ollama_num_ctx,
@@ -1731,7 +2147,7 @@ class MemoryEngine(MemoryEngineInterface):
             base_url=reflect_base_url,
             model=reflect_model,
             reasoning_effort=config.reflect_llm_reasoning_effort or config.llm_reasoning_effort,
-            extra_body=config.reflect_llm_extra_body or config.llm_extra_body,
+            extra_body=_pick_override(config.reflect_llm_extra_body, config.llm_extra_body),
             default_headers=config.llm_default_headers,
             cache_affinity=config.reflect_llm_cache_affinity or config.llm_cache_affinity,
             ollama_num_ctx=config.llm_ollama_num_ctx,
@@ -1772,7 +2188,7 @@ class MemoryEngine(MemoryEngineInterface):
             base_url=consolidation_base_url,
             model=consolidation_model,
             reasoning_effort=config.consolidation_llm_reasoning_effort or config.llm_reasoning_effort,
-            extra_body=config.consolidation_llm_extra_body or config.llm_extra_body,
+            extra_body=_pick_override(config.consolidation_llm_extra_body, config.llm_extra_body),
             default_headers=config.llm_default_headers,
             cache_affinity=config.consolidation_llm_cache_affinity or config.llm_cache_affinity,
             ollama_num_ctx=config.llm_ollama_num_ctx,
@@ -2698,6 +3114,24 @@ class MemoryEngine(MemoryEngineInterface):
                 # would convert a legitimate defer into a 60-second RetryTaskAt
                 # and lose the "not a failure" semantics entirely.
                 raise
+            except MentalModelRefreshError as e:
+                # Expected fail-safe from #3112/#3182: refresh_mental_model
+                # raises MentalModelRefreshError after _preserve_and_fail leaves
+                # content and watermark untouched so a retry re-reads the same
+                # window. Delta ops are LLM-produced and non-deterministic, so
+                # this is still retryable (same policy as a generic
+                # non-consolidation error). Do not print a traceback: soak
+                # watchers and operators treat stderr tracebacks as crashes
+                # (the unhandled-in-overlay pattern).
+                logger.warning(
+                    "Mental model refresh failed (content preserved): "
+                    "task_type=%s mental_model_id=%s bank_id=%s error=%s",
+                    task_type,
+                    task_dict.get("mental_model_id"),
+                    task_dict.get("bank_id"),
+                    e,
+                )
+                _retry_or_reraise_worker_task(e, task_dict)
             except Exception as e:
                 # exc_info, not a bare print_exc(): the traceback is the only pointer
                 # to the offending call site, and under production log volume the
@@ -2778,14 +3212,7 @@ class MemoryEngine(MemoryEngineInterface):
                     # Retry count and backoff come from config (HINDSIGHT_API_WORKER_MAX_RETRIES and
                     # HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS). Defaults of 3 x 60s give a
                     # 4-minute total window; operators expecting a longer provider outage can raise them.
-                    config = get_config()
-                    retry_count = task_dict.get("_retry_count", 0)
-                    if retry_count < config.worker_max_retries:
-                        raise RetryTaskAt(
-                            retry_at=datetime.now(UTC) + timedelta(seconds=config.worker_task_retry_backoff_seconds),
-                            message=error_message,
-                        )
-                    raise
+                    _retry_or_reraise_worker_task(e, task_dict)
 
     async def _fire_consolidation_webhook(
         self,
@@ -3262,6 +3689,13 @@ class MemoryEngine(MemoryEngineInterface):
             based_on_counts={fact_type: len(facts or []) for fact_type, facts in based_on.items()},
             delta_ops_applied=len(reflect_response.get("delta_operations_applied") or []),
             delta_ops_skipped=len(reflect_response.get("delta_operations_skipped") or []),
+            # reflect_response carries the tier as `fast_path`: "tier0"/"tier1" from the
+            # fast path, and None from the agentic loop. Normalised to "tier2" here so
+            # the persisted value names the tier that ran rather than the absence of a
+            # flag -- a null in result_metadata would be ambiguous between "agentic" and
+            # "written by a build that predates this field".
+            serving_tier=reflect_response.get("fast_path") or "tier2",
+            fast_path_fallback_reason=reflect_response.get("fast_path_fallback_reason"),
         )
         try:
             backend = await self._get_backend()
@@ -5676,6 +6110,417 @@ class MemoryEngine(MemoryEngineInterface):
         finally:
             recall_span_context.__exit__(None, None, None)
 
+    async def recall_multi_async(
+        self,
+        bank_ids: list[str],
+        query: str,
+        *,
+        merge: MultiBankMerge = "score",
+        budget: Budget | None = None,
+        max_tokens: int = 4096,
+        enable_trace: bool = False,
+        fact_type: list[str] | None = None,
+        prefer_observations: bool = True,
+        question_date: datetime | None = None,
+        include_entities: bool = False,
+        max_entity_tokens: int = 500,
+        include_chunks: bool = False,
+        max_chunk_tokens: int = 8192,
+        include_source_facts: bool = False,
+        max_source_facts_tokens: int = 4096,
+        max_source_facts_tokens_per_observation: int = -1,
+        request_context: "RequestContext",
+        tags: list[str] | None = None,
+        tags_match: TagsMatch = "any",
+        tag_groups: list[TagGroup] | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        min_scores: MinScores | None = None,
+        _connection_budget: int | None = None,
+        _quiet: bool = False,
+        reranking: RecallReranking = "cross_encoder",
+    ) -> RecallResultModel:
+        """Recall across multiple banks and merge (thin orchestrator above ``recall_async``).
+
+        One ``recall_async`` sub-call per bank runs concurrently via ``asyncio.gather``
+        (task-per-bank so each keeps its own ``_current_bank_id`` ContextVar binding).
+        When union CE is eligible, each sub-call uses ``reranking="rrf"`` (retrieval
+        only) and this method runs **one** ``CrossEncoderReranker.rerank`` over the
+        union (default cap 200). LAT1: CE was 94% of single-bank wall; N per-bank
+        CE jobs on one 8-core box made 5-bank p50 sit between max and sum.
+
+        **Merge modes** (``merge``):
+        - ``score`` (default): sort the union by each result's normalized cross-encoder
+          score (``scores.reranker``). After union CE those scores are comparable
+          across banks. Auto-falls back to ``interleave`` when CE is disabled/null
+          (``enable_reranking=false``, caller ``rrf``/``interleave``, or passthrough).
+          Fallback is recorded in response metadata.
+        - ``interleave``: round-robin by per-bank rank (bankA#1, bankB#1, ...).
+          Still available; within-bank rank is CE order when union CE ran.
+
+        **Token budget:** the caller's full ``max_tokens`` is passed to each sub-call;
+        the merged list is then cut to ``max_tokens`` (same until-budget semantics as
+        single-bank). Slight over-fetch is the accepted v1 cost.
+
+        **Attribution:** every merged result is stamped with ``bank_id``.
+
+        **Failures:** ordinary bank infrastructure errors do not kill the call — partial
+        results are returned with per-bank status in ``metadata["multi_bank"]["banks"]``
+        (client-visible error text is generic; details are logged server-side).
+        Precedence for hard failures re-raised from the gather: ``OperationCancelledError``
+        first (HTTP 499), then tenant ``AuthenticationError`` (HTTP 401; auth is
+        per-request, not per-bank), then ``OperationValidationError`` (bank-scoped
+        403/422 denials — same mapping as single-bank recall). None of those
+        soft-fail into a 200. The tenant is also authenticated once before fan-out
+        so an unauthenticated request fails before N parallel recalls start.
+
+        **Dedup:** exact/normalized text across banks (``exact_normalized``), after
+        merge and before the token cut. Per-bank pre-cap default 50; union cap
+        default 200. ``prefer_observations`` defaults True on this orchestrator only
+        (HTTP/MCP request models still default False and pass the caller's value through).
+        """
+        from .multi_bank_recall import (
+            DEFAULT_MULTI_UNION_CAP,
+            DEFAULT_PER_BANK_FLOOR,
+            DEFAULT_PER_BANK_MERGE_CAP,
+            FALLBACK_NO_USABLE_RERANKER_SCORES,
+            MAX_MULTI_BANK_RECALL_BANKS,
+            apply_per_bank_floor,
+            bank_rank_from_merged,
+            build_multi_bank_metadata,
+            cross_encoder_eligible,
+            has_usable_reranker_scores,
+            memory_facts_to_merged_candidates,
+            merge_cap_dedup_cut,
+            select_union_candidates,
+            stamp_union_ce_scores,
+            union_merge_dicts,
+            union_per_bank_max_tokens,
+        )
+
+        if merge not in ("score", "interleave"):
+            raise ValueError(f"merge must be 'score' or 'interleave', got {merge!r}")
+        query = sanitize_text(query) or ""
+
+        # Preserve caller order; de-dupe so a bank is only recalled once.
+        seen: set[str] = set()
+        ordered_bank_ids: list[str] = []
+        for bid in bank_ids:
+            if bid not in seen:
+                seen.add(bid)
+                ordered_bank_ids.append(bid)
+
+        if len(ordered_bank_ids) > MAX_MULTI_BANK_RECALL_BANKS:
+            from hindsight_api.extensions.operation_validator import OperationValidationError
+
+            raise OperationValidationError(
+                f"Too many bank_ids: {len(ordered_bank_ids)} exceeds maximum of "
+                f"{MAX_MULTI_BANK_RECALL_BANKS} parallel banks per multi-bank recall.",
+                status_code=422,
+            )
+
+        if not ordered_bank_ids:
+            return RecallResultModel(
+                results=[],
+                metadata=build_multi_bank_metadata(
+                    merge_requested=merge,
+                    merge_applied=merge,
+                    merge_fallback_reason=None,
+                    bank_statuses={},
+                    # No gather happened on this path, so nothing was deduped.
+                    dedup_dropped=0,
+                    per_bank_cap=DEFAULT_PER_BANK_MERGE_CAP,
+                ),
+            )
+
+        # Tenant auth is request-scoped, not per-bank. Authenticate once before
+        # fan-out so an unauthenticated multi-recall fails the whole request
+        # instead of starting N recalls. Each recall_async still authenticates
+        # (single-bank contract / schema ContextVar); we do not skip that.
+        # Per-bank OperationValidator precheck stays inside recall_async.
+        await self._authenticate_tenant(request_context)
+
+        # Resolve per-bank enable_reranking so score-merge auto-fallback can run
+        # before (or without) depending on result scores. Failed config lookups
+        # are treated as "unknown / not CE-safe" → force interleave for score mode.
+        # Client-visible config_error is generic; details stay in the server log.
+        enable_flags: list[bool] = []
+        config_lookup_failed: set[str] = set()
+        for bid in ordered_bank_ids:
+            try:
+                cfg = await self._config_resolver.get_bank_config(bid, request_context)
+                enable_flags.append(bool(cfg.get("enable_reranking", True)))
+            except Exception as e:
+                enable_flags.append(False)
+                config_lookup_failed.add(bid)
+                logger.warning(
+                    "[RECALL MULTI %s] bank config lookup failed: %s: %r",
+                    bid[:8] if len(bid) >= 8 else bid,
+                    type(e).__name__,
+                    e,
+                )
+
+        merge_requested: MultiBankMerge = merge
+        merge_applied: MultiBankMerge = merge_requested
+        merge_fallback_reason: str | None = None
+        if merge_requested == "score":
+            eligible, reason = cross_encoder_eligible(
+                requested_reranking=reranking,
+                bank_enable_reranking=enable_flags,
+            )
+            if not eligible:
+                merge_applied = "interleave"
+                merge_fallback_reason = reason
+
+        # One CE over the union, not N per-bank CE jobs. Eligible only when the
+        # caller asked for cross_encoder, every bank still has reranking on, and
+        # this engine actually has a non-passthrough CrossEncoder. Missing /
+        # null / rrf-passthrough CE keeps today's per-bank rrf/interleave path.
+        union_ce = _union_ce_usable(self, requested_reranking=reranking, enable_flags=enable_flags)
+        per_bank_reranking: RecallReranking = "rrf" if union_ce else reranking
+        try:
+            union_cfg = get_config()
+            union_cap = int(getattr(union_cfg, "multi_union_cap", DEFAULT_MULTI_UNION_CAP))
+            per_bank_pre_cap = int(getattr(union_cfg, "multi_per_bank_pre_cap", DEFAULT_PER_BANK_MERGE_CAP))
+            per_bank_floor = int(getattr(union_cfg, "multi_per_bank_floor", DEFAULT_PER_BANK_FLOOR))
+        except Exception:
+            union_cap = DEFAULT_MULTI_UNION_CAP
+            per_bank_pre_cap = DEFAULT_PER_BANK_MERGE_CAP
+            per_bank_floor = DEFAULT_PER_BANK_FLOOR
+        union_cap = max(1, union_cap)
+        per_bank_pre_cap = max(1, per_bank_pre_cap)
+        per_bank_floor = max(1, per_bank_floor)
+        subcall_max_tokens = union_per_bank_max_tokens(max_tokens, union_ce=union_ce)
+
+        # Fan-out: task-per-bank keeps @_bind_bank_id ContextVar isolation.
+        async def _one(bank_id: str) -> RecallResultModel:
+            return await self.recall_async(
+                bank_id,
+                query,
+                budget=budget,
+                max_tokens=subcall_max_tokens,
+                enable_trace=enable_trace,
+                fact_type=fact_type,
+                prefer_observations=prefer_observations,
+                question_date=question_date,
+                include_entities=include_entities,
+                max_entity_tokens=max_entity_tokens,
+                include_chunks=include_chunks,
+                max_chunk_tokens=max_chunk_tokens,
+                include_source_facts=include_source_facts,
+                max_source_facts_tokens=max_source_facts_tokens,
+                max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
+                request_context=request_context,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=tag_groups,
+                created_after=created_after,
+                created_before=created_before,
+                min_scores=min_scores,
+                _connection_budget=_connection_budget,
+                _quiet=_quiet,
+                reranking=per_bank_reranking,
+            )
+
+        gathered = await asyncio.gather(
+            *(_one(bid) for bid in ordered_bank_ids),
+            return_exceptions=True,
+        )
+
+        # Hard failures first — never soft-fail into partial 200 metadata.
+        # Precedence: cancellation (499), then tenant AuthenticationError (401),
+        # then OperationValidationError (403/422). 2026-08-10 P1#(3) re-raised
+        # OVE only; AuthenticationError still fell into the generic per-bank
+        # soft-fail (live-measured 2026-08-15: multi POST -> 200).
+        from hindsight_api.extensions import AuthenticationError
+        from hindsight_api.extensions.operation_validator import OperationValidationError
+
+        for outcome in gathered:
+            if isinstance(outcome, OperationCancelledError):
+                raise outcome
+        for outcome in gathered:
+            if isinstance(outcome, AuthenticationError):
+                raise outcome
+        for outcome in gathered:
+            if isinstance(outcome, OperationValidationError):
+                raise outcome
+
+        bank_statuses: dict[str, dict] = {}
+        successful_facts: list[tuple[str, list[MemoryFact]]] = []
+        successful_outcomes: list[tuple[str, RecallResultModel]] = []
+        for bid, outcome in zip(ordered_bank_ids, gathered, strict=True):
+            if isinstance(outcome, BaseException):
+                # Soft-fail ordinary infrastructure errors. Client metadata is generic
+                # (no exception class/repr oracle); details stay server-side.
+                logger.warning(
+                    "[RECALL MULTI %s] per-bank recall failed: %s: %r",
+                    bid[:8] if len(bid) >= 8 else bid,
+                    type(outcome).__name__,
+                    outcome,
+                )
+                bank_statuses[bid] = {
+                    "status": "error",
+                    "error": "recall failed for this bank",
+                }
+                if bid in config_lookup_failed:
+                    bank_statuses[bid]["config_error"] = "bank config lookup failed"
+                continue
+            # Successful RecallResultModel — keep full outcome for include_* side dicts.
+            count = len(outcome.results)
+            bank_statuses[bid] = {"status": "ok", "count": count}
+            successful_facts.append((bid, list(outcome.results)))
+            successful_outcomes.append((bid, outcome))
+
+        union_ce_applied = False
+        if union_ce and successful_facts:
+            # Cancellation checkpoint: union CE is the expensive stage and runs
+            # in a worker that cannot be interrupted once dispatched.
+            request_context.raise_if_cancelled()
+            try:
+                pool = select_union_candidates(
+                    successful_facts,
+                    per_bank_pre_cap=per_bank_pre_cap,
+                    union_cap=union_cap,
+                    k_floor=per_bank_floor,
+                )
+                tokened = memory_facts_to_merged_candidates(pool.facts)
+                if tokened:
+                    reranker_instance = self._cross_encoder_reranker
+                    await reranker_instance.ensure_initialized()
+                    scored = await reranker_instance.rerank(query, [item.candidate for item in tokened])
+                    score_by_token = {sr.id: sr.cross_encoder_score_normalized for sr in scored}
+                    scored_facts = stamp_union_ce_scores(
+                        [item.fact for item in tokened],
+                        [item.token for item in tokened],
+                        score_by_token,
+                    )
+                    # P3-9: scores.final uses the same combined-scoring formula as
+                    # single-bank (CE * recency * temporal * proof). scores.reranker
+                    # stays the raw normalized CE so score-merge stays comparable.
+                    if scored:
+                        try:
+                            scoring_config = get_config()
+                            apply_combined_scoring(
+                                scored,
+                                now=_recall_scoring_now(question_date),
+                                is_passthrough_reranker=False,
+                                recency_decay_function=scoring_config.recency_decay_function,
+                                recency_decay_linear_window_days=scoring_config.recency_decay_linear_window_days,
+                                recency_decay_halflife_days=scoring_config.recency_decay_halflife_days,
+                            )
+                            weight_by_token = {sr.id: float(sr.weight) for sr in scored}
+                            rewritten: list[MemoryFact] = []
+                            for fact, token in zip(
+                                scored_facts, [item.token for item in tokened], strict=True
+                            ):
+                                prev = fact.scores
+                                if prev is None or token not in weight_by_token:
+                                    rewritten.append(fact)
+                                    continue
+                                rewritten.append(
+                                    fact.model_copy(
+                                        update={
+                                            "scores": prev.model_copy(
+                                                update={"final": weight_by_token[token]}
+                                            )
+                                        }
+                                    )
+                                )
+                            scored_facts = rewritten
+                        except Exception as scoring_exc:
+                            logger.warning(
+                                "[RECALL MULTI] union combined scoring failed; "
+                                "scores.final stays raw CE: %s: %r",
+                                type(scoring_exc).__name__,
+                                scoring_exc,
+                            )
+                    scored_facts = apply_per_bank_floor(
+                        scored_facts,
+                        k_floor=per_bank_floor,
+                        keep=union_cap,
+                        bank_order=pool.bank_order,
+                    )
+                    by_bank: dict[str, list[MemoryFact]] = {bid: [] for bid, _facts in successful_facts}
+                    for fact in scored_facts:
+                        bid = fact.bank_id or ""
+                        by_bank.setdefault(bid, []).append(fact)
+
+                    def _union_score(fact: MemoryFact) -> float:
+                        if fact.scores is None or fact.scores.reranker is None:
+                            return float("-inf")
+                        return float(fact.scores.reranker)
+
+                    for lst in by_bank.values():
+                        lst.sort(key=_union_score, reverse=True)
+                    successful_facts = [(bid, by_bank.get(bid, [])) for bid, _old in successful_facts]
+                    union_ce_applied = True
+            except OperationCancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "[RECALL MULTI] union CE failed; falling back to rrf/interleave: %s: %r",
+                    type(e).__name__,
+                    e,
+                )
+                union_ce = False
+
+        # Post-gather evidence check: pre-flight config said CE was fine, but the
+        # returned facts may still lack scores.reranker (RRF passthrough, etc.).
+        if merge_applied == "score" and not has_usable_reranker_scores(successful_facts):
+            merge_applied = "interleave"
+            merge_fallback_reason = FALLBACK_NO_USABLE_RERANKER_SCORES
+
+        # cap -> merge -> dedup -> token cut. Floor is applied BEFORE this
+        # token cut (P2-5): a CE-weak bank can still vanish from the HTTP list
+        # when max_tokens is tight. merge_applied already carries any
+        # FALLBACK_NO_USABLE_RERANKER_SCORES downgrade decided just above.
+        pipeline = merge_cap_dedup_cut(
+            successful_facts,
+            merge=merge_applied,
+            max_tokens=max_tokens,
+            max_per_bank=per_bank_pre_cap,
+        )
+        cut = pipeline.facts
+        dedup_dropped = pipeline.dropped
+
+        # Union-merge entities/chunks/source_facts across successful banks. On key
+        # collision keep the bank whose results ranked higher in the merged order
+        # (chunk ids already embed bank ids, so real collisions are rare).
+        bank_rank = bank_rank_from_merged(cut)
+        entities = union_merge_dicts(
+            [(bid, outcome.entities) for bid, outcome in successful_outcomes],
+            bank_rank=bank_rank,
+        )
+        chunks = union_merge_dicts(
+            [(bid, outcome.chunks) for bid, outcome in successful_outcomes],
+            bank_rank=bank_rank,
+        )
+        source_facts = union_merge_dicts(
+            [(bid, outcome.source_facts) for bid, outcome in successful_outcomes],
+            bank_rank=bank_rank,
+        )
+
+        return RecallResultModel(
+            results=cut,
+            entities=entities,
+            chunks=chunks,
+            source_facts=source_facts,
+            source_facts_truncated=or_source_facts_truncated(
+                [outcome for _, outcome in successful_outcomes]
+            ),
+            metadata=build_multi_bank_metadata(
+                merge_requested=merge_requested,
+                merge_applied=merge_applied,
+                merge_fallback_reason=merge_fallback_reason,
+                bank_statuses=bank_statuses,
+                dedup_dropped=dedup_dropped,
+                per_bank_cap=per_bank_pre_cap,
+                union_ce=union_ce_applied,
+                union_cap=union_cap,
+                per_bank_floor=per_bank_floor,
+            ),
+        )
+
     async def _search_with_retries(
         self,
         bank_id: str,
@@ -6111,6 +6956,7 @@ class MemoryEngine(MemoryEngineInterface):
             scored_results: list = []
             pre_filtered_count = 0
             rerank_kind = "cross-encoder"
+            rerank_degraded = False
             try:
                 # Pre-filter candidates by RRF before the (optional) cross-encoder.
                 # RRF already provides good ranking; this caps cross-encoder cost.
@@ -6144,7 +6990,40 @@ class MemoryEngine(MemoryEngineInterface):
 
                     # Ensure reranker is initialized (for lazy initialization mode)
                     await reranker_instance.ensure_initialized()
-                    scored_results = await reranker_instance.rerank(query, merged_candidates)
+                    try:
+                        scored_results = await reranker_instance.rerank(query, merged_candidates)
+                    except OperationCancelledError:
+                        raise
+                    except Exception:
+                        # CE predict raised (live 2026-08-16: ValueError "Unable
+                        # to create tensor ... truncation and/or padding" on a
+                        # file-sized query x 77 candidates). The outer handler
+                        # logs exc_info and re-raises RuntimeError -> HTTP 500
+                        # and soak "unhandled-in-overlay". Degrade to the same
+                        # un-reranked RRF order the rrf-passthrough arm already
+                        # builds. Do not include the HF message — the soak gate
+                        # greps "Unable to create tensor".
+                        rerank_degraded = True
+                        reason = "reranker_predict_error"
+                        rerank_kind = "rrf-passthrough"
+                        logger.warning(
+                            "[RECALL %s] cross-encoder rerank failed; "
+                            "degrading to un-reranked RRF (merge_applied reason=%s)",
+                            recall_id,
+                            reason,
+                        )
+                        log_buffer.append(
+                            f"  [4] Reranking degraded to un-reranked RRF (reason={reason})"
+                        )
+                        scored_results = [
+                            ScoredResult(
+                                candidate=mc,
+                                cross_encoder_score=0.0,
+                                cross_encoder_score_normalized=0.0,
+                                weight=0.0,
+                            )
+                            for mc in sorted(merged_candidates, key=lambda mc: mc.rrf_score, reverse=True)
+                        ]
                 else:
                     # "rrf" / "interleave": skip the cross-encoder and keep the fusion order
                     # (rrf_score is descending by fusion position for both). The cross-encoder
@@ -6196,7 +7075,12 @@ class MemoryEngine(MemoryEngineInterface):
             elif scored_results:
                 ce = reranker_instance.cross_encoder
                 # "rrf" mode is passthrough by construction; so is a configured "rrf" CE.
-                is_passthrough = (reranking == "rrf") or (ce is not None and ce.provider_name == "rrf")
+                # rerank_degraded: CE raised; scores are placeholders — seed from RRF.
+                is_passthrough = (
+                    rerank_degraded
+                    or (reranking == "rrf")
+                    or (ce is not None and ce.provider_name == "rrf")
+                )
                 scoring_config = get_config()
                 apply_combined_scoring(
                     scored_results,
@@ -6820,8 +7704,10 @@ class MemoryEngine(MemoryEngineInterface):
             # cross_encoder_score_normalized is then a rank-derived placeholder, not a
             # true relevance score.
             ce_model = self._cross_encoder_reranker.cross_encoder
-            reranker_passthrough = (reranking != "cross_encoder") or (
-                ce_model is not None and getattr(ce_model, "provider_name", None) == "rrf"
+            reranker_passthrough = (
+                rerank_degraded
+                or (reranking != "cross_encoder")
+                or (ce_model is not None and getattr(ce_model, "provider_name", None) == "rrf")
             )
             scores_by_id: dict[str, RecallScores] = {
                 sr.id: RecallScores(
@@ -12732,6 +13618,298 @@ class MemoryEngine(MemoryEngineInterface):
             return max(newest_in_scope, current_last_refreshed_at)
         return newest_in_scope
 
+    async def _try_delta_fast_path(
+        self,
+        ctx: _MentalModelRefreshContext,
+        *,
+        bank_id: str,
+        request_context: "RequestContext",
+        resolved_config: "HindsightConfig",
+        tag_filtering: RefreshTagFiltering,
+        fact_types: list[str] | None,
+        stored_structured_content: dict[str, Any] | None,
+        stored_max_tokens: int | None,
+        recall_max_tokens_override: int | None,
+        operation_label: str,
+    ) -> _DeltaFastPathResult:
+        """Run a delta refresh without the agentic loop, or decline and say why.
+
+        Delta mode's premise is incremental work, but every delta refresh still ran
+        the full reflect loop first: several LLM calls, each resending the whole
+        accumulated conversation, to produce a handful of edit operations — and on
+        a large share of refreshes, none at all. The pieces needed to skip it were
+        already here, just sequenced behind the loop instead of in front of it.
+
+        Two tiers, both bounded:
+
+        - **Tier 0** reads the delta window with the same two typed retrieval calls
+          the loop's tools make. No facts in the window means nothing to integrate,
+          so the document is preserved and the watermark advances — the same
+          outcome the loop reaches after paying for it. Zero LLM calls.
+        - **Tier 1** hands those facts and the current document to the existing
+          structured-delta prompt, in one call, and applies what comes back.
+
+        Anything less than clearly safe hands back to the loop instead: no baseline
+        to edit, the model saying it needs more context, a call or parse that
+        failed, or operations that all bounced. The loop then produces the result
+        exactly as it does today, so this can change what a refresh COSTS but not
+        what outcomes are reachable.
+
+        By construction it can only apply operations to the existing document or
+        preserve it — it never writes a synthesised candidate as the whole
+        document, so the narrow-candidate and empty-answer failure classes the
+        agentic path guards against cannot arise here.
+        """
+        from .reflect.delta_ops import (
+            DeltaAllOpsInvalidError,
+            apply_operations,
+            parse_delta_operation_list,
+            serialize_document_for_delta_prompt,
+        )
+        from .reflect.prompts import (
+            STRUCTURED_DELTA_FAST_PATH_SYSTEM_PROMPT,
+            build_structured_delta_prompt,
+        )
+        from .reflect.structured_doc import render_document
+
+        current_doc = _load_delta_baseline(ctx.mental_model_id, ctx.current_content, stored_structured_content)
+        if current_doc is None:
+            return _DeltaFastPathFallback(reason="no_delta_baseline")
+
+        # Mirror the loop's tool wiring rather than flattening it into one call:
+        # recall covers world/experience under the recall_max_tokens budget, and
+        # search_observations covers observations under the tool-call budget. Both
+        # wrappers mark the request internal, so these are not double-billed on top
+        # of the refresh operation itself.
+        include_observations = fact_types is None or "observation" in fact_types
+        recall_fact_types = [ft for ft in (fact_types or ["world", "experience"]) if ft in ("world", "experience")]
+        effective_recall_max_tokens = (
+            recall_max_tokens_override if recall_max_tokens_override is not None else resolved_config.recall_max_tokens
+        )
+
+        tool_trace: list[ToolCallTrace] = []
+        based_on: dict[str, list[dict[str, Any]]] = {}
+        created_after = ctx.window.created_after
+        created_before = ctx.window.created_before
+
+        if recall_fact_types:
+            started_call = time.time()
+            # Chunks are raw source text for a synthesis step this path does not
+            # have: only id/text/type/context reach the delta prompt, so fetching
+            # them would cost a lookup whose result is discarded.
+            recall_out = await tool_recall(
+                self,
+                bank_id,
+                ctx.source_query,
+                request_context,
+                max_tokens=effective_recall_max_tokens,
+                tags=tag_filtering.tags,
+                tags_match=tag_filtering.tags_match,
+                tag_groups=tag_filtering.tag_groups,
+                fact_types=recall_fact_types if fact_types is not None else None,
+                include_chunks=False,
+                created_after=created_after,
+                created_before=created_before,
+            )
+            tool_trace.append(
+                ToolCallTrace(
+                    tool="recall",
+                    input={"query": ctx.source_query, "max_tokens": effective_recall_max_tokens},
+                    output=recall_out,
+                    duration_ms=int((time.time() - started_call) * 1000),
+                )
+            )
+            for memory in recall_out.get("memories") or []:
+                fact_type = memory.get("fact_type") or "world"
+                based_on.setdefault(fact_type, []).append(_serialize_window_fact(memory, fact_type))
+
+        if include_observations:
+            started_call = time.time()
+            # last_consolidated_at / pending_consolidation only shape the freshness
+            # fields in the response, which the agent reads and this path does not;
+            # source facts are off for the same reason chunks are.
+            observations_out = await tool_search_observations(
+                self,
+                bank_id,
+                ctx.source_query,
+                request_context,
+                max_tokens=_FAST_PATH_OBSERVATIONS_MAX_TOKENS,
+                tags=tag_filtering.tags,
+                tags_match=tag_filtering.tags_match,
+                tag_groups=tag_filtering.tag_groups,
+                source_facts_max_tokens=-1,
+                created_after=created_after,
+                created_before=created_before,
+            )
+            tool_trace.append(
+                ToolCallTrace(
+                    tool="search_observations",
+                    input={"query": ctx.source_query, "max_tokens": _FAST_PATH_OBSERVATIONS_MAX_TOKENS},
+                    output=observations_out,
+                    duration_ms=int((time.time() - started_call) * 1000),
+                )
+            )
+            for observation in observations_out.get("observations") or []:
+                based_on.setdefault("observation", []).append(_serialize_window_fact(observation, "observation"))
+
+        supporting_facts = [fact for facts in based_on.values() for fact in facts]
+        # Everything retrieved is sent to the delta prompt — there is no agent in
+        # between to declare a subset relevant — so used mirrors retrieved here.
+        facts = MentalModelFactCounts(
+            retrieved=_count_retrieved_facts(tool_trace),
+            used={fact_type: len(serialized) for fact_type, serialized in based_on.items() if serialized},
+        )
+        tool_calls = _summarize_refresh_tool_calls(tool_trace, created_after)
+
+        if not supporting_facts:
+            logger.info(
+                f"[MENTAL_MODELS] Delta fast path (tier 0) for {ctx.mental_model_id}: "
+                "no new facts in the window, preserving content without an LLM call"
+            )
+            return _DeltaFastPathSuccess(
+                tier="tier0",
+                evidence=_MentalModelRefreshEvidence(
+                    candidate_content=ctx.current_content,
+                    facts=facts,
+                    tool_calls=tool_calls,
+                ),
+                based_on={},
+                final_content=ctx.current_content,
+                final_structured=None,
+                delta_operations=None,
+                outcome="content_preserved_no_new_facts",
+                delta_applied=False,
+                delta_skipped_reason="no_new_facts",
+                warnings=_retrieval_warnings(facts),
+            )
+
+        # Same budget arithmetic as the agentic path's delta call: op JSON is
+        # denser than the rendered markdown, so allow 1.5x the document cap.
+        doc_max_tokens = stored_max_tokens or 2048
+        delta_max_tokens = max(2048, int(doc_max_tokens * 1.5))
+        user_prompt = build_structured_delta_prompt(
+            # Annotated with each block's own index, not a bare model dump —
+            # see serialize_document_for_delta_prompt's docstring for why a
+            # compact, unannotated dump makes the model silently count array
+            # elements to know a block's index, which is the root cause the
+            # anchor/index fix in delta_ops.py exists to remove.
+            current_document_json=serialize_document_for_delta_prompt(current_doc),
+            # There is no synthesis on this path — that is the call being skipped.
+            # The fast-path system prompt says so and tells the model to ask for
+            # the agentic pass rather than guess when the facts alone fall short.
+            candidate_markdown="",
+            supporting_facts=supporting_facts,
+            source_query=ctx.source_query,
+            max_output_tokens=delta_max_tokens,
+        )
+        started_call = time.time()
+        try:
+            raw, usage = await self._reflect_llm_config.with_config(
+                resolved_config, bank_id=bank_id, operation=operation_label
+            ).call(
+                messages=[
+                    {"role": "system", "content": STRUCTURED_DELTA_FAST_PATH_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_completion_tokens=delta_max_tokens,
+                temperature=get_config().llm_temperature_consolidation,
+                scope="mental_model_delta_ops",
+                return_usage=True,
+            )
+            op_list = parse_delta_operation_list(raw)
+        except DeltaAllOpsInvalidError as exc:
+            logger.warning(
+                f"[MENTAL_MODELS] Delta fast path for {ctx.mental_model_id}: every operation failed "
+                f"validation ({exc}); handing back to the reflect loop"
+            )
+            return _DeltaFastPathFallback(reason="delta_ops_invalid")
+        except Exception as exc:
+            logger.warning(
+                f"[MENTAL_MODELS] Delta fast path for {ctx.mental_model_id} could not produce "
+                f"operations ({exc}); handing back to the reflect loop"
+            )
+            return _DeltaFastPathFallback(reason="delta_ops_failed")
+
+        llm_calls = [LLMCallTrace(scope="mental_model_delta_ops", duration_ms=int((time.time() - started_call) * 1000))]
+
+        if op_list.needs_full_context:
+            logger.info(
+                f"[MENTAL_MODELS] Delta fast path for {ctx.mental_model_id}: the model asked for full "
+                "context; handing back to the reflect loop"
+            )
+            return _DeltaFastPathFallback(reason="needs_full_context")
+
+        apply_outcome = apply_operations(current_doc, op_list.operations)
+        if op_list.operations and not apply_outcome.applied:
+            # Every op was rejected, so the document is unchanged while this
+            # window's facts never landed. The loop gets a turn rather than the
+            # refresh being persisted as if it had integrated them.
+            logger.warning(
+                f"[MENTAL_MODELS] Delta fast path for {ctx.mental_model_id}: all "
+                f"{len(apply_outcome.skipped)} op(s) were skipped; handing back to the reflect loop"
+            )
+            return _DeltaFastPathFallback(reason="delta_ops_all_skipped")
+
+        final_content = render_document(apply_outcome.document)
+        warnings = _retrieval_warnings(facts)
+        if apply_outcome.skipped:
+            warnings.append(
+                f"{len(apply_outcome.skipped)} of {len(op_list.operations)} delta operation(s) "
+                "were rejected and their content did not reach the document. See the skipped "
+                "operations for the reason each was dropped."
+            )
+        if not final_content.strip():
+            # Reachable only by operations that empty the document (removing every
+            # section). Rare, but the invariant that a refresh never overwrites a
+            # working document with nothing is not one to special-case away.
+            warnings.append(
+                "The refresh produced empty content, which usually means an upstream LLM failure. "
+                "A real refresh would preserve the existing content and fail."
+            )
+            return _DeltaFastPathSuccess(
+                tier="tier1",
+                evidence=_MentalModelRefreshEvidence(
+                    candidate_content=final_content,
+                    facts=facts,
+                    tool_calls=tool_calls,
+                    llm_calls=llm_calls,
+                    usage=usage,
+                ),
+                based_on=based_on,
+                final_content=final_content,
+                final_structured=None,
+                delta_operations=MentalModelDeltaOperations(
+                    applied=apply_outcome.applied, skipped=apply_outcome.skipped
+                ),
+                outcome="refresh_failed_empty_candidate",
+                delta_applied=False,
+                warnings=warnings,
+            )
+
+        logger.info(
+            f"[MENTAL_MODELS] Delta fast path (tier 1) for {ctx.mental_model_id}: applied "
+            f"{len(apply_outcome.applied)} op(s), skipped {len(apply_outcome.skipped)}, in one LLM call"
+        )
+        return _DeltaFastPathSuccess(
+            tier="tier1",
+            evidence=_MentalModelRefreshEvidence(
+                # No reflect synthesis exists on this path, so the "candidate" a
+                # preview reports is the document the operations produced.
+                candidate_content=final_content,
+                facts=facts,
+                tool_calls=tool_calls,
+                llm_calls=llm_calls,
+                usage=usage,
+            ),
+            based_on=based_on,
+            final_content=final_content,
+            final_structured=apply_outcome.document,
+            delta_operations=MentalModelDeltaOperations(applied=apply_outcome.applied, skipped=apply_outcome.skipped),
+            outcome="content_written",
+            delta_applied=True,
+            warnings=warnings,
+        )
+
     async def _execute_mental_model_refresh(
         self,
         bank_id: str,
@@ -12887,6 +14065,17 @@ class MemoryEngine(MemoryEngineInterface):
         if stored_max_tokens is not None:
             reflect_kwargs["max_tokens"] = stored_max_tokens
 
+        resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+        compact_enabled = bool(getattr(resolved_config, "mental_model_compact_to_max_tokens", True))
+        size_budget_tokens: int | None = None
+        if compact_enabled and stored_max_tokens is not None:
+            try:
+                parsed_budget = int(stored_max_tokens)
+            except (TypeError, ValueError):
+                parsed_budget = 0
+            if parsed_budget > 0:
+                size_budget_tokens = parsed_budget
+
         # Delta mode: scope recall to memories created since the last refresh
         # so the agentic loop only retrieves genuinely new information.
         created_after: datetime | None = None
@@ -12904,6 +14093,75 @@ class MemoryEngine(MemoryEngineInterface):
             created_before=refresh_cutoff,
             watermark=processed_watermark,
         )
+        ctx = _MentalModelRefreshContext(
+            mental_model_id=mental_model_id,
+            name=mm_name,
+            requested_mode=requested_mode,
+            scope=scope,
+            window=window,
+            current_content=current_content,
+            source_query=source_query,
+            processed_watermark=processed_watermark,
+            started=started,
+        )
+
+        # Deterministic delta fast path, ahead of the agentic loop. Only delta
+        # refreshes that survived the mode decision above are eligible: full mode
+        # regenerates the whole document from the unbounded window, which is not
+        # something edit operations can express. Resolving config here also gives
+        # the delta LLM call below its bank attribution. Config was already
+        # resolved above for the size-budget flag; reuse it.
+        fast_path_fallback_reason: FastPathFallbackReason | None = None
+        if use_delta:
+            trigger_fast_path = trigger_data.get("delta_fast_path")
+            fast_path_enabled = (
+                resolved_config.mental_model_delta_fast_path if trigger_fast_path is None else bool(trigger_fast_path)
+            )
+            if fast_path_enabled:
+                fast_path = await self._try_delta_fast_path(
+                    ctx,
+                    bank_id=bank_id,
+                    request_context=request_context,
+                    resolved_config=resolved_config,
+                    tag_filtering=tag_filtering,
+                    fact_types=fact_types,
+                    stored_structured_content=stored_structured_content,
+                    stored_max_tokens=stored_max_tokens,
+                    recall_max_tokens_override=recall_max_tokens_override,
+                    operation_label=operation_label,
+                )
+                if isinstance(fast_path, _DeltaFastPathSuccess):
+                    based_on = fast_path.based_on
+                    _accumulate_delta_based_on(based_on, mental_model.get("reflect_response"))
+                    reflect_response_payload = {
+                        "text": fast_path.evidence.candidate_content,
+                        "based_on": based_on,
+                        "mental_models": [],
+                        "delta_applied": fast_path.delta_applied,
+                        "fast_path": fast_path.tier,
+                        "fast_path_fallback_reason": None,
+                    }
+                    if fast_path.delta_skipped_reason is not None:
+                        reflect_response_payload["delta_skipped_reason"] = fast_path.delta_skipped_reason
+                    if fast_path.delta_operations is not None:
+                        reflect_response_payload["delta_operations_applied"] = fast_path.delta_operations.applied
+                        reflect_response_payload["delta_operations_skipped"] = fast_path.delta_operations.skipped
+                    return _finalize_refresh_document(
+                        ctx,
+                        fast_path.evidence,
+                        effective_mode="delta",
+                        mode_fallback_reason=None,
+                        final_content=fast_path.final_content,
+                        final_structured=fast_path.final_structured,
+                        delta_operations=fast_path.delta_operations,
+                        reflect_response=reflect_response_payload,
+                        outcome=fast_path.outcome,
+                        warnings=fast_path.warnings,
+                        fast_path=fast_path.tier,
+                        size_budget_tokens=size_budget_tokens,
+                        has_delta_baseline=has_delta_baseline,
+                    )
+                fast_path_fallback_reason = fast_path.reason
 
         reflect_result = await self.reflect_async(**reflect_kwargs)
 
@@ -12953,75 +14211,42 @@ class MemoryEngine(MemoryEngineInterface):
         for _facts in based_on_serialized_payload.values():
             delta_supporting_facts.extend(_facts)
 
+        # LOCAL PATCH #2894 leg support (2026-08-01, REBASED onto v0.9.0
+        # 2026-08-07; RE-APPLIED onto the SPEC-A two-tier branch e034f97
+        # 2026-08-08 -- same anchor; loop path only, tier-1 never reaches
+        # this function region): capture whether THIS reflect retrieved
+        # anything BEFORE the delta-mode merge below can mix in facts
+        # carried over from the previous refresh (review finding:
+        # post-merge emptiness is fail-open under carry-over).
+        _patch_fresh_retrieval_empty = not any(
+            v for v in based_on_serialized_payload.values() if v
+        )
+
         # In delta mode, based_on must accumulate: the mental model is
         # grounded on ALL facts ever used, not just the latest delta's new
         # ones. Merge previous based_on with current, deduplicating by id.
         if use_delta:
-            prev_rr = mental_model.get("reflect_response") or {}
-            prev_based_on = prev_rr.get("based_on") or {}
-            for ftype, prev_facts in prev_based_on.items():
-                if not isinstance(prev_facts, list):
-                    continue
-                new_ids = {f["id"] for f in based_on_serialized_payload.get(ftype, [])}
-                carried = [f for f in prev_facts if isinstance(f, dict) and f.get("id") not in new_ids]
-                if carried:
-                    based_on_serialized_payload.setdefault(ftype, []).extend(carried)
+            _accumulate_delta_based_on(based_on_serialized_payload, mental_model.get("reflect_response"))
 
         reflect_response_payload: dict[str, Any] = {
             "text": reflect_result.text,
             "based_on": based_on_serialized_payload,
             "mental_models": [],  # Mental models are included in based_on["mental-models"]
+            # Null tier: this refresh came from the agentic loop. The reason says
+            # whether the fast path declined it, or never looked at it.
+            "fast_path": None,
+            "fast_path_fallback_reason": fast_path_fallback_reason,
         }
 
-        warnings: list[str] = []
-        retrieved_total = sum(facts.retrieved.values())
-        used_total = sum(facts.used.values())
-        if retrieved_total == 0:
-            warnings.append(
-                "Retrieval returned no facts at all. Check the resolved scope and the time window — "
-                "in delta mode nothing created after the last refresh is in range."
-            )
-        elif used_total == 0:
-            warnings.append(
-                f"Retrieval returned {retrieved_total} fact(s) but the reflect agent used none of them, "
-                "so the document was written from an empty evidence set. The source query may not match "
-                "what the retrieved memories are about."
-            )
+        warnings = _retrieval_warnings(facts)
 
-        def _finish(
-            *,
-            effective_mode: RefreshMode,
-            mode_fallback_reason: ModeFallbackReason | None,
-            final_content: str,
-            final_structured: StructuredDocument | None,
-            delta_operations: MentalModelDeltaOperations | None,
-            outcome: RefreshOutcome,
-        ) -> _MentalModelRefreshRun:
-            """Close over everything the pipeline resolved before it branched."""
-            return _MentalModelRefreshRun(
-                mental_model_id=mental_model_id,
-                name=mm_name,
-                requested_mode=requested_mode,
-                effective_mode=effective_mode,
-                mode_fallback_reason=mode_fallback_reason,
-                scope=scope,
-                window=window,
-                facts=facts,
-                current_content=current_content,
-                candidate_content=reflect_result.text,
-                final_content=final_content,
-                final_structured=final_structured,
-                delta_operations=delta_operations,
-                reflect_response=reflect_response_payload,
-                source_query=source_query,
-                processed_watermark=processed_watermark,
-                outcome=outcome,
-                tool_calls=_summarize_refresh_tool_calls(reflect_result.tool_trace, created_after),
-                llm_calls=list(reflect_result.llm_trace),
-                usage=reflect_result.usage or TokenUsage(),
-                duration_ms=int((time.time() - started) * 1000),
-                warnings=warnings,
-            )
+        evidence = _MentalModelRefreshEvidence(
+            candidate_content=reflect_result.text,
+            facts=facts,
+            tool_calls=_summarize_refresh_tool_calls(reflect_result.tool_trace, created_after),
+            llm_calls=list(reflect_result.llm_trace),
+            usage=reflect_result.usage or TokenUsage(),
+        )
 
         # Delta-mode path: emit structured operations against the existing
         # structured doc, apply them, then re-render to markdown. Sections
@@ -13031,6 +14256,7 @@ class MemoryEngine(MemoryEngineInterface):
         from .reflect.delta_ops import (
             apply_operations,
             parse_delta_operation_list,
+            serialize_document_for_delta_prompt,
         )
         from .reflect.prompts import (
             STRUCTURED_DELTA_SYSTEM_PROMPT,
@@ -13047,34 +14273,9 @@ class MemoryEngine(MemoryEngineInterface):
         delta_operations: MentalModelDeltaOperations | None = None
 
         if use_delta:
-            # Use the previously stored structured doc when available; otherwise
-            # parse the existing markdown so the very first delta refresh can
-            # still operate without waiting for a full rebuild.
-            #
-            # A stored doc that fails validation (hand-edited JSON, a shape from an
-            # older schema) is NOT fatal: the markdown in ``content`` is the same
-            # document and ``parse_markdown`` is lenient, so re-deriving the baseline
-            # from it keeps the delta path alive and rebuilds the structured doc as a
-            # side effect. Giving up here would refuse every subsequent refresh
-            # (nothing else repairs the column) over a baseline we can reconstruct.
-            current_doc: StructuredDocument | None = None
-            if stored_structured_content is not None:
-                try:
-                    current_doc = StructuredDocument.model_validate(stored_structured_content)
-                except Exception as exc:
-                    logger.warning(
-                        f"[MENTAL_MODELS] Stored structured doc for {mental_model_id} is unusable "
-                        f"({exc}); re-deriving the delta baseline from the stored markdown"
-                    )
+            current_doc = _load_delta_baseline(mental_model_id, current_content, stored_structured_content)
             if current_doc is None:
-                try:
-                    current_doc = parse_markdown(current_content)
-                except Exception as exc:
-                    logger.warning(
-                        f"[MENTAL_MODELS] Could not load structured doc for {mental_model_id} "
-                        f"({exc}); delta has no baseline to edit"
-                    )
-                    mode_fallback_reason = "structured_doc_unreadable"
+                mode_fallback_reason = "structured_doc_unreadable"
 
             if current_doc is not None:
                 supporting_facts = delta_supporting_facts
@@ -13084,13 +14285,20 @@ class MemoryEngine(MemoryEngineInterface):
                 if not supporting_facts:
                     reflect_response_payload["delta_applied"] = False
                     reflect_response_payload["delta_skipped_reason"] = "no_new_facts"
-                    return _finish(
+                    return _finalize_refresh_document(
+                        ctx,
+                        evidence,
                         effective_mode="delta",
                         mode_fallback_reason=None,
                         final_content=current_content,
                         final_structured=None,
                         delta_operations=None,
+                        reflect_response=reflect_response_payload,
                         outcome="content_preserved_no_new_facts",
+                        warnings=warnings,
+                        fast_path_fallback_reason=fast_path_fallback_reason,
+                        size_budget_tokens=size_budget_tokens,
+                        has_delta_baseline=has_delta_baseline,
                     )
 
                 # Op JSON is denser than the rendered markdown — each op
@@ -13103,7 +14311,9 @@ class MemoryEngine(MemoryEngineInterface):
                 doc_max_tokens = stored_max_tokens or 2048
                 delta_max_tokens = max(2048, int(doc_max_tokens * 1.5))
                 user_prompt = build_structured_delta_prompt(
-                    current_document_json=current_doc.model_dump_json(),
+                    # Annotated with each block's own index — see
+                    # serialize_document_for_delta_prompt's docstring.
+                    current_document_json=serialize_document_for_delta_prompt(current_doc),
                     candidate_markdown=reflect_result.text,
                     supporting_facts=supporting_facts,
                     source_query=source_query,
@@ -13222,13 +14432,67 @@ class MemoryEngine(MemoryEngineInterface):
                 "The refresh produced empty content, which usually means an upstream LLM failure. "
                 "A real refresh would preserve the existing content and fail."
             )
-            return _finish(
+            return _finalize_refresh_document(
+                ctx,
+                evidence,
                 effective_mode=effective_mode,
                 mode_fallback_reason=mode_fallback_reason,
                 final_content=final_content,
                 final_structured=None,
                 delta_operations=delta_operations,
+                reflect_response=reflect_response_payload,
                 outcome="refresh_failed_empty_candidate",
+                warnings=warnings,
+                fast_path_fallback_reason=fast_path_fallback_reason,
+            )
+
+        # LOCAL PATCH (2026-08-01 v2, upstream #2959 + #2894, cross-model
+        # reviewed; REBASED onto v0.9.0 2026-08-07; RE-APPLIED onto the
+        # SPEC-A two-tier branch e034f97 2026-08-08 -- _finish became
+        # _build_refresh_run, and tier-1 makes the placeholder leg
+        # structurally unreachable on the fast path, so this guard covers
+        # the tier-2/loop path only): refuse to overwrite EXISTING REAL
+        # content when (a) the candidate is a known failure placeholder
+        # (#2959: NO_ANSWER_TEXT or the iteration-limit fallback --
+        # non-empty, so the emptiness guard above passes it), or (b) THIS
+        # reflect retrieved nothing fresh (#2894: embedding index
+        # unavailable -> model emits generic no-info text; measured
+        # pre-merge, because delta carry-over refills based_on and makes a
+        # post-merge check fail-open). Both legs gate on existing real
+        # content (has_delta_baseline): a bootstrap "no answer" on an
+        # empty/PENDING model is a correct first write, not a clobber.
+        # Reuses outcome "refresh_failed_empty_candidate" so the caller's
+        # preserve-and-fail path needs no new outcome value; the warning
+        # below records the precise reason for audit.
+        # TWOTIER1 merge 2026-08-18: return via _finalize_refresh_document so
+        # the size-budget compact + identifier gate cannot be skipped here.
+        from .reflect.agent import NO_ANSWER_TEXT as _PATCH_NO_ANSWER
+
+        _patch_cand = final_content.strip()
+        _patch_placeholder = (
+            _patch_cand == _PATCH_NO_ANSWER.strip()
+            or _patch_cand.startswith("I was unable to formulate a complete answer")
+        )
+        if has_delta_baseline and (_patch_placeholder or _patch_fresh_retrieval_empty):
+            _patch_reason = (
+                "placeholder_candidate" if _patch_placeholder else "empty_fresh_retrieval"
+            )
+            warnings.append(
+                f"LOCAL PATCH #2959/#2894: refresh produced a {_patch_reason} render over "
+                "existing real content; preserving previous content and failing the refresh."
+            )
+            return _finalize_refresh_document(
+                ctx,
+                evidence,
+                effective_mode=effective_mode,
+                mode_fallback_reason=mode_fallback_reason,
+                final_content=final_content,
+                final_structured=None,
+                delta_operations=delta_operations,
+                reflect_response=reflect_response_payload,
+                outcome="refresh_failed_empty_candidate",
+                warnings=warnings,
+                fast_path_fallback_reason=fast_path_fallback_reason,
             )
 
         # Refuse to write a delta-window candidate as the whole document (#3112).
@@ -13243,13 +14507,18 @@ class MemoryEngine(MemoryEngineInterface):
         # this correct anyway, because a candidate read over full history IS a document
         # and writing it is a legitimate full regeneration.
         if use_delta and not delta_applied and created_after is not None:
-            return _finish(
+            return _finalize_refresh_document(
+                ctx,
+                evidence,
                 effective_mode=effective_mode,
                 mode_fallback_reason=mode_fallback_reason,
                 final_content=final_content,
                 final_structured=None,
                 delta_operations=delta_operations,
+                reflect_response=reflect_response_payload,
                 outcome="refresh_failed_delta_not_applied",
+                warnings=warnings,
+                fast_path_fallback_reason=fast_path_fallback_reason,
             )
 
         # When delta is not applied (full mode, or delta fallback), parse the
@@ -13264,13 +14533,20 @@ class MemoryEngine(MemoryEngineInterface):
                     f"for {mental_model_id} ({exc}); leaving structured_content unchanged"
                 )
 
-        return _finish(
+        return _finalize_refresh_document(
+            ctx,
+            evidence,
             effective_mode=effective_mode,
             mode_fallback_reason=mode_fallback_reason,
             final_content=final_content,
             final_structured=final_structured,
             delta_operations=delta_operations,
+            reflect_response=reflect_response_payload,
             outcome="content_written",
+            warnings=warnings,
+            fast_path_fallback_reason=fast_path_fallback_reason,
+            size_budget_tokens=size_budget_tokens,
+            has_delta_baseline=has_delta_baseline,
         )
 
     async def refresh_mental_model(
@@ -13403,6 +14679,20 @@ class MemoryEngine(MemoryEngineInterface):
                     "memories newer than the last refresh, so writing it would drop the rest of the document.",
                 )
 
+            if run.outcome == "refresh_failed_identifier_retention":
+                # The candidate was NOT empty -- it dropped too many anchored
+                # identifiers from the existing content. The detail names them
+                # verbatim: the names usually make the cause obvious at a
+                # glance, where a bare count would send a human diffing two
+                # document versions.
+                await _preserve_and_fail(
+                    "identifier_retention",
+                    next(
+                        (w for w in run.warnings if w.startswith("identifier-retention:")),
+                        "the candidate dropped too many anchored identifiers from the existing content.",
+                    ),
+                )
+
             # Parse the final stored content into structured_output when a schema is
             # configured. If extraction fails, fail the refresh loudly rather than
             # persisting content with no structured view (which would also clobber the
@@ -13506,6 +14796,8 @@ class MemoryEngine(MemoryEngineInterface):
             effective_mode=run.effective_mode,
             mode_fallback_reason=run.mode_fallback_reason,
             outcome=run.outcome,
+            fast_path=run.fast_path,
+            fast_path_fallback_reason=run.fast_path_fallback_reason,
             would_persist=run.outcome == "content_written",
             scope=run.scope,
             window=run.window,
@@ -14787,6 +16079,14 @@ class MemoryEngine(MemoryEngineInterface):
                     scoped_clause = tags_clause.replace("AND ", "", 1)
                     filters.append(f"((tags IS NULL OR tags = '{{}}') OR ({scoped_clause}))")
                     params.extend(tags_params)
+            if tag_groups:
+                # Directives carry no entity postings, so an entity leaf is
+                # unanswerable here and reads permissively; only the surviving
+                # tag constraints scope the directive set. memory_units queries
+                # keep their entity leaves.
+                from .search.tags import strip_entity_leaves
+
+                tag_groups = strip_entity_leaves(tag_groups)
             if tag_groups:
                 groups_clause, groups_params, param_idx = build_tag_groups_where_clause(
                     tag_groups, param_offset=param_idx
@@ -16081,7 +17381,7 @@ class MemoryEngine(MemoryEngineInterface):
                             # set is silently lost and the models stay stale. Safe to
                             # UPDATE here: dedupe_by_bank holds FOR NO KEY UPDATE on the
                             # bank row, serialising concurrent submits for this bank.
-                            incoming_tags = full_payload.get("pending_refresh_tags")
+                            incoming_tags = (full_payload or {}).get("pending_refresh_tags")
                             if incoming_tags:
                                 existing_tags = row_dict.get("pending_refresh_tags") or []
                                 merged_tags = sorted(set(existing_tags) | set(incoming_tags))

@@ -8,9 +8,10 @@ Configuration via environment variables - see hindsight_api.config for all env v
 
 import asyncio
 import logging
+import threading
 import warnings
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import httpx
@@ -45,6 +46,141 @@ from .local_device import (
 from .tei_retry import tei_retry_delay
 
 logger = logging.getLogger(__name__)
+
+# Local MiniLM (cross-encoder/ms-marco-MiniLM-L-6-v2) and most ST CE models
+# are 512 tokens. sentence-transformers 5.2.0 CrossEncoder.predict already
+# calls tokenizer(..., padding=True, truncation=True) but omits max_length.
+# A 7.5KB query x 77 docs then dies in convert_to_tensors:
+#   ValueError: Unable to create tensor ... activate truncation and/or padding
+# (token_type_ids / attention_mask "excessive nesting"). The soak gate already
+# grepped that prefix for the 2026-08-15 shared-tokenizer race; this is a
+# different cause with the same prefix.
+DEFAULT_LOCAL_CE_MAX_LENGTH = 512
+
+# Process-wide: torch intra-op / interop can be set only once.
+# Default 0 = no pin (LAT4: pin=2 was the single-bank +47-110%).
+# HINDSIGHT_API_RERANKER_TORCH_THREADS is opt-in (1..8).
+_TORCH_THREADS_PINNED = False
+_DEFAULT_RERANKER_TORCH_THREADS = 0
+_MIN_RERANKER_TORCH_THREADS = 0
+_MAX_RERANKER_TORCH_THREADS = 8
+
+
+def pin_reranker_torch_threads(*, device_type: str, num_threads: int | None = None) -> int:
+    """CPU-only opt-in pin. 0 / unset = do not call set_num_threads.
+
+    Reads ``getattr(get_config(), "reranker_torch_threads", 0)`` when
+    ``num_threads`` is omitted. n<=0 skips the pin and returns 0.
+    n>=1 is clamped to 1..8. CUDA/MPS/XPU are left alone.
+    """
+    global _TORCH_THREADS_PINNED
+    if device_type != "cpu":
+        return 0
+    if num_threads is None:
+        try:
+            from hindsight_api.config import get_config
+
+            num_threads = getattr(get_config(), "reranker_torch_threads", _DEFAULT_RERANKER_TORCH_THREADS)
+        except Exception:
+            num_threads = _DEFAULT_RERANKER_TORCH_THREADS
+    try:
+        n = int(num_threads)
+    except (TypeError, ValueError):
+        n = _DEFAULT_RERANKER_TORCH_THREADS
+    if n <= 0:
+        return 0
+    n = min(_MAX_RERANKER_TORCH_THREADS, n)
+    try:
+        import torch  # type: ignore[import-untyped,unresolved-import]
+    except ImportError:
+        logger.info("Reranker: torch not installed; skipping CPU thread pin")
+        return 0
+
+    if _TORCH_THREADS_PINNED:
+        return n
+    torch.set_num_threads(n)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # Already set for this process (torch forbids changing it later).
+        pass
+    _TORCH_THREADS_PINNED = True
+    return n
+
+
+def resolve_ce_max_length(model: Any, default: int = DEFAULT_LOCAL_CE_MAX_LENGTH) -> int:
+    """Return a usable max_length for a loaded CrossEncoder / stub."""
+    tok = getattr(model, "tokenizer", None)
+    inner = getattr(tok, "_inner", None)
+    candidates = (
+        getattr(model, "max_length", None),
+        getattr(tok, "model_max_length", None),
+        getattr(tok, "_max_length", None),
+        getattr(inner, "model_max_length", None),
+    )
+    for val in candidates:
+        if isinstance(val, bool):
+            continue
+        if isinstance(val, (int, float)) and 8 <= int(val) <= 8192:
+            return int(val)
+    return default
+
+
+def truncate_ce_pairs(pairs: list, max_length: int) -> list[tuple[str, str]]:
+    """Clip each pair's query and doc to *max_length* characters.
+
+    Character clip is a lower bound on tokens (a token is never shorter than
+    one character). Combined with TokenizerMaxLengthWrapper this keeps the
+    HF batch encodings rectangular even when ST 5.2.0 omits max_length.
+    """
+    # Planner review 2026-08-16: clip at 8x max_length CHARS, not max_length chars.
+    # The TokenizerMaxLengthWrapper below already enforces truncation at
+    # max_length TOKENS, so this clip is only a coarse memory bound; clipping
+    # docs to 512 chars (~120 tokens) would gut long candidates for every rerank
+    # (recall-quality regression class J).
+    q_budget = max(4, int(max_length) * 8)
+    d_budget = max(4, int(max_length) * 8)
+    out: list[tuple[str, str]] = []
+    for pair in pairs:
+        if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+            q = "" if pair[0] is None else str(pair[0])
+            d = "" if pair[1] is None else str(pair[1])
+        else:
+            q = "" if pair is None else str(pair)
+            d = ""
+        if len(q) > q_budget:
+            q = q[:q_budget]
+        if len(d) > d_budget:
+            d = d[:d_budget]
+        out.append((q, d))
+    return out
+
+
+class TokenizerMaxLengthWrapper:
+    """Force padding, truncation, and max_length on every tokenizer() call."""
+
+    def __init__(self, inner: Any, max_length: int) -> None:
+        self._inner = inner
+        self._max_length = int(max_length)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("padding", True)
+        kwargs.setdefault("truncation", True)
+        kwargs.setdefault("max_length", self._max_length)
+        return self._inner(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _bind_tokenizer_max_length(model: Any, max_length: int) -> None:
+    tok = getattr(model, "tokenizer", None)
+    if tok is None or isinstance(tok, TokenizerMaxLengthWrapper):
+        return
+    try:
+        model.tokenizer = TokenizerMaxLengthWrapper(tok, max_length)
+    except Exception:
+        pass
 
 
 class CrossEncoderModel(ABC):
@@ -104,12 +240,20 @@ class LocalSTCrossEncoder(CrossEncoderModel):
     - Small model (80MB)
     - Trained for passage re-ranking
 
-    Uses a dedicated thread pool to limit concurrent CPU-bound work.
+    Uses a dedicated thread pool to limit concurrent CPU-bound work. Each
+    executor thread owns its own CrossEncoder (tokenizer + weights). Sharing
+    one instance across threads races the HuggingFace fast tokenizer
+    (set_truncation_and_padding + encode_batch) and was observed live as
+    ``Unable to create tensor`` wrapping ``'int' object is not callable``.
     """
 
-    # Shared executor across all instances (one model loaded anyway)
+    # Shared executor across LocalSTCrossEncoder wrappers. The executor is the
+    # only shared mutable object — not the CrossEncoder / tokenizer.
     _executor: ThreadPoolExecutor | None = None
     _max_concurrent: int = 4  # Limit concurrent CPU-bound reranking calls
+    # Serializes first-use CrossEncoder() construction so concurrent worker
+    # threads do not race the HuggingFace cache / torch load path.
+    _load_lock = threading.Lock()
 
     def __init__(
         self,
@@ -153,8 +297,13 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         self.bucket_batching = bucket_batching
         self.batch_size = batch_size
         self.allow_mps = allow_mps
+        # Kept for test doubles that inject a stub; production predict never
+        # reads this. A load failure must not fall back to a shared instance.
         self._model = None
+        self._device: str | None = None
         self._device_type: str = "cpu"
+        self._initialized = False
+        self._thread_models = threading.local()
         LocalSTCrossEncoder._max_concurrent = max_concurrent
 
     @property
@@ -165,33 +314,13 @@ class LocalSTCrossEncoder(CrossEncoderModel):
     def blocking_init(self) -> bool:
         return True
 
-    async def initialize(self) -> None:
-        """Load the cross-encoder model and initialize the executor."""
-        if self._model is not None:
-            return
+    def _apply_xlm_compat_patch(self) -> None:
+        """Restore create_position_ids_from_input_ids for transformers 5.x + XLM-R.
 
-        try:
-            from sentence_transformers import CrossEncoder
-        except ImportError:
-            raise ImportError(
-                "sentence-transformers is required for LocalSTCrossEncoder. "
-                "Install it with: pip install sentence-transformers"
-            )
-
-        logger.info(f"Reranker: initializing local provider with model {self.model_name}")
-
-        # Determine device based on hardware availability. We always set
-        # low_cpu_mem_usage=False to prevent lazy loading (meta tensors) which can
-        # cause issues when accelerate is installed but no GPU is available.
-        # Note: We do NOT use device_map because CrossEncoder internally calls .to(device)
-        # after loading, which conflicts with accelerate's device_map handling.
-        # MPS is opt-in (allow_mps) — see engine/local_device.py for why.
-        device = select_local_device(self.force_cpu, self.allow_mps)
-
-        # Patch transformers 5.x compatibility for models using XLM-RoBERTa
-        # (e.g., jina-reranker-v2-base-multilingual). transformers 5.x removed
-        # create_position_ids_from_input_ids as a module-level function; the custom
-        # code in these models still references it. This monkey-patch restores it.
+        transformers 5.x removed that helper as a module-level function; custom
+        code in models such as jina-reranker-v2-base-multilingual still imports
+        it. Best-effort: a missing transformers install is not an init failure.
+        """
         try:
             import transformers.models.xlm_roberta.modeling_xlm_roberta as xlm_module
             from transformers.models.xlm_roberta.modeling_xlm_roberta import XLMRobertaEmbeddings
@@ -206,56 +335,229 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         except Exception:
             pass
 
-        # Suppress verbose transformers warnings during model loading
-        # This suppresses the "UNEXPECTED" warnings from CrossEncoder which are harmless
-        # but look alarming to users (e.g., "embeddings.position_ids | UNEXPECTED")
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=UserWarning)
-            warnings.filterwarnings("ignore", message=".*was not found in model state dict.*")
-            warnings.filterwarnings("ignore", message=".*UNEXPECTED.*")
+    def _ensure_executor(self) -> ThreadPoolExecutor:
+        """Create the class-level pool once. Does not resize an existing pool.
 
-            # Also suppress transformers library logging temporarily
-            transformers_logger = logging.getLogger("transformers")
-            original_level = transformers_logger.level
-            transformers_logger.setLevel(logging.ERROR)
-
-            try:
-                self._model = CrossEncoder(
-                    self.model_name,
-                    device=device,
-                    model_kwargs={"low_cpu_mem_usage": False},
-                    trust_remote_code=self.trust_remote_code,
-                )
-            finally:
-                # Restore original logging level
-                transformers_logger.setLevel(original_level)
-
-        self._device_type = resolve_model_device_type(self._model)
-
-        # FP16 inference: convert model weights to half precision.
-        # Empirically validated: 27-36% faster on MPS, quality-identical (20/20 overlap).
-        if self.fp16 and self._device_type != "cpu":
-            self._model.model.half()
-            logger.info("Reranker: FP16 inference enabled")
-
-        # Initialize shared executor (limited workers naturally limits concurrency)
+        max_workers stays whatever the first initialize() observed — changing
+        RERANKER_LOCAL_MAX_CONCURRENT after the executor exists is a process
+        restart, same as before this per-thread change.
+        """
         if LocalSTCrossEncoder._executor is None:
             LocalSTCrossEncoder._executor = ThreadPoolExecutor(
                 max_workers=LocalSTCrossEncoder._max_concurrent,
                 thread_name_prefix="reranker",
             )
-            logger.info(f"Reranker: local provider initialized (max_concurrent={LocalSTCrossEncoder._max_concurrent})")
-        else:
-            logger.info("Reranker: local provider initialized (using existing executor)")
+        return LocalSTCrossEncoder._executor
+
+    def _pin_eval_and_device(self, model: Any) -> None:
+        """Run to(device)/eval once at load so predict() is not the first writer.
+
+        Sentence-Transformers CrossEncoder.predict still calls these on every
+        batch; after this they are idempotent writes on a thread-private model.
+        """
+        inner = getattr(model, "model", None)
+        target = inner if inner is not None else model
+        device = getattr(model, "device", None)
+        if device is None:
+            device = self._device
+        to_fn = getattr(target, "to", None)
+        if callable(to_fn) and device is not None:
+            to_fn(device)
+        eval_fn = getattr(target, "eval", None)
+        if callable(eval_fn):
+            eval_fn()
+
+    def _load_model_instance(self) -> Any:
+        """Construct one CrossEncoder for the calling thread. Never returns a shared instance."""
+        try:
+            from sentence_transformers import CrossEncoder
+        except ImportError:
+            raise ImportError(
+                "sentence-transformers is required for LocalSTCrossEncoder. "
+                "Install it with: pip install sentence-transformers"
+            )
+
+        device = self._device
+        if device is None:
+            device = select_local_device(self.force_cpu, self.allow_mps)
+            self._device = device
+
+        # Suppress verbose transformers warnings during model loading.
+        # CrossEncoder emits harmless "UNEXPECTED" / missing-key UserWarnings
+        # (e.g. "embeddings.position_ids | UNEXPECTED") that look like failures.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            warnings.filterwarnings("ignore", message=".*was not found in model state dict.*")
+            warnings.filterwarnings("ignore", message=".*UNEXPECTED.*")
+
+            transformers_logger = logging.getLogger("transformers")
+            original_level = transformers_logger.level
+            transformers_logger.setLevel(logging.ERROR)
+
+            try:
+                # low_cpu_mem_usage=False avoids accelerate meta tensors when no
+                # GPU is present. We do not pass device_map: CrossEncoder calls
+                # .to(device) after load, which conflicts with accelerate.
+                model = CrossEncoder(
+                    self.model_name,
+                    device=device,
+                    max_length=DEFAULT_LOCAL_CE_MAX_LENGTH,
+                    model_kwargs={"low_cpu_mem_usage": False},
+                    trust_remote_code=self.trust_remote_code,
+                )
+            finally:
+                transformers_logger.setLevel(original_level)
+
+        if model is None:
+            raise RuntimeError(
+                f"CrossEncoder({self.model_name!r}) returned None; refusing to share another thread's model"
+            )
+
+        self._device_type = resolve_model_device_type(model)
+        if self.fp16 and self._device_type != "cpu":
+            model.model.half()
+            logger.info("Reranker: FP16 inference enabled")
+        max_len = resolve_ce_max_length(model)
+        try:
+            model.max_length = max_len
+        except Exception:
+            pass
+        _bind_tokenizer_max_length(model, max_len)
+        self._pin_eval_and_device(model)
+        return model
+
+    def _get_thread_model(self) -> Any:
+        """Return the CrossEncoder owned by this executor thread, loading if needed.
+
+        Load failures raise. This method never returns another thread's instance
+        and never falls back to ``self._model``.
+        """
+        model = getattr(self._thread_models, "model", None)
+        if model is not None:
+            return model
+
+        thread_name = threading.current_thread().name
+        with LocalSTCrossEncoder._load_lock:
+            model = getattr(self._thread_models, "model", None)
+            if model is not None:
+                return model
+            try:
+                model = self._load_model_instance()
+            except ImportError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to create a per-thread LocalSTCrossEncoder instance "
+                    f"for thread {thread_name!r} (model={self.model_name!r}). "
+                    "Refusing to share another thread's model."
+                ) from exc
+            if model is None:
+                raise RuntimeError(
+                    "Failed to create a per-thread LocalSTCrossEncoder instance "
+                    f"for thread {thread_name!r}: loader returned None. "
+                    "Refusing to share another thread's model."
+                )
+            self._thread_models.model = model
+            return model
+
+    def _warmup_executor_threads(self) -> None:
+        """Force every pool thread to exist and load its own instance.
+
+        ThreadPoolExecutor only creates a worker when a task runs on it.
+        Submitting N tasks without a barrier can run them all on one worker
+        (N loads, 1 thread-local). The barrier makes all N workers start
+        before any load, so initialize() fails fast if any instance cannot
+        be created and first recall does not pay 4 cold loads.
+        """
+        executor = LocalSTCrossEncoder._executor
+        if executor is None:
+            raise RuntimeError("Reranker executor missing during per-thread warmup")
+        # The class-level _max_concurrent is last-writer-wins and does not
+        # resize an existing pool (same as before). Warming N>max_workers
+        # tasks on a smaller pool deadlocks the barrier.
+        n = getattr(executor, "_max_workers", LocalSTCrossEncoder._max_concurrent)
+        barrier = threading.Barrier(n)
+
+        def _warmup() -> None:
+            # Bound so a dead worker cannot hang API startup forever.
+            barrier.wait(timeout=600)
+            self._get_thread_model()
+
+        futures: list[Future[None]] = [executor.submit(_warmup) for _ in range(n)]
+        for fut in futures:
+            fut.result()
+
+    async def initialize(self) -> None:
+        """Prepare the executor and load one CrossEncoder per executor thread."""
+        if self._initialized:
+            return
+
+        logger.info(f"Reranker: initializing local provider with model {self.model_name}")
+        # Device is chosen once; each per-thread CrossEncoder is constructed on it.
+        # MPS is opt-in (allow_mps) — see engine/local_device.py for why.
+        self._device = select_local_device(self.force_cpu, self.allow_mps)
+        device_kind = "cpu" if self._device == "cpu" else str(self._device).split(":", 1)[0]
+        # LAT4: process-wide pin=2 is the single-bank +47-110%. Default is
+        # no pin. Opt-in via HINDSIGHT_API_RERANKER_TORCH_THREADS >= 1.
+        if device_kind == "cpu":
+            pinned = pin_reranker_torch_threads(device_type="cpu")
+            if pinned > 0:
+                logger.info(
+                    "Reranker: pinned torch intra-op threads=%s interop=1 (opt-in)",
+                    pinned,
+                )
+        self._apply_xlm_compat_patch()
+        created_executor = LocalSTCrossEncoder._executor is None
+        self._ensure_executor()
+        self._warmup_executor_threads()
+        self._initialized = True
+        reused = "" if created_executor else ", using existing executor"
+        logger.info(
+            "Reranker: local provider initialized "
+            f"(max_concurrent={LocalSTCrossEncoder._max_concurrent}, "
+            f"per-thread model instances{reused})"
+        )
+
+    def _scores_from_model(self, model: Any, pairs: list[tuple[str, str]]) -> list[float]:
+        if not pairs:
+            return []
+        max_len = resolve_ce_max_length(model)
+        prepared = truncate_ce_pairs(pairs, max_len)
+        _bind_tokenizer_max_length(model, max_len)
+        try:
+            if getattr(model, "max_length", None) in (None, 0):
+                model.max_length = max_len
+        except Exception:
+            pass
+        try:
+            scores = model.predict(prepared, batch_size=self.batch_size, show_progress_bar=False)
+        except ValueError:
+            # Last resort: one pair at a time so convert_to_tensors never sees
+            # a variable-length batch. Do not log the HF message — the soak
+            # gate greps "Unable to create tensor".
+            logger.warning(
+                "Reranker: batched predict failed; scoring %d pairs one-at-a-time",
+                len(prepared),
+            )
+            scores = []
+            for pair in prepared:
+                one = model.predict([pair], batch_size=1, show_progress_bar=False)
+                one_list = one.tolist() if hasattr(one, "tolist") else list(one)
+                scores.extend(one_list)
+            return list(scores)
+        return scores.tolist() if hasattr(scores, "tolist") else list(scores)
 
     def _predict_sync(self, pairs: list[tuple[str, str]]) -> list[float]:
         """Synchronous prediction wrapper for thread pool execution.
+
+        Both the bucket-batching and plain arms score through the calling
+        thread's private CrossEncoder.
 
         Supports two optimizations (controlled via .env):
         - bucket_batching: sort pairs by token length to reduce padding waste (36-54% speedup)
         - batch_size: explicit batch size for predict() calls (MPS optimal: 32)
         """
-
+        model = self._get_thread_model()
         try:
             if self.bucket_batching and len(pairs) > 1:
                 # Sort pairs by approximate token length to create homogeneous batches.
@@ -265,8 +567,7 @@ class LocalSTCrossEncoder(CrossEncoderModel):
                 sorted_indices = sorted(range(len(pairs)), key=lambda i: lengths[i])
                 sorted_pairs = [pairs[i] for i in sorted_indices]
 
-                sorted_scores = self._model.predict(sorted_pairs, batch_size=self.batch_size, show_progress_bar=False)
-                sorted_scores = sorted_scores.tolist() if hasattr(sorted_scores, "tolist") else list(sorted_scores)
+                sorted_scores = self._scores_from_model(model, sorted_pairs)
 
                 # Restore original order
                 scores = [0.0] * len(pairs)
@@ -274,8 +575,7 @@ class LocalSTCrossEncoder(CrossEncoderModel):
                     scores[orig_idx] = sorted_scores[new_pos]
                 return scores
 
-            scores = self._model.predict(pairs, batch_size=self.batch_size, show_progress_bar=False)
-            return scores.tolist() if hasattr(scores, "tolist") else list(scores)
+            return self._scores_from_model(model, pairs)
         finally:
             release_local_inference_memory(self._device_type)
 
@@ -284,6 +584,8 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         Score query-document pairs for relevance.
 
         Uses a dedicated thread pool with limited workers to prevent CPU thrashing.
+        Forwards overlap across banks because each worker has its own model;
+        a process-wide predict lock would sum per-bank CE times.
 
         Args:
             pairs: List of (query, document) tuples to score
@@ -291,7 +593,7 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         Returns:
             List of relevance scores (raw logits from the model)
         """
-        if self._model is None:
+        if not self._initialized:
             raise RuntimeError("Reranker not initialized. Call initialize() first.")
 
         # Use dedicated executor - limited workers naturally limits concurrency

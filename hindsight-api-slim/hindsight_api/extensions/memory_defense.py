@@ -199,6 +199,18 @@ _REDACTION_PATTERNS: list[tuple[str, str]] = [
     # --- PII (US-centric defaults; can be tuned per deployment) ---
     # NOTE: credit_card regex is intentionally narrowed to 13-19 digits with
     # exact separators to reduce false positives on long product IDs.
+    # --- OVERLAY ADDITION 2026-08-01 (operator J5 decision: personal facts now
+    # flow into the bank, so personal-financial PII defense must predate them;
+    # idea #19, urgency-ordered). High-confidence formats ONLY, per this
+    # module's own scope note -- addresses/DOB/phones are context-dependent and
+    # deliberately NOT covered by regex. ORDER IS LOAD-BEARING and live-fire
+    # proven: these three MUST run BEFORE credit_card -- the first live-fire
+    # (2026-08-01) had them appended after it, and credit_card consumed an
+    # IBAN's digit tail (mislabeled marker, 'GB29 NWBK' left readable). iban
+    # also stays BEFORE uk_sort_account so an IBAN tail is not re-matched.
+    ("iban", r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}[ ]?[A-Z0-9]{1,4}\b"),
+    ("uk_nino", r"\b(?!BG|GB|NK|KN|TN|NT|ZZ)[A-CEGHJ-PR-TW-Z]{2}[ ]?\d{2}[ ]?\d{2}[ ]?\d{2}[ ]?[A-D]\b"),
+    ("uk_sort_account", r"\b\d{2}-\d{2}-\d{2}[ ]?\d{8}\b"),
     ("credit_card", r"\b(?:\d{4}[ -]?){3}\d{1,4}\b"),
     ("ssn_us", r"\b\d{3}-\d{2}-\d{4}\b"),
 ]

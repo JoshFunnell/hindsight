@@ -348,6 +348,9 @@ class PostgresMemories(MemoriesExtension):
         fact_types: list[str],
         limit: int,
         scope_tags: list[str] | None = None,
+        order: str = "asc",
+        created_after=None,
+        exclude_ids: list[str] | None = None,
     ) -> list[StoredMemory]:
         return await reads.find_unconsolidated(
             conn=conn,
@@ -356,6 +359,9 @@ class PostgresMemories(MemoriesExtension):
             fact_types=fact_types,
             limit=limit,
             scope_tags=scope_tags,
+            order=order,
+            created_after=created_after,
+            exclude_ids=exclude_ids,
         )
 
     async def count_unconsolidated(

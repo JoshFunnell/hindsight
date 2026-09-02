@@ -18,12 +18,13 @@ NOTE: Observations are distinct from mental models (pinned reflections).
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from collections import defaultdict
 from contextlib import AsyncExitStack
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from fnmatch import fnmatchcase
 from itertools import combinations
 from typing import TYPE_CHECKING, Any, Literal
@@ -722,6 +723,116 @@ class _ConsolidationBatchResponse(BaseModel):
     deletes: list[_DeleteAction] = []
 
 
+#: How a consolidation LLM batch failed, once its retries are exhausted.
+#:
+#: ``content`` is the only kind the memories themselves can be blamed for, and
+#: the only one that may end in ``consolidation_failed_at`` — the stamp is
+#: permanent, so it must never be applied for a condition the rows did not cause.
+LLMFailureKind = Literal["transient", "auth", "content"]
+
+#: How many sub-batches in a row may be lost to a transient provider failure
+#: before the rest of the batch is abandoned for this run. Not stamping
+#: ``consolidation_failed_at`` on a transient failure is correct, but it also
+#: removes the accidental rate limiting that permanent exclusion used to provide:
+#: without a breaker, every subsequent run reselects the same rows and re-hits a
+#: provider that is already refusing traffic.
+_MAX_CONSECUTIVE_TRANSIENT_SUB_BATCHES = 3
+
+#: Exception class names that are transient by construction, whatever the message
+#: says. Matched on the class name so a provider SDK's typed error is classified
+#: even when its ``str()`` is empty — the case a message-only classifier gets
+#: exactly backwards, since the cleanest errors carry the least text.
+_TRANSIENT_EXC_NAMES = (
+    "ratelimiterror",
+    "apitimeouterror",
+    "apiconnectionerror",
+    "internalservererror",
+    "serviceunavailable",
+    "overloadederror",
+    "timeouterror",
+    "connectionerror",
+)
+_AUTH_EXC_NAMES = ("authenticationerror", "permissiondeniederror", "unauthorized", "forbidden")
+
+#: HTTP statuses that mean "come back later". Matched with word boundaries: a
+#: bare ``"429" in text`` also fires on a token count of 14290 or a byte offset,
+#: which is the same substring false-positive that ruled out bare ``auth`` and
+#: ``connection`` as markers.
+_TRANSIENT_STATUS_RE = re.compile(r"\b(408|429|500|502|503|504|529)\b")
+_AUTH_STATUS_RE = re.compile(r"\b(401|403)\b")
+
+#: Message fragments, used only when neither the exception type nor a status code
+#: settled it. Multi-word or underscored so they cannot match ordinary prose.
+_TRANSIENT_MESSAGE_MARKERS = (
+    "usage limit",
+    "rate limit",
+    "rate_limit",
+    "ratelimit",
+    "limit reached",
+    "too many requests",
+    "too_many_requests",
+    "resource exhausted",
+    "resource_exhausted",
+    "quota",
+    "overloaded",
+    "capacity",
+    "connection refused",
+    "connection error",
+    "connection reset",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "service unavailable",
+)
+_AUTH_MESSAGE_MARKERS = (
+    "authentication failed",
+    "not logged in",
+    "invalid api key",
+    "invalid_api_key",
+    "expired token",
+    "credentials",
+)
+
+
+def classify_llm_failure(exc: BaseException | None) -> LLMFailureKind:
+    """Classify an exhausted-retry LLM failure so the caller knows what to blame.
+
+    Order matters: the exception TYPE is checked before any status code, and both
+    before the message text. A typed ``RateLimitError`` with an empty message is
+    common and would otherwise fall through to ``content`` — the single worst
+    misclassification available here, because it dead-letters healthy rows for
+    the most unambiguous provider signal there is.
+
+    ``auth`` is deliberately NOT folded into ``transient``: a bad or expired
+    credential does not heal on its own, so treating it as transient means the
+    job retries it silently every run, forever, with nothing recorded anywhere.
+    It is not ``content`` either — the rows did not cause it and must not be
+    permanently excluded for it. The caller circuit-breaks on this kind instead.
+
+    Unknown failures classify as ``content``, preserving the pre-existing
+    bisect-then-stamp behaviour for anything this function does not recognise.
+    """
+    if exc is None:
+        return "content"
+    name = type(exc).__name__.lower()
+    if any(marker in name for marker in _AUTH_EXC_NAMES):
+        return "auth"
+    if any(marker in name for marker in _TRANSIENT_EXC_NAMES):
+        return "transient"
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int):
+        if status in (401, 403):
+            return "auth"
+        if status in (408, 429, 500, 502, 503, 504, 529):
+            return "transient"
+    text = str(exc).lower()
+    if _AUTH_STATUS_RE.search(text) or any(marker in text for marker in _AUTH_MESSAGE_MARKERS):
+        return "auth"
+    if _TRANSIENT_STATUS_RE.search(text) or any(marker in text for marker in _TRANSIENT_MESSAGE_MARKERS):
+        return "transient"
+    return "content"
+
+
 @dataclass
 class _BatchLLMResult:
     creates: list[_CreateAction] = field(default_factory=list)
@@ -730,6 +841,10 @@ class _BatchLLMResult:
     obs_count: int = 0
     prompt_chars: int = 0
     failed: bool = False
+    #: Why the batch failed, when it did. ``None`` while ``failed`` is False.
+    #: Drives whether the caller bisects and stamps (content) or leaves the rows
+    #: pending (transient / auth) — see ``classify_llm_failure``.
+    failure_kind: LLMFailureKind | None = None
 
 
 @dataclass
@@ -1040,6 +1155,10 @@ async def _fetch_unconsolidated_rows(
     fact_types: list[str],
     limit: int,
     observation_scopes: list[list[str]] | None,
+    *,
+    order: str = "asc",
+    created_after: datetime | None = None,
+    exclude_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Unconsolidated candidate facts, read through the memories store.
 
@@ -1047,17 +1166,40 @@ async def _fetch_unconsolidated_rows(
     directly — otherwise a store that keeps its rows elsewhere yields nothing and
     consolidation silently produces no observations. Returns the same row-dict shape the
     consolidation loop consumes. Mirrors the job's scope filter: with scopes, OR each
-    "tags ⊇ scope" and merge oldest-first; without, one unscoped read.
+    "tags ⊇ scope" and merge; without, one unscoped read. ``order`` / ``created_after``
+    / ``exclude_ids`` are the hot-window knobs: newest-first inside a recent window,
+    then oldest-first for the remainder so a backlog still drains fairly.
     """
     store = get_memories()
     scopes: list[list[str] | None] = list(observation_scopes) if observation_scopes else [None]
     by_id: dict[str, Any] = {}
     for scope in scopes:
-        for m in await store.find_unconsolidated(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=fact_types, limit=limit, scope_tags=scope
-        ):
+        store_kwargs = dict(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            fact_types=fact_types,
+            limit=limit,
+            scope_tags=scope,
+        )
+        try:
+            found = await store.find_unconsolidated(
+                **store_kwargs,
+                order=order,
+                created_after=created_after,
+                exclude_ids=exclude_ids,
+            )
+        except TypeError:
+            # Image store without the hot-window kwargs: degrade to oldest-first.
+            found = await store.find_unconsolidated(**store_kwargs)
+        for m in found:
             by_id.setdefault(m.unit_id, m)
-    ordered = sorted(by_id.values(), key=lambda m: (m.created_at is None, m.created_at))[:limit]
+    reverse = order == "desc"
+    ordered = sorted(
+        by_id.values(),
+        key=lambda m: (m.created_at is None, m.created_at),
+        reverse=reverse,
+    )[:limit]
     return [
         {
             "id": uuid.UUID(m.unit_id),
@@ -1072,6 +1214,55 @@ async def _fetch_unconsolidated_rows(
         }
         for m in ordered
     ]
+
+
+async def _fetch_round_candidates(
+    conn,
+    bank_id: str,
+    fact_types: list[str],
+    limit: int,
+    observation_scopes: list[list[str]] | None,
+    config: Any,
+) -> list[dict[str, Any]]:
+    """Hot-window newest-first, then oldest-first fill, capped at ``limit``.
+
+    A retain that lands while a 400-unit backlog is draining used to wait for
+    every older row (FIFO). Units created inside ``consolidation_hot_window_seconds``
+    are taken first (newest among them, capped by ``consolidation_hot_round_max``)
+    so the new retain is in this round; the rest of the slot still drains the
+    oldest backlog so old units are not starved.
+    """
+    if limit <= 0:
+        return []
+    hot_window = int(getattr(config, "consolidation_hot_window_seconds", 0) or 0)
+    hot_max = int(getattr(config, "consolidation_hot_round_max", 0) or 0)
+    if hot_window <= 0 or hot_max <= 0:
+        # Kill-switch: no hot slice. Newest-first so a brand-new retain still
+        # lands in this round instead of the FIFO tail.
+        return await _fetch_unconsolidated_rows(conn, bank_id, fact_types, limit, observation_scopes, order="desc")
+    cutoff = datetime.now(UTC) - timedelta(seconds=hot_window)
+    hot = await _fetch_unconsolidated_rows(
+        conn,
+        bank_id,
+        fact_types,
+        min(limit, hot_max),
+        observation_scopes,
+        order="desc",
+        created_after=cutoff,
+    )
+    remaining = limit - len(hot)
+    if remaining <= 0:
+        return hot[:limit]
+    rest = await _fetch_unconsolidated_rows(
+        conn,
+        bank_id,
+        fact_types,
+        remaining,
+        observation_scopes,
+        order="asc",
+        exclude_ids=[str(m["id"]) for m in hot],
+    )
+    return hot + rest
 
 
 #: Cap on the store-side count of unconsolidated facts. Used only for the "is there work?"
@@ -1328,8 +1519,8 @@ async def _run_consolidation_job(
         # keeps its rows outside Postgres is read too.
         async with acquire_with_retry(pool) as conn:
             t0 = time.time()
-            memories = await _fetch_unconsolidated_rows(
-                conn, bank_id, ["experience", "world"], fetch_limit, observation_scopes
+            memories = await _fetch_round_candidates(
+                conn, bank_id, ["experience", "world"], fetch_limit, observation_scopes, config
             )
             perf.record_timing("fetch_memories", time.time() - t0)
 
@@ -1400,6 +1591,9 @@ async def _run_consolidation_job(
 
             try:
                 pending: list[list[dict[str, Any]]] = [llm_batch_local]
+                #: Consecutive sub-batches lost to a transient provider failure. Reset
+                #: by any sub-batch that gets a real answer.
+                consecutive_transient = 0
                 while pending:
                     sub_batch = pending.pop(0)
 
@@ -1409,11 +1603,14 @@ async def _run_consolidation_job(
                     obs_tags_list = _resolve_obs_tags_list(sub_batch[0]) if sub_batch else None
 
                     sub_deleted: int = 0
-                    sub_llm_failed = False
+                    # Every failure kind this sub-batch produced. A SET, not a pair of
+                    # booleans: one pass failing transiently must not decide the fate
+                    # of a sibling pass that failed on content, and vice versa.
+                    sub_failure_kinds: set[LLMFailureKind] = set()
                     if obs_tags_list:
                         sub_results: list[dict[str, Any]] = []
                         for obs_tags in obs_tags_list:
-                            pass_results, pass_deleted, pass_failed = await _process_memory_batch(
+                            pass_results, pass_deleted, pass_failure = await _process_memory_batch(
                                 pool=pool,
                                 memory_engine=memory_engine,
                                 llm_config=llm_config,
@@ -1426,7 +1623,8 @@ async def _run_consolidation_job(
                                 txn=_batch_txn,
                             )
                             sub_deleted += pass_deleted
-                            sub_llm_failed = sub_llm_failed or pass_failed
+                            if pass_failure is not None:
+                                sub_failure_kinds.add(pass_failure)
                             if not sub_results:
                                 sub_results = pass_results
                             else:
@@ -1451,7 +1649,7 @@ async def _run_consolidation_job(
                                             "total_actions": total,
                                         }
                     else:
-                        sub_results, sub_deleted, sub_llm_failed = await _process_memory_batch(
+                        sub_results, sub_deleted, _sub_failure = await _process_memory_batch(
                             pool=pool,
                             memory_engine=memory_engine,
                             llm_config=llm_config,
@@ -1462,8 +1660,60 @@ async def _run_consolidation_job(
                             config=config,
                             txn=_batch_txn,
                         )
+                        if _sub_failure is not None:
+                            sub_failure_kinds.add(_sub_failure)
 
                     all_deleted += sub_deleted
+
+                    # A content failure anywhere in the sub-batch outranks a transient
+                    # one: content is the only kind bisection can actually isolate, and
+                    # letting a co-occurring transient failure suppress it would leave
+                    # genuinely unprocessable rows retrying forever.
+                    if "content" in sub_failure_kinds:
+                        sub_llm_failed = True
+                    elif sub_failure_kinds:
+                        sub_llm_failed = False
+                        kind = "auth" if "auth" in sub_failure_kinds else "transient"
+                        all_results.extend({"action": "skipped", "reason": f"{kind}_llm"} for _ in sub_batch)
+                        if kind == "auth":
+                            # Credentials do not heal on their own. Leaving the rows
+                            # pending is right — they did nothing wrong — but staying
+                            # quiet about it is not: without this the job would retry
+                            # a dead credential every run, forever, recording nothing.
+                            # Stop the batch loop so the failure surfaces as one loud
+                            # event instead of an endless trickle.
+                            logger.error(
+                                f"[CONSOLIDATION] bank={bank_id} AUTH failure for sub-batch of {len(sub_batch)}; "
+                                f"leaving {len(sub_batch)} memory row(s) PENDING and ABORTING this batch — "
+                                "credentials will not recover by retrying."
+                            )
+                            pending.clear()
+                            continue
+                        consecutive_transient += 1
+                        logger.warning(
+                            f"[CONSOLIDATION] bank={bank_id} TRANSIENT LLM failure for sub-batch of "
+                            f"{len(sub_batch)}; leaving {len(sub_batch)} memory row(s) PENDING "
+                            f"(no consolidation_failed_at stamp; {consecutive_transient} in a row)"
+                        )
+                        if consecutive_transient >= _MAX_CONSECUTIVE_TRANSIENT_SUB_BATCHES:
+                            # Removing the dead-letter stamp also removed the accidental
+                            # rate limiter it provided: every run now reselects these rows
+                            # and re-hits the same exhausted provider. Give up on the rest
+                            # of this batch instead of hammering through it.
+                            logger.warning(
+                                f"[CONSOLIDATION] bank={bank_id} {consecutive_transient} consecutive transient "
+                                f"failures; abandoning {len(pending)} remaining sub-batch(es) this run. "
+                                "Rows stay PENDING for the next run."
+                            )
+                            pending.clear()
+                        continue
+                    else:
+                        sub_llm_failed = False
+
+                    # Reached only when the provider actually answered (success, or a
+                    # content failure it is right to bisect), so the transient streak
+                    # is over. The transient and auth paths above never get here.
+                    consecutive_transient = 0
 
                     if sub_llm_failed and len(sub_batch) > 1:
                         mid = len(sub_batch) // 2
@@ -1755,6 +2005,12 @@ async def _run_consolidation_job(
     if operation_id:
         all_refresh_tags |= await _read_pending_refresh_tags(pool, operation_id)
 
+    # A round that processed exactly max_memories_per_round and emptied the
+    # queue used to set hit_round_limit (remaining <= 0) and skip the refresh
+    # forever -- the follow-up job saw no_new_memories and never fanned out.
+    if hit_round_limit and await _count_unconsolidated() == 0:
+        hit_round_limit = False
+
     if hit_round_limit:
         remaining = total_count - stats["memories_processed"]
         logger.info(
@@ -1969,7 +2225,7 @@ async def _process_memory_batch(
     config: Any = None,
     obs_tags_override: list[str] | None = None,
     txn=None,
-) -> tuple[list[dict[str, Any]], int, bool]:
+) -> tuple[list[dict[str, Any]], int, LLMFailureKind | None]:
     """
     Process a batch of memories in a single LLM call.
 
@@ -2251,7 +2507,10 @@ async def _process_memory_batch(
         else:
             results.append({"action": "skipped", "reason": "no_durable_knowledge"})
 
-    return results, deleted_count, llm_result.failed
+    # The third element is the failure KIND rather than a bare bool: the caller
+    # has to tell "the rows are bad" apart from "the provider is down", and a
+    # boolean cannot carry that. ``None`` means the batch did not fail.
+    return results, deleted_count, (llm_result.failure_kind if llm_result.failed else None)
 
 
 def _min_date(dates: "Any") -> "datetime | None":
@@ -2886,12 +3145,24 @@ async def _consolidate_batch_with_llm(
                 f"[CONSOLIDATION] LLM batch call failed (attempt {attempt}/{max_attempts}) for {batch_label}: {exc}"
             )
 
+    # Classify before returning: only a CONTENT failure may end in
+    # consolidation_failed_at, because that stamp permanently removes the rows
+    # from selection. A provider-side condition (quota window, rate limit,
+    # transport) is not something the memories did, and bisecting it only halves
+    # the batch into more calls that fail the same way. The kind is THREADED to
+    # the decision site rather than raised: a mid-loop raise would skip the
+    # consolidated_at finalization for sub-batches that already wrote, and the
+    # next run would re-create their observations.
+    failure_kind = classify_llm_failure(last_exc)
     logger.error(
         f"[CONSOLIDATION] LLM batch call failed after {max_attempts} attempts for {batch_label}, "
-        f"skipping batch. Last error: {last_exc}"
+        f"skipping batch (failure_kind={failure_kind}). Last error: {last_exc}"
     )
     return _BatchLLMResult(
-        obs_count=len(union_observations), prompt_chars=len(system_prompt) + len(user_content), failed=True
+        obs_count=len(union_observations),
+        prompt_chars=len(system_prompt) + len(user_content),
+        failed=True,
+        failure_kind=failure_kind,
     )
 
 
