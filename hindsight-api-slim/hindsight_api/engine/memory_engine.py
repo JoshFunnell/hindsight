@@ -7455,27 +7455,20 @@ class MemoryEngine(MemoryEngineInterface):
                             )
                             weight_by_token = {sr.id: float(sr.weight) for sr in scored}
                             rewritten: list[MemoryFact] = []
-                            for fact, token in zip(
-                                scored_facts, [item.token for item in tokened], strict=True
-                            ):
+                            for fact, token in zip(scored_facts, [item.token for item in tokened], strict=True):
                                 prev = fact.scores
                                 if prev is None or token not in weight_by_token:
                                     rewritten.append(fact)
                                     continue
                                 rewritten.append(
                                     fact.model_copy(
-                                        update={
-                                            "scores": prev.model_copy(
-                                                update={"final": weight_by_token[token]}
-                                            )
-                                        }
+                                        update={"scores": prev.model_copy(update={"final": weight_by_token[token]})}
                                     )
                                 )
                             scored_facts = rewritten
                         except Exception as scoring_exc:
                             logger.warning(
-                                "[RECALL MULTI] union combined scoring failed; "
-                                "scores.final stays raw CE: %s: %r",
+                                "[RECALL MULTI] union combined scoring failed; scores.final stays raw CE: %s: %r",
                                 type(scoring_exc).__name__,
                                 scoring_exc,
                             )
@@ -7550,9 +7543,7 @@ class MemoryEngine(MemoryEngineInterface):
             entities=entities,
             chunks=chunks,
             source_facts=source_facts,
-            source_facts_truncated=or_source_facts_truncated(
-                [outcome for _, outcome in successful_outcomes]
-            ),
+            source_facts_truncated=or_source_facts_truncated([outcome for _, outcome in successful_outcomes]),
             metadata=build_multi_bank_metadata(
                 merge_requested=merge_requested,
                 merge_applied=merge_applied,
@@ -8253,9 +8244,7 @@ class MemoryEngine(MemoryEngineInterface):
                             recall_id,
                             reason,
                         )
-                        log_buffer.append(
-                            f"  [4] Reranking degraded to un-reranked RRF (reason={reason})"
-                        )
+                        log_buffer.append(f"  [4] Reranking degraded to un-reranked RRF (reason={reason})")
                         scored_results = [
                             ScoredResult(
                                 candidate=mc,
@@ -8318,9 +8307,7 @@ class MemoryEngine(MemoryEngineInterface):
                 # "rrf" mode is passthrough by construction; so is a configured "rrf" CE.
                 # rerank_degraded: CE raised; scores are placeholders — seed from RRF.
                 is_passthrough = (
-                    rerank_degraded
-                    or (reranking == "rrf")
-                    or (ce is not None and ce.provider_name == "rrf")
+                    rerank_degraded or (reranking == "rrf") or (ce is not None and ce.provider_name == "rrf")
                 )
                 scoring_config = get_config()
                 apply_combined_scoring(
@@ -16591,9 +16578,7 @@ class MemoryEngine(MemoryEngineInterface):
         # anything BEFORE the delta-mode merge below can mix in facts
         # carried over from the previous refresh (review finding:
         # post-merge emptiness is fail-open under carry-over).
-        _patch_fresh_retrieval_empty = not any(
-            v for v in based_on_serialized_payload.values() if v
-        )
+        _patch_fresh_retrieval_empty = not any(v for v in based_on_serialized_payload.values() if v)
         # In delta mode, based_on must accumulate: the mental model is
         # grounded on ALL facts ever used, not just the latest delta's new
         # ones. Merge previous based_on with current, deduplicating by id.

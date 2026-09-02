@@ -671,9 +671,7 @@ class MultiBankRecallRequest(RecallRequest):
     )
 
     bank_ids: list[str] = Field(
-        description=(
-            "Memory banks to query in parallel (max 10). Order is preserved for interleave merge."
-        ),
+        description=("Memory banks to query in parallel (max 10). Order is preserved for interleave merge."),
         min_length=1,
         max_length=10,
     )
@@ -748,9 +746,7 @@ def _core_recall_to_http_response(core_result: CoreRecallResult) -> RecallRespon
 
     source_facts_response = None
     if core_result.source_facts:
-        source_facts_response = {
-            fact_id: _fact_to_result(fact) for fact_id, fact in core_result.source_facts.items()
-        }
+        source_facts_response = {fact_id: _fact_to_result(fact) for fact_id, fact in core_result.source_facts.items()}
 
     return RecallResponse(
         results=recall_results,
@@ -5313,9 +5309,7 @@ def _register_routes(app: FastAPI):
             raise
         except (asyncio.TimeoutError, TimeoutError):
             handler_duration = time.time() - handler_start
-            logger.error(
-                f"[RECALL MULTI TIMEOUT] banks={request.bank_ids} handler_duration={handler_duration:.3f}s"
-            )
+            logger.error(f"[RECALL MULTI TIMEOUT] banks={request.bank_ids} handler_duration={handler_duration:.3f}s")
             raise HTTPException(
                 status_code=504,
                 detail="Request timed out while searching memories. Try a shorter or more specific query.",

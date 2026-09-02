@@ -274,9 +274,7 @@ def ce_pair_from_retrieval(query: str, retrieval: RetrievalResult) -> tuple[str,
     return (query, doc_text)
 
 
-def union_predict_pairs(
-    query: str, facts: Sequence[MemoryFact]
-) -> list[tuple[str, str]]:
+def union_predict_pairs(query: str, facts: Sequence[MemoryFact]) -> list[tuple[str, str]]:
     """Exact (query, doc) pairs the union path feeds to predict."""
     pairs: list[tuple[str, str]] = []
     for item in memory_facts_to_merged_candidates(facts):
@@ -284,9 +282,7 @@ def union_predict_pairs(
     return pairs
 
 
-def single_bank_predict_pairs(
-    query: str, facts: Sequence[MemoryFact]
-) -> list[tuple[str, str]]:
+def single_bank_predict_pairs(query: str, facts: Sequence[MemoryFact]) -> list[tuple[str, str]]:
     """Single-bank CE pairs: RetrievalResult built the way rerank() sees them."""
     pairs: list[tuple[str, str]] = []
     for fact in facts:
@@ -324,8 +320,7 @@ def select_union_candidates(
     k_floor = max(1, int(k_floor))
     pre_capped = cap_per_bank_results(bank_results, max_per_bank=per_bank_pre_cap)
     stamped: list[tuple[str, list[MemoryFact]]] = [
-        (bank_id, [stamp_bank_id(fact, bank_id) for fact in facts])
-        for bank_id, facts in pre_capped
+        (bank_id, [stamp_bank_id(fact, bank_id) for fact in facts]) for bank_id, facts in pre_capped
     ]
     bank_order = [bank_id for bank_id, _facts in stamped]
     n_with = sum(1 for _bank_id, facts in stamped if facts)
@@ -498,8 +493,7 @@ def interleave_merge(
     was considered and rejected.
     """
     stamped_lists: list[list[MemoryFact]] = [
-        [stamp_bank_id(fact, bank_id) for fact in facts]
-        for bank_id, facts in bank_results
+        [stamp_bank_id(fact, bank_id) for fact in facts] for bank_id, facts in bank_results
     ]
     merged: list[MemoryFact] = []
     max_len = max((len(lst) for lst in stamped_lists), default=0)
@@ -543,9 +537,7 @@ def dedup_exact_normalized(facts: Sequence[MemoryFact]) -> DedupedFacts:
     return DedupedFacts(facts=kept, dropped=dropped)
 
 
-def cut_to_token_budget(
-    facts: Sequence[MemoryFact], max_tokens: int
-) -> list[MemoryFact]:
+def cut_to_token_budget(facts: Sequence[MemoryFact], max_tokens: int) -> list[MemoryFact]:
     """Keep results until ``max_tokens`` on the ``text`` field (same semantics as single-bank).
 
     Stops before including a fact that would exceed the budget. Counts tokens through

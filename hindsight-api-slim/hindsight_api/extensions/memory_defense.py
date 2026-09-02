@@ -234,7 +234,10 @@ _REDACTION_PATTERNS: list[tuple[str, str]] = [
     # Bodies carry upstream's ASCII token boundaries (e181fb75) instead of \b so
     # a CJK neighbour is not treated as a token character.
     ("iban", _ascii_token_pattern(r"[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}[ ]?[A-Z0-9]{1,4}")),
-    ("uk_nino", _ascii_token_pattern(r"(?!BG|GB|NK|KN|TN|NT|ZZ)[A-CEGHJ-PR-TW-Z]{2}[ ]?\d{2}[ ]?\d{2}[ ]?\d{2}[ ]?[A-D]")),
+    (
+        "uk_nino",
+        _ascii_token_pattern(r"(?!BG|GB|NK|KN|TN|NT|ZZ)[A-CEGHJ-PR-TW-Z]{2}[ ]?\d{2}[ ]?\d{2}[ ]?\d{2}[ ]?[A-D]"),
+    ),
     ("uk_sort_account", _ascii_token_pattern(r"\d{2}-\d{2}-\d{2}[ ]?\d{8}")),
     ("credit_card", _ascii_token_pattern(r"(?:\d{4}[ -]?){3}\d{1,4}")),
     ("ssn_us", _ascii_token_pattern(r"\d{3}-\d{2}-\d{4}")),
