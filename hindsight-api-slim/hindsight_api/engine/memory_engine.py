@@ -17133,7 +17133,6 @@ class MemoryEngine(MemoryEngineInterface):
             final_content=final_content,
             final_structured=final_structured,
             delta_operations=delta_operations,
-            reflect_response=reflect_response_payload,
             outcome="content_written" if final_content.strip() != current_content else "content_unchanged",
             warnings=warnings,
             fast_path_fallback_reason=fast_path_fallback_reason,
