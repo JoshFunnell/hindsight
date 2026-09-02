@@ -26,6 +26,24 @@ interface BankContextType {
 
 const BankContext = createContext<BankContextType | undefined>(undefined);
 
+const LAST_BANK_KEY = "hindsight.currentBank";
+
+function readLastBank(): string | null {
+  try {
+    return sessionStorage.getItem(LAST_BANK_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeLastBank(id: string): void {
+  try {
+    sessionStorage.setItem(LAST_BANK_KEY, id);
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
 export function BankProvider({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const [currentBank, setCurrentBank] = useState<string | null>(null);
@@ -58,11 +76,19 @@ export function BankProvider({ children }: { children: React.ReactNode }) {
   // Derive bank IDs for backwards compatibility
   const banks = bankInfos.map((b) => b.bank_id);
 
-  // Initialize bank from URL on mount
+  // Initialize bank from URL on mount. /stm is not a bank route; restore the
+  // last bank so the left rail (and the STM icon below the gear) stays visible.
   useEffect(() => {
     const bankMatch = pathname?.match(/^\/banks\/([^/?]+)/);
     if (bankMatch) {
-      setCurrentBank(decodeURIComponent(bankMatch[1]));
+      const id = decodeURIComponent(bankMatch[1]);
+      setCurrentBank(id);
+      writeLastBank(id);
+      return;
+    }
+    if (pathname === "/stm" || pathname === "/stm/") {
+      const saved = readLastBank();
+      if (saved) setCurrentBank(saved);
     }
   }, [pathname]);
 
@@ -70,9 +96,21 @@ export function BankProvider({ children }: { children: React.ReactNode }) {
     loadBanks();
   }, []);
 
+  const setCurrentBankAndRemember = (bank: string | null) => {
+    setCurrentBank(bank);
+    if (bank) writeLastBank(bank);
+  };
+
   return (
     <BankContext.Provider
-      value={{ currentBank, setCurrentBank, banks, bankInfos, banksLoading, loadBanks }}
+      value={{
+        currentBank,
+        setCurrentBank: setCurrentBankAndRemember,
+        banks,
+        bankInfos,
+        banksLoading,
+        loadBanks,
+      }}
     >
       {children}
     </BankContext.Provider>

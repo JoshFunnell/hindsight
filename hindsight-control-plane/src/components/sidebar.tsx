@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { usePathname } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
 import { bankRoute } from "@/lib/bank-url";
@@ -15,10 +16,14 @@ import {
   ChevronLeft,
   ChevronRight,
   Settings,
+  ClipboardList,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import Link from "next/link";
 import { client } from "@/lib/api";
+
+const STM_HREF = "/stm";
+const STM_TOOLTIP = "STM (working state)";
 
 type NavItem =
   | "home"
@@ -39,6 +44,8 @@ export function Sidebar({ currentTab, onTabChange }: SidebarProps) {
   const t = useTranslations("bank.sidebar");
   const tBank = useTranslations("bank");
   const { currentBank } = useBank();
+  const pathname = usePathname();
+  const stmActive = pathname === STM_HREF || pathname === STM_HREF + "/";
   const [isCollapsed, setIsCollapsed] = useState(true);
   const [apiVersion, setApiVersion] = useState<string | null>(null);
 
@@ -49,7 +56,7 @@ export function Sidebar({ currentTab, onTabChange }: SidebarProps) {
       .catch(() => setApiVersion(null));
   }, []);
 
-  if (!currentBank) {
+  if (!currentBank && !stmActive) {
     return null;
   }
 
@@ -93,9 +100,10 @@ export function Sidebar({ currentTab, onTabChange }: SidebarProps) {
     >
       <nav className="flex-1 p-3 pt-4">
         <ul className="space-y-1">
-          {navItems.map((item) => {
+          {currentBank &&
+            navItems.map((item) => {
             const Icon = item.icon;
-            const isActive = currentTab === item.id;
+            const isActive = !stmActive && currentTab === item.id;
             const href = bankRoute(currentBank, `?view=${item.id}`);
 
             return (
@@ -131,6 +139,26 @@ export function Sidebar({ currentTab, onTabChange }: SidebarProps) {
               </li>
             );
           })}
+          <li>
+            <Link
+              href={STM_HREF}
+              data-stm-nav="1"
+              onClick={(e) => {
+                e.stopPropagation();
+              }}
+              className={cn(
+                "w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-all cursor-pointer",
+                stmActive
+                  ? "bg-primary-gradient text-white shadow-sm"
+                  : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                isCollapsed && "justify-center px-0"
+              )}
+              title={STM_TOOLTIP}
+            >
+              <ClipboardList className="w-5 h-5 flex-shrink-0" />
+              {!isCollapsed && <span>STM</span>}
+            </Link>
+          </li>
         </ul>
       </nav>
 
