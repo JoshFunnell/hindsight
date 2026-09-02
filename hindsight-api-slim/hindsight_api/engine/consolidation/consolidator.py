@@ -1003,6 +1003,21 @@ class _BatchLLMResult:
     #: pending (transient / auth) — see ``classify_llm_failure``.
     failure_kind: LLMFailureKind | None = None
 
+    def __post_init__(self) -> None:
+        """Refuse a failure that does not say why.
+
+        The caller reads the KIND, not the flag —
+        ``(llm_result.failure_kind if llm_result.failed else None)`` folded into a
+        single ``if _sub_failure is not None`` — so a ``failed=True`` built without a
+        kind reads as SUCCESS downstream: no bisection, no stamp, and whatever the
+        failed batch produced is accepted. The field has to keep its ``None`` default
+        for the success case, so the invariant is enforced here instead (landing-diff
+        review, S107; today's single construction site does pass a kind, and
+        ``classify_llm_failure`` cannot return ``None``).
+        """
+        if self.failed and self.failure_kind is None:
+            raise ValueError("_BatchLLMResult(failed=True) must carry a failure_kind")
+
 
 @dataclass
 class _SourceAggregation:
@@ -1349,8 +1364,23 @@ async def _fetch_unconsolidated_rows(
                 created_after=created_after,
                 exclude_ids=exclude_ids,
             )
-        except TypeError:
+        except TypeError as exc:
             # Image store without the hot-window kwargs: degrade to oldest-first.
+            # ONLY that. A bare `except TypeError` here also swallows a TypeError
+            # raised INSIDE find_unconsolidated -- a None column hitting arithmetic,
+            # a bad row shape -- and re-issues the call without the hot window, so a
+            # real defect would surface as nothing worse than a stale ordering, with
+            # no log line to find it by. The signature mismatch is the one shape
+            # CPython words as "unexpected keyword argument"; anything else is the
+            # store's own error and must propagate (landing-diff review, S107).
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            logger.warning(
+                "[CONSOLIDATION] memories store does not accept the hot-window kwargs "
+                "(order/created_after/exclude_ids); degrading to oldest-first for bank %s. %s",
+                bank_id,
+                exc,
+            )
             found = await store.find_unconsolidated(**store_kwargs)
         for m in found:
             by_id.setdefault(m.unit_id, m)

@@ -103,6 +103,20 @@ class TestBatchResultCarriesTheKind(unittest.TestCase):
         annotation = str(inspect.signature(_process_memory_batch).return_annotation)
         self.assertIn("LLMFailureKind", annotation)
 
+    def test_a_failure_without_a_kind_is_refused_at_construction(self):
+        """Widening the third element to a kind made `failed=True` alone unreadable.
+
+        The caller keys on the kind, so a failure built without one reads as success
+        downstream -- no bisection, no stamp, the failed batch's output accepted. The
+        default has to stay None for the success case, so the pairing is enforced in
+        __post_init__ (landing-diff review, S107).
+        """
+        from hindsight_api.engine.consolidation.consolidator import _BatchLLMResult
+
+        with self.assertRaises(ValueError):
+            _BatchLLMResult(failed=True)
+        self.assertEqual(_BatchLLMResult(failed=True, failure_kind="transient").failure_kind, "transient")
+
 
 if __name__ == "__main__":
     unittest.main()

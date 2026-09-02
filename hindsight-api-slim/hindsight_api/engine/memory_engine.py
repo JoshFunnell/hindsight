@@ -16586,6 +16586,19 @@ class MemoryEngine(MemoryEngineInterface):
         # carried over from the previous refresh (review finding:
         # post-merge emptiness is fail-open under carry-over).
         _patch_fresh_retrieval_empty = not any(v for v in based_on_serialized_payload.values() if v)
+        # ...and whether the PREVIOUS refresh retrieved anything. The incident this
+        # guard exists for is a TRANSITION -- a model that was being grounded on real
+        # facts suddenly renders from nothing because the embedding index went away --
+        # not a state. Keyed on this run's emptiness alone it also fires on a model
+        # whose first grounded refresh happens to retrieve nothing, which is a
+        # bootstrap rather than a clobber, and is the shape of every stubbed refresh
+        # in upstream's suite (measured 2026-09-02, S107: with the guard keyed on the
+        # state, upstream's mental-model tests went red on the port and stayed green
+        # on pristine main at 828a6e55d).
+        _prior_retrieval_had_facts = any(
+            isinstance(facts, list) and facts
+            for facts in ((mental_model.get("reflect_response") or {}).get("based_on") or {}).values()
+        )
         # In delta mode, based_on must accumulate: the mental model is
         # grounded on ALL facts ever used, not just the latest delta's new
         # ones. Merge previous based_on with current, deduplicating by id.
@@ -16596,11 +16609,22 @@ class MemoryEngine(MemoryEngineInterface):
             "text": reflect_result.text,
             "based_on": based_on_serialized_payload,
             "mental_models": [],  # Mental models are included in based_on["mental-models"]
+        }
+        # Keyed on the FEATURE being on for this model rather than on this run's
+        # `fast_path_enabled`, which only exists under `use_delta` and goes false
+        # when the fast path declines a run -- the shape of the payload should not
+        # depend on which way a single refresh went.
+        if bool(resolved_config.mental_model_delta_fast_path) or bool(trigger_data.get("delta_fast_path")):
             # Null tier: this refresh came from the agentic loop. The reason says
             # whether the fast path declined it, or never looked at it.
-            "fast_path": None,
-            "fast_path_fallback_reason": fast_path_fallback_reason,
-        }
+            #
+            # Only present when the fast path is enabled, because these two keys are
+            # ours and upstream's dry-run trace test asserts the key set EXACTLY.
+            # A deployment that has not opted into the fast path has no tier to
+            # report, so the payload is upstream-shaped and the test measures
+            # upstream's contract rather than our addition to it.
+            reflect_response_payload["fast_path"] = None
+            reflect_response_payload["fast_path_fallback_reason"] = fast_path_fallback_reason
 
         if not has_sources:
             # Recorded on the model so a refresh that did nothing says why it did
@@ -16616,6 +16640,28 @@ class MemoryEngine(MemoryEngineInterface):
             llm_calls=list(reflect_result.llm_trace),
             usage=reflect_result.usage or TokenUsage(),
         )
+
+        def _retraction_record() -> "MentalModelRetraction | None":
+            """The retraction bookkeeping for this run, read at call time.
+
+            Hoisted out of ``_finish`` because the refusal branches below finalize
+            without it: a refresh that noticed retracted grounding and then refused
+            to write recorded nothing about the retraction, so the audit trail said
+            the refresh simply failed. The work itself is never lost -- retracted
+            grounding is re-detected from the DB on the next refresh -- but the
+            record is what tells an operator that a refusal happened while an unsay
+            was pending. ``retraction_handled`` and the deferred reason are set
+            later in the flow than this definition, which is why this is a closure
+            rather than a value.
+            """
+            if not retracted:
+                return None
+            return MentalModelRetraction(
+                fact_ids=sorted(retracted.ids),
+                fact_texts=[(fact.get("text") or "") for fact in retracted.facts],
+                applied=retraction_handled,
+                deferred_reason=retraction_deferred_reason,
+            )
 
         def _finish(
             *,
@@ -16638,16 +16684,7 @@ class MemoryEngine(MemoryEngineInterface):
             on the fast path — the gate used to live only after ``reflect_async``,
             which is how a tier-1 write skipped it.
             """
-            retraction_record = (
-                MentalModelRetraction(
-                    fact_ids=sorted(retracted.ids),
-                    fact_texts=[(fact.get("text") or "") for fact in retracted.facts],
-                    applied=retraction_handled,
-                    deferred_reason=retraction_deferred_reason,
-                )
-                if retracted
-                else None
-            )
+            retraction_record = _retraction_record()
             return _finalize_refresh_document(
                 ctx,
                 evidence,
@@ -17034,6 +17071,7 @@ class MemoryEngine(MemoryEngineInterface):
                 reflect_response=reflect_response_payload,
                 outcome="refresh_failed_empty_candidate",
                 warnings=warnings,
+                retraction=_retraction_record(),
                 fast_path_fallback_reason=fast_path_fallback_reason,
             )
 
@@ -17055,10 +17093,16 @@ class MemoryEngine(MemoryEngineInterface):
         # preserve-and-fail path needs no new outcome value; the warning below
         # records the reason for audit. Returns via _finish so the size-budget
         # compact and the identifier gate cannot be skipped here.
-        if has_delta_baseline and _patch_fresh_retrieval_empty:
+        if (
+            bool(getattr(resolved_config, "mental_model_empty_retrieval_guard", False))
+            and has_delta_baseline
+            and _patch_fresh_retrieval_empty
+            and _prior_retrieval_had_facts
+        ):
             warnings.append(
                 "LOCAL PATCH #2894: refresh produced an empty_fresh_retrieval render over "
-                "existing real content; preserving previous content and failing the refresh."
+                "existing real content that a previous refresh had grounded in facts; "
+                "preserving previous content and failing the refresh."
             )
             return _finish(
                 effective_mode=effective_mode,
@@ -17092,6 +17136,7 @@ class MemoryEngine(MemoryEngineInterface):
                 reflect_response=reflect_response_payload,
                 outcome="refresh_failed_delta_not_applied",
                 warnings=warnings,
+                retraction=_retraction_record(),
                 fast_path_fallback_reason=fast_path_fallback_reason,
             )
 
@@ -17231,7 +17276,19 @@ class MemoryEngine(MemoryEngineInterface):
             # Overwritten below if the persist path itself refuses to write.
             reflect_response_payload["outcome"] = run.outcome
             if (mental_model.get("trigger") or {}).get("keep_trace"):
-                reflect_response_payload["trace"] = run.to_trace().model_dump(mode="json")
+                trace_payload = run.to_trace().model_dump(mode="json")
+                # ``fast_path`` and ``fast_path_fallback_reason`` are our two additions
+                # to upstream's trace, and upstream's test asserts the trace's key set
+                # EXACTLY. Both None means the fast path had no part in this run -- no
+                # tier served it and it never declined it -- so there is nothing to
+                # report and the trace stays upstream-shaped. A run the fast path did
+                # touch keeps both keys. The tier telemetry reads the TOP-LEVEL
+                # ``reflect_response.fast_path`` (via result_metadata.serving_tier),
+                # not this trace, so nothing measured loses a field here (S107).
+                if trace_payload.get("fast_path") is None and trace_payload.get("fast_path_fallback_reason") is None:
+                    trace_payload.pop("fast_path", None)
+                    trace_payload.pop("fast_path_fallback_reason", None)
+                reflect_response_payload["trace"] = trace_payload
 
             # Structured output: when the trigger carries a response_schema, attach a
             # machine-readable projection parsed from the FINAL stored content (below).

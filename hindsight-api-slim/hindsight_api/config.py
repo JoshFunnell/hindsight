@@ -882,6 +882,7 @@ ENV_RECALL_CHUNKS_MAX_TOKENS = "HINDSIGHT_API_RECALL_CHUNKS_MAX_TOKENS"
 # Mental model refresh
 ENV_MENTAL_MODEL_DELTA_FAST_PATH = "HINDSIGHT_API_MENTAL_MODEL_DELTA_FAST_PATH"
 ENV_MENTAL_MODEL_COMPACT_TO_MAX_TOKENS = "HINDSIGHT_API_MENTAL_MODEL_COMPACT_TO_MAX_TOKENS"
+ENV_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD = "HINDSIGHT_API_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD"
 
 # Recall pipeline stages. Each arm of recall costs latency, and a bank whose
 # content has no temporal or relational structure pays for stages it cannot use
@@ -1630,13 +1631,34 @@ DEFAULT_RECALL_MAX_TOKENS = 2048  # Token budget for facts returned by internal 
 DEFAULT_RECALL_CHUNKS_MAX_TOKENS = 1000  # Token budget for raw chunks returned by internal recall
 
 # Mental model refresh: run the deterministic delta fast path before the agentic
-# reflect loop. On by default — the fast path preserves every outcome and hands
-# back to the loop on any doubt, so the loop still produces the result whenever
-# a surgical edit is not obviously safe. Set false to always run the loop.
-DEFAULT_MENTAL_MODEL_DELTA_FAST_PATH = True
+# reflect loop. The fast path preserves every outcome and hands back to the loop
+# on any doubt, so the loop still produces the result whenever a surgical edit is
+# not obviously safe.
+#
+# OFF by default, and that default is load-bearing rather than a preference
+# (measured 2026-09-02, S107, on the main port at 828a6e55d): the fast path does
+# its own retrieval instead of calling ``reflect_async``, which is the exact seam
+# upstream's mental-model suite stubs. With the default on, 26 upstream tests fail
+# on the port and 0 fail on pristine main — so the suite stops being able to tell
+# "our port broke something" from "the known 26", at every future upstream pull.
+# Our deployment opts in explicitly (HINDSIGHT_API_MENTAL_MODEL_DELTA_FAST_PATH=true
+# in docker-compose.yml), which also puts the configuration next to the tier-rate
+# measurements instead of leaving it implicit in a constant.
+DEFAULT_MENTAL_MODEL_DELTA_FAST_PATH = False
 # Honour per-model max_tokens on the stored document: drop prose, keep
 # identifiers. Off only as a kill switch if a compact write needs revert.
 DEFAULT_MENTAL_MODEL_COMPACT_TO_MAX_TOKENS = True
+
+# Refuse a refresh whose retrieval came back empty over a document a previous
+# refresh had grounded in facts (issue #2894: with the embedding index away, the
+# model writes fluent generic no-info text, which passes every emptiness check
+# there is, and the working document is gone -- measured 2026-08-01, which is why
+# mm_refresh_safe.py had to snapshot and restore around every refresh).
+# OFF by default for the same reason as the fast path above: a stubbed reflect
+# returns real text with no facts BY CONSTRUCTION, so an on-by-default guard
+# refuses upstream's own suite. Our deployment opts in through the compose env,
+# where every other behaviour-changing overlay switch already lives.
+DEFAULT_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD = False
 
 # Recall pipeline stages — all on by default, so recall behaviour is unchanged
 # unless a bank opts out.
@@ -2917,6 +2939,8 @@ class HindsightConfig:
     mental_model_delta_fast_path: bool
     # Honour per-model max_tokens as a stored-document size budget
     mental_model_compact_to_max_tokens: bool
+    # Refuse a refresh that retrieved nothing over a previously grounded document
+    mental_model_empty_retrieval_guard: bool
 
     # Recall budget mapping: how the Budget enum (LOW/MID/HIGH) maps to thinking_budget integer.
     # function="fixed": use the recall_budget_fixed_* values directly (legacy behavior).
@@ -3220,6 +3244,7 @@ class HindsightConfig:
         # Mental model refresh (per-model override lives on trigger.delta_fast_path)
         "mental_model_delta_fast_path",
         "mental_model_compact_to_max_tokens",
+        "mental_model_empty_retrieval_guard",
         # Recall budget mapping (Budget enum -> thinking_budget integer)
         "recall_budget_function",
         "recall_budget_fixed_low",
@@ -4459,6 +4484,10 @@ class HindsightConfig:
             in ("true", "1", "yes"),
             mental_model_compact_to_max_tokens=os.getenv(
                 ENV_MENTAL_MODEL_COMPACT_TO_MAX_TOKENS, str(DEFAULT_MENTAL_MODEL_COMPACT_TO_MAX_TOKENS)
+            ).lower()
+            in ("true", "1", "yes"),
+            mental_model_empty_retrieval_guard=os.getenv(
+                ENV_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD, str(DEFAULT_MENTAL_MODEL_EMPTY_RETRIEVAL_GUARD)
             ).lower()
             in ("true", "1", "yes"),
             recall_budget_function=_validate_recall_budget_function(
